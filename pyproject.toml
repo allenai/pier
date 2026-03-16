@@ -1,0 +1,42 @@
+[build-system]
+requires = ["setuptools>=61", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pier"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = [
+    "click",
+]
+
+[project.optional-dependencies]
+harbor = [
+    "harbor",
+]
+dev = [
+    "pier[harbor]",
+    "pytest",
+    "ruff",
+    "mypy",
+    "pre-commit",
+]
+
+[project.scripts]
+pier = "pier.cli:cli"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = [
+    "pier",
+    "pier.*",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["pier/tests"]
+
+[tool.mypy]
+
+[[tool.mypy.overrides]]
+module = ["harbor", "harbor.*"]
+ignore_missing_imports = true
