@@ -184,6 +184,7 @@ def _write_mounts_compose(
     include_bind_mount: bool = True,
     task_dir: Path | None = None,
     ports: list[int] | None = None,
+    environment_env: list[str] | None = None,
 ) -> Path:
     """Write a docker-compose override for workspace mounts.
 
@@ -196,6 +197,7 @@ def _write_mounts_compose(
     Skills are handled by Harbor via skills_dir in task.toml.
 
     When ports is provided, exposes those container ports to the host.
+    When environment_env is provided, adds static environment entries to the service.
     """
     service: dict = {"tmpfs": [f"{container_workdir}/.pier"]}
     volumes: list[str] = []
@@ -212,6 +214,12 @@ def _write_mounts_compose(
         service["volumes"] = volumes
     if ports:
         service["ports"] = [f"{p}:{p}" for p in ports]
+    if environment_env:
+        env_dict: dict[str, str] = {}
+        for entry in environment_env:
+            k, _, v = entry.partition("=")
+            env_dict[k] = v
+        service["environment"] = env_dict
     compose = {"services": {"main": service}}
     path = trial_dir / "docker-compose-pier.json"
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -226,6 +234,7 @@ def _make_environment(
     workspace_dir: Path | None = None,
     ports: list[int] | None = None,
     extra_mounts: list[str] | None = None,
+    environment_env: list[str] | None = None,
 ):
     """Reconstruct a Harbor Docker environment from pier session data.
 
@@ -280,16 +289,18 @@ def _make_environment(
             include_bind_mount=False,
             task_dir=task_dir,
             ports=ports,
+            environment_env=environment_env,
         )
         _patch_compose_paths(environment, mounts_path)
-    elif ports:
-        # No workspace mount, but still need ports exposed.
+    elif ports or environment_env:
+        # No workspace mount, but still need ports and/or compose env.
         mounts_path = _write_mounts_compose(
             trial_dir,
             workspace_dir or Path("/unused"),
             container_workdir,
             include_bind_mount=False,
             ports=ports,
+            environment_env=environment_env,
         )
         _patch_compose_paths(environment, mounts_path)
     else:
@@ -335,6 +346,7 @@ async def _async_start_environment(
     workspace_dir: Path | None = None,
     ports: list[int] | None = None,
     extra_mounts: list[str] | None = None,
+    environment_env: list[str] | None = None,
 ) -> None:
     environment, task, _ = _make_environment(
         task_dir,
@@ -343,6 +355,7 @@ async def _async_start_environment(
         workspace_dir=workspace_dir,
         ports=ports,
         extra_mounts=extra_mounts,
+        environment_env=environment_env,
     )
     await environment.start(force_build=False)
 
@@ -389,12 +402,14 @@ def start_environment(
     workspace_dir: Path | None = None,
     ports: list[int] | None = None,
     extra_mounts: list[str] | None = None,
+    environment_env: list[str] | None = None,
 ) -> None:
     """Build (if needed), start a Harbor Docker environment.
 
     If workspace_dir is provided, it is bind-mounted into the container.
     If ports is provided, those container ports are exposed to the host.
     If extra_mounts is provided, they are added as volume mounts.
+    If environment_env is provided, those KEY=VALUE pairs are added to the compose service environment.
     """
     with _placeholder_task_env_vars(task_dir):
         asyncio.run(
@@ -405,6 +420,7 @@ def start_environment(
                 workspace_dir=workspace_dir,
                 ports=ports,
                 extra_mounts=extra_mounts,
+                environment_env=environment_env,
             )
         )
 

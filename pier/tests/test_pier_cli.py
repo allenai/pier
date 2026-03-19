@@ -1327,6 +1327,124 @@ def test_stop_host_errors(runner, index_path, tmp_path):
     assert "host" in result.output.lower()
 
 
+@patch("pier.harbor_bridge.stop_environment")
+def test_stop_all(mock_stop, runner, index_path, tmp_path):
+    """pier stop --all stops all container-mode workspaces."""
+    ws1 = tmp_path / "ws1"
+    ws1.mkdir()
+    _write_session(ws1, _container_session(harbor_session_id="pier-1"), index_path)
+    ws2 = tmp_path / "ws2"
+    ws2.mkdir()
+    _write_session(ws2, _container_session(harbor_session_id="pier-2"), index_path)
+    ws3 = tmp_path / "ws3"
+    ws3.mkdir()
+    _write_session(ws3, _host_session(), index_path)
+
+    result = runner.invoke(cli, ["stop", "--all"], catch_exceptions=False)
+    assert result.exit_code == 0
+    assert mock_stop.call_count == 2
+    assert "Stopped" in result.output
+
+
+def test_stop_all_no_workspaces(runner, index_path):
+    result = runner.invoke(cli, ["stop", "--all"], catch_exceptions=False)
+    assert result.exit_code == 0
+    assert "No container-mode workspaces" in result.output
+
+
+@patch("subprocess.run", return_value=MagicMock(returncode=0))
+@patch("pier.harbor_bridge.stop_environment", side_effect=FileNotFoundError("gone"))
+@patch("pier.harbor_bridge.get_container_name", return_value="pier-ws-main-1")
+def test_stop_fallback_removes_container(
+    mock_name, mock_stop, mock_run, runner, index_path, tmp_path
+):
+    """When Harbor stop fails, fallback to docker rm -f and clean up session."""
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    _write_session(ws, _container_session(), index_path)
+    result = runner.invoke(cli, ["stop"], catch_exceptions=False)
+    assert result.exit_code == 0
+    assert not (ws / ".pier" / "session.json").exists()
+    docker_args = mock_run.call_args[0][0]
+    assert "docker" in docker_args
+    assert "rm" in docker_args
+
+
+# ---------------------------------------------------------------------------
+# pier start --force
+# ---------------------------------------------------------------------------
+
+
+@patch("pier.harbor_bridge.stop_environment")
+@patch("pier.harbor_bridge.start_environment")
+def test_start_force_tears_down_existing(
+    mock_start, mock_stop, runner, index_path, task_dir, tmp_path
+):
+    """pier start --force removes existing workspace before starting."""
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    _write_session(ws, _container_session(), index_path)
+    (ws / "stale-file.txt").write_text("old")
+
+    result = runner.invoke(
+        cli,
+        ["start", str(task_dir), "-d", str(ws), "--force"],
+        catch_exceptions=False,
+    )
+    assert result.exit_code == 0, result.output
+    assert "Removed existing workspace" in result.output
+    assert not (ws / "stale-file.txt").exists()
+    assert (ws / ".pier" / "session.json").exists()
+
+
+# ---------------------------------------------------------------------------
+# pier start --exec
+# ---------------------------------------------------------------------------
+
+
+@patch("pier.harbor_bridge.is_environment_running", return_value=True)
+@patch("pier.harbor_bridge.start_environment")
+def test_start_exec_runs_command(
+    mock_start, mock_running, runner, index_path, task_dir, tmp_path
+):
+    """pier start --exec runs a command in the container after start."""
+    ws = tmp_path / "ws"
+    with patch("subprocess.run", return_value=MagicMock(returncode=0)) as mock_run:
+        result = runner.invoke(
+            cli,
+            ["start", str(task_dir), "-d", str(ws), "--exec", "claude --help"],
+            catch_exceptions=False,
+        )
+    assert result.exit_code == 0, result.output
+    docker_args = mock_run.call_args[0][0]
+    assert "claude" in docker_args
+    assert "--help" in docker_args
+
+
+# ---------------------------------------------------------------------------
+# pier exec --ae dedup
+# ---------------------------------------------------------------------------
+
+
+@patch("pier.harbor_bridge.is_environment_running", return_value=True)
+def test_exec_agent_env_overrides_host_api_key(
+    mock_running, runner, index_path, tmp_path, monkeypatch
+):
+    """Session agent_env overrides host API key of the same name."""
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    sess = _container_session()
+    sess["agent_env"] = ["ANTHROPIC_API_KEY=from-session"]
+    _write_session(ws, sess, index_path)
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "from-host")
+    with patch("subprocess.run", return_value=MagicMock(returncode=0)) as mock_run:
+        runner.invoke(cli, ["exec", "bash"])
+    args = mock_run.call_args[0][0]
+    # Session value should win; host value should not appear
+    assert "ANTHROPIC_API_KEY=from-session" in args
+    assert "ANTHROPIC_API_KEY=from-host" not in args
+
+
 # ---------------------------------------------------------------------------
 # pier list
 # ---------------------------------------------------------------------------

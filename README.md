@@ -34,7 +34,10 @@ pier skills             # install task skills for your agent
 - `--agent` installs a [supported coding agent](https://github.com/laude-institute/harbor) and registers skills from `skills_dir` in task.toml. Optional — without it you get a plain workspace. To install multiple agents, run `pier start --agent <name>` again from the workspace.
 - `--image` accepts any Docker image — a stock OS, a project image with tools pre-installed, etc.
 - `--no-mount` keeps files inside the container only (no bind-mount to host). `pier stop` copies files back.
-- `-f` / `--force` allows starting in a non-empty directory.
+- `-f` / `--force` allows starting in a non-empty directory. If a pier session already exists at `-d`, it stops the container, removes the workspace tree, and starts fresh.
+- `--ae` / `--agent-env` sets `KEY=VALUE` pairs stored in the session and passed into `pier exec`; they override host `*_API_KEY` vars with the same name when both are set.
+- `--ee` / `--environment-env` sets container environment variables at compose startup (`KEY=VALUE`, repeatable).
+- `--exec "<cmd>"` runs a command in the container immediately after a successful container start (not supported with `--host`).
 
 ### Work in the workspace
 
@@ -140,6 +143,8 @@ pier start https://github.com/org/repo#tasks/my-task
 # Manage existing workspace
 pier start --agent claude-code              # install agent in current workspace
 pier start                                  # restart a stopped container
+pier start ./tasks/my-task -d ./ws -f       # replace an existing session at ./ws
+pier start ./tasks/my-task -d ./ws --exec "claude --help"
 ```
 
 - `task_path` can be a local directory or a remote git reference (`URL#path`). Optional — omit for task-free mode.
@@ -150,7 +155,9 @@ pier start                                  # restart a stopped container
 - `-e` passes container-mode environment variables in `KEY=VALUE` format (repeatable). Stored in the session and forwarded on every `pier exec`.
 - `--env-file` loads container-mode environment variables from a `.env` file. Same behavior as `-e` for each line.
 - `--no-mount` keeps files inside the container only (no bind-mount to host). `pier stop` copies files back.
-- `-f` / `--force` allows starting in a non-empty directory.
+- `-f` / `--force` allows starting in a non-empty directory. If a session already exists at the target `-d`, removes that workspace (and stops its container) before creating a new one.
+- `--ae` / `--agent-env` and `--ee` / `--environment-env` pass `KEY=VALUE` pairs (repeatable); `--ae` values are persisted and merged into `pier exec` (overriding host `*_API_KEY` for the same key). `--ee` values are applied in the compose service environment at container start.
+- `--exec` runs one command in the container right after start (container mode only).
 - `--host` skips the container (workspace only).
 - `--agent` installs a coding agent. To install additional agents, run `pier start --agent <name>` again from the workspace. When `task_path` is omitted, it operates on the current workspace.
 
@@ -164,7 +171,7 @@ pier exec claude
 pier exec -d -- quarto preview --port 8888 --host 0.0.0.0 --no-browse
 ```
 
-- **Container mode**: delegates to `docker exec` in the container's working directory
+- **Container mode**: delegates to `docker exec` in the container's working directory. Host `*_API_KEY` environment variables are forwarded unless the session has the same key from `--ae` / `--agent-env` (session wins).
 - **Host mode**: runs the command directly with `TASK_WORKSPACE` set
 - `-d` / `--detach`: runs in the background (useful for servers like quarto preview)
 
@@ -182,6 +189,13 @@ pier verify
 ### `pier stop`
 
 Stop the Docker container for the current workspace (container mode only). The workspace directory is preserved. Restart later with `pier start` (no arguments, from inside the workspace).
+
+```bash
+pier stop              # stop the current workspace's container
+pier stop --all        # stop every container-mode workspace pier knows about
+```
+
+If Harbor cannot tear down the environment (for example the task directory was removed), pier falls back to `docker rm -f` and clears the local session.
 
 ### `pier list`
 
