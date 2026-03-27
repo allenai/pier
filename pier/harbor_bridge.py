@@ -229,16 +229,11 @@ def _make_environment(
     trial_paths.mkdir()
 
     container_workdir = _get_dockerfile_workdir(task.paths.environment_dir)
-    mount_spec = (
-        f"{workspace_dir.resolve()}:{container_workdir}:rw"
-        if workspace_dir is not None
-        else None
-    )
 
-    kwargs: dict = {}
-    if mount_spec and _harbor_supports_mounts_json():
-        kwargs["mounts_json"] = [mount_spec]
-
+    # Do NOT pass mounts_json to Harbor.  Harbor's start() calls
+    # _write_mounts_compose_file() when mounts_json is set, which
+    # overwrites the same docker-compose-mounts.json that pier writes
+    # below — clobbering the tmpfs and .task/ mounts.
     environment = EnvironmentFactory.create_environment(
         type="docker",
         environment_dir=task.paths.environment_dir,
@@ -246,18 +241,16 @@ def _make_environment(
         session_id=harbor_session_id,
         trial_paths=trial_paths,
         task_env_config=task.config.environment,
-        **kwargs,
     )
 
-    # Always write a compose override for the tmpfs mount that hides .pier/
-    # from the container. On older Harbor (no mounts_json), this file also
-    # carries the workspace bind mount.
+    # Write a single compose override with all pier-specific mounts:
+    # workspace bind, tmpfs over .pier/, and .task/ read-only mounts.
     if workspace_dir is not None:
         mounts_path = _write_mounts_compose(
             trial_dir,
             workspace_dir,
             container_workdir,
-            include_bind_mount=not _harbor_supports_mounts_json(),
+            include_bind_mount=True,
             task_dir=task_dir,
         )
         _patch_compose_paths(environment, mounts_path)
