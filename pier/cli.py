@@ -1,52 +1,42 @@
-"""pier CLI — interactive task runner (container or host workspaces).
+"""pier CLI — interactive workspace manager for coding agents.
 
 Commands:
+    pier capture                   — extract agent trajectory for current workspace
+    pier traces                    — list or export captured traces
     pier start <task_path>         — launch a workspace for a task
-    pier start <task_path> --host  — launch a host-based workspace (no Docker)
+    pier start -d . --image <img>  — launch a task-free container workspace
     pier exec -- <cmd>             — run a command in the workspace
     pier verify                    — run verifier for the workspace
     pier view                      — web dashboard for trial trajectories
     pier summarize                 — AI summary of trial results
-    pier stop                      — tear down workspace, extract artifacts
+    pier stop                      — stop the container
     pier list                      — show active workspaces
-    pier skills --install          — install task skills (host mode)
+    pier skills                    — install task skills (host mode)
 """
 
 from __future__ import annotations
 
 import hashlib
 import json
+import tempfile
 import logging
 import os
+import re
 import shutil
 import subprocess
-import sys
 import tomllib
 from datetime import datetime, timezone
 from pathlib import Path
 
 import click
 
+from pier import harbor_bridge
+
 PIER_DIR = ".pier"
 
 logger = logging.getLogger(__name__)
 INDEX_PATH = Path.home() / ".pier" / "index.json"
-
-_HARBOR_INSTALL_HINT = (
-    "Install: uv tool install --with harbor git+https://github.com/allenai/pier"
-)
-
-
-def _require_harbor(feature: str):
-    """Import and return harbor_bridge, or raise a clear error."""
-    try:
-        from pier import harbor_bridge
-
-        return harbor_bridge
-    except ImportError:
-        raise click.ClickException(
-            f"{feature} requires Harbor.\n{_HARBOR_INSTALL_HINT}"
-        )
+ENV_KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 
 # ---------------------------------------------------------------------------
@@ -141,6 +131,14 @@ def _resolve_workspace(workspace_arg: str | None = None) -> tuple[dict, Path]:
     return workspaces[0]
 
 
+def _resolve_workspace_from_cwd_only() -> tuple[dict, Path]:
+    """Resolve a workspace only from the current directory ancestry."""
+    found = _find_workspace_from_cwd()
+    if found is None:
+        raise click.ClickException("Not inside a workspace.")
+    return _load_session(found), found
+
+
 # ---------------------------------------------------------------------------
 # Global index (~/.pier/index.json) — lightweight cache for pier list
 # ---------------------------------------------------------------------------
@@ -173,6 +171,130 @@ def _index_register(workspace: Path) -> None:
 # ---------------------------------------------------------------------------
 # Task config
 # ---------------------------------------------------------------------------
+
+
+def _tar_copy_to_container(workspace: Path, container: str, workdir: str) -> None:
+    """Stream workspace files (excluding .pier/) into the container via tar pipe."""
+    with subprocess.Popen(
+        ["tar", "-cf", "-", "-C", str(workspace), "--exclude", ".pier", "."],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env={**os.environ, "COPYFILE_DISABLE": "1"},
+    ) as tar_create:
+        extract = subprocess.run(
+            ["docker", "exec", "-i", container, "tar", "-xf", "-", "-C", workdir],
+            stdin=tar_create.stdout,
+            capture_output=True,
+        )
+        if tar_create.stdout is not None:
+            tar_create.stdout.close()
+        tar_create.wait()
+        tar_create_stderr = b""
+        if tar_create.stderr is not None:
+            tar_create_stderr = tar_create.stderr.read()
+    if extract.returncode != 0:
+        stderr = extract.stderr.decode(errors="replace").strip()
+        raise click.ClickException(
+            f"Failed to extract workspace into container: {stderr or 'tar extraction failed'}"
+        )
+    if tar_create.returncode != 0:
+        stderr = tar_create_stderr.decode(errors="replace").strip()
+        raise click.ClickException(
+            f"Failed to archive workspace for container copy: {stderr or 'tar create failed'}"
+        )
+
+
+def _tar_copy_from_container(container: str, workdir: str, workspace: Path) -> None:
+    """Stream container workspace files (excluding .pier/) to host via tar pipe."""
+    with subprocess.Popen(
+        [
+            "docker",
+            "exec",
+            container,
+            "tar",
+            "-cf",
+            "-",
+            "-C",
+            workdir,
+            "--exclude",
+            ".pier",
+            ".",
+        ],
+        stdout=subprocess.PIPE,
+    ) as tar_create:
+        extract = subprocess.run(
+            ["tar", "-xf", "-", "--no-same-owner", "-C", str(workspace)],
+            stdin=tar_create.stdout,
+            env={**os.environ, "COPYFILE_DISABLE": "1"},
+        )
+        tar_create.wait()
+    if tar_create.returncode != 0 or extract.returncode != 0:
+        raise click.ClickException(
+            f"tar copy from container failed (create={tar_create.returncode}, "
+            f"extract={extract.returncode})"
+        )
+
+
+def _parse_env_file(path: Path) -> list[str]:
+    """Parse a .env file into KEY=VALUE strings."""
+    result = []
+    for lineno, line in enumerate(path.read_text().splitlines(), start=1):
+        line = line.strip()
+        if line and not line.startswith("#") and "=" in line:
+            result.append(_validate_env_kv(line, f"{path}:{lineno}"))
+        elif line and not line.startswith("#"):
+            raise click.ClickException(
+                f"Malformed environment entry in {path}:{lineno}: {line!r}. "
+                "Expected KEY=VALUE."
+            )
+    return result
+
+
+def _validate_env_kv(entry: str, source: str) -> str:
+    if entry.startswith("export "):
+        raise click.ClickException(
+            f"Malformed environment entry from {source}: {entry!r}. "
+            "Use KEY=VALUE without 'export '."
+        )
+    key, sep, value = entry.partition("=")
+    if not sep or not key or not ENV_KEY_RE.fullmatch(key):
+        raise click.ClickException(
+            f"Malformed environment entry from {source}: {entry!r}. "
+            "Expected KEY=VALUE with a valid env var name."
+        )
+    return f"{key}={value}"
+
+
+def _resolve_restart_ports(
+    requested_ports: tuple[int, ...] | list[int] | None, existing_sess: dict
+) -> list[int]:
+    if requested_ports:
+        return list(requested_ports)
+    return [int(port) for port in existing_sess.get("ports", [])]
+
+
+def _resolve_restart_mounts(
+    requested_mounts: list[str] | None, existing_sess: dict
+) -> list[str]:
+    if requested_mounts is not None:
+        return requested_mounts
+    return list(existing_sess.get("extra_mounts", []))
+
+
+def _parse_mounts_json(mounts_json: str | None) -> list[str] | None:
+    if not mounts_json:
+        return None
+    try:
+        parsed = json.loads(mounts_json)
+    except json.JSONDecodeError as exc:
+        raise click.ClickException(
+            f"--mounts-json must be valid JSON: {exc.msg}"
+        ) from exc
+    if not isinstance(parsed, list) or any(
+        not isinstance(item, str) for item in parsed
+    ):
+        raise click.ClickException("--mounts-json must be a JSON array of strings")
+    return parsed
 
 
 def _read_task_toml(task_dir: Path) -> dict:
@@ -220,28 +342,6 @@ def _add_agent(agents: list[str], agent: str | None) -> list[str]:
     return agents
 
 
-def _link_task_files(task_dir: Path, workspace: Path) -> None:
-    """Symlink task instruction and skills into .task/ in the workspace.
-
-    Exposes only instruction.md and skills/ — not tests or task.toml
-    which could leak verifier details to agents.
-    """
-    dot_task = workspace / ".task"
-    dot_task.mkdir(exist_ok=True)
-
-    instruction = task_dir / "instruction.md"
-    if instruction.exists():
-        link = dot_task / "instruction.md"
-        if not link.exists():
-            link.symlink_to(instruction.resolve())
-
-    skills_dir = task_dir / "environment" / "skills"
-    if skills_dir.is_dir():
-        link = dot_task / "skills"
-        if not link.exists():
-            link.symlink_to(skills_dir.resolve())
-
-
 def _seed_workspace(
     task_dir: Path, workspace: Path, *, container: bool = False
 ) -> None:
@@ -251,13 +351,11 @@ def _seed_workspace(
     workspace matches what Harbor's container would have.  Falls back to
     copying the environment/ directory (approximates ``COPY . /app``).
 
-    In container mode, .task/ files are mounted via Docker compose override
-    so we skip creating symlinks (whose host-path targets confuse tools
-    like glob/find inside the container).
+    In host mode, .task/ is symlinked so task edits propagate immediately.
+    In container mode, .task/ is populated separately (by _write_mounts_compose
+    or the --no-mount copy path) using copies, so we skip it here.
     """
     try:
-        from pier import harbor_bridge
-
         click.echo("Building image and extracting workspace files...")
         harbor_bridge.extract_image_workdir(task_dir, workspace)
     except Exception as e:
@@ -277,7 +375,14 @@ def _seed_workspace(
                     shutil.copy2(item, dest)
 
     if not container:
-        _link_task_files(task_dir, workspace)
+        # Host mode: symlink so edits to the task source propagate immediately.
+        dot_task = workspace / ".task"
+        dot_task.mkdir(exist_ok=True)
+        instruction = task_dir / "instruction.md"
+        if instruction.exists():
+            link = dot_task / "instruction.md"
+            if not link.exists():
+                link.symlink_to(instruction.resolve())
 
 
 def _is_remote_task(task_path: str) -> bool:
@@ -299,15 +404,8 @@ def _resolve_task_path(task_path: str) -> Path:
         git_url, task_subpath = task_path.rsplit("#", 1)
         click.echo(f"Downloading task from {git_url} ({task_subpath})...")
 
-        from pier import harbor_bridge
-
         try:
             task_dir = harbor_bridge.download_task(git_url, task_subpath)
-        except ImportError:
-            raise click.ClickException(
-                f"Remote task references require Harbor.\n{_HARBOR_INSTALL_HINT}\n"
-                "Or clone the repo and use a local path: pier start ./path/to/task -d ./workspace"
-            )
         except Exception as e:
             raise click.ClickException(f"Failed to download task: {e}")
         return task_dir
@@ -326,25 +424,6 @@ def _print_reward(reward: dict) -> None:
             click.echo(f"  {k}: {v}")
 
 
-def _read_host_reward(verifier_dir: Path) -> dict:
-    """Read reward from host-mode verifier output directory."""
-    reward_path = verifier_dir / "reward.json"
-    details_path = verifier_dir / "details.json"
-
-    reward: dict = {}
-    if reward_path.exists():
-        try:
-            reward = json.loads(reward_path.read_text())
-        except json.JSONDecodeError:
-            pass
-    if details_path.exists():
-        try:
-            reward.update(json.loads(details_path.read_text()))
-        except json.JSONDecodeError:
-            pass
-    return reward or {"reward": None}
-
-
 def _assemble_trial_output(
     trial_dir: Path,
     sess: dict,
@@ -361,28 +440,22 @@ def _assemble_trial_output(
     agent_context = None
 
     if session_dir:
-        try:
-            from pier import harbor_bridge
-
-            # Auto-detect agent from session_dir if not specified
-            if not agent:
-                agent = harbor_bridge.detect_agent_from_session_dir(Path(session_dir))
-                if agent:
-                    click.echo(f"Detected agent: {agent}")
-
+        # Auto-detect agent from session_dir if not specified
+        if not agent:
+            agent = harbor_bridge.detect_agent_from_session_dir(Path(session_dir))
             if agent:
-                agent_context = harbor_bridge.extract_agent_logs(
-                    agent,
-                    Path(session_dir),
-                    trial_dir / "agent",
-                )
-                if agent_context:
-                    click.echo("Agent trajectory extracted.")
-        except ImportError:
-            click.echo(
-                "Warning: Harbor not installed, skipping agent log extraction.",
-                err=True,
+                click.echo(f"Detected agent: {agent}")
+
+        if agent:
+            agent_context = harbor_bridge.extract_agent_logs(
+                agent,
+                Path(session_dir),
+                trial_dir / "agent",
             )
+            if agent_context:
+                click.echo("Agent trajectory extracted.")
+            else:
+                click.echo("Warning: trajectory extraction returned no data.", err=True)
     elif agent:
         click.echo(f"Tip: pass --session-dir to extract {agent} trajectory.")
 
@@ -408,7 +481,7 @@ def _assemble_trial_output(
 
 @click.group()
 def cli():
-    """pier — interactive task runner."""
+    """pier — interactive workspace manager for coding agents."""
 
 
 @cli.command()
@@ -425,39 +498,141 @@ def cli():
     "workspace_dir",
     default=None,
     type=click.Path(),
-    help="Workspace directory. Required for local tasks; defaults to ./<task-name> for remote tasks.",
+    help="Workspace directory. Required for local tasks and task-free mode.",
 )
 @click.option(
     "-a",
     "--agent",
     default=None,
-    help="Agent to set up with skills (container mode). E.g. claude-code, codex, goose.",
+    help="Agent to set up (container mode). E.g. claude-code, codex, goose.",
+)
+@click.option(
+    "--image",
+    default=None,
+    help="Base Docker image for task-free mode (e.g. ubuntu:24.04).",
+)
+@click.option(
+    "--ports",
+    multiple=True,
+    type=int,
+    help="Expose container port to host (repeatable).",
+)
+@click.option(
+    "--mounts-json",
+    default=None,
+    help="JSON array of volume mounts (e.g. '[\"./skills:/opt/asta-plugins/skills:ro\"]').",
+)
+@click.option(
+    "-e",
+    "extra_env_cli",
+    multiple=True,
+    help="Container-mode environment variable in KEY=VALUE format, forwarded to all pier exec commands (repeatable).",
+)
+@click.option(
+    "--env-file",
+    type=click.Path(exists=True),
+    default=None,
+    help="Path to a .env file to load into the container environment (container mode only).",
+)
+@click.option(
+    "--no-mount",
+    is_flag=True,
+    default=False,
+    help="Don't bind-mount the workspace into the container. Files stay inside the container only.",
+)
+@click.option(
+    "-f",
+    "--force",
+    is_flag=True,
+    default=False,
+    help="Allow starting in a non-empty directory.",
 )
 def start(
     task_path: str | None,
     host: bool,
     workspace_dir: str | None,
     agent: str | None,
+    image: str | None,
+    ports: tuple[int, ...],
+    mounts_json: str | None,
+    extra_env_cli: tuple[str, ...],
+    env_file: str | None,
+    no_mount: bool,
+    force: bool,
 ) -> None:
-    """Launch a workspace for a task, or install an agent into an existing one.
+    """Launch a workspace, or install an agent into an existing one.
 
     TASK_PATH is a local directory containing task.toml, or a remote git
     reference in the form URL#path (e.g.
     https://github.com/org/repo#tasks/my-task).
 
-    If TASK_PATH is omitted, operates on the current workspace (resolved
-    from cwd). This is useful for installing an agent into an existing
-    workspace: pier start --agent claude-code
+    If TASK_PATH is omitted with --image and -d, starts a task-free
+    container from the given image.
 
-    A local workspace directory is created and seeded with the task
-    image's WORKDIR contents.  In container mode (the default), the
-    workspace is bind-mounted into the container so edits sync both
-    ways.  Pass --host to skip the container.
+    If TASK_PATH is omitted without --image, operates on the current
+    workspace (resolved from cwd). This is useful for installing an agent
+    into an existing workspace: pier start --agent claude-code
+
+    \b
+    Examples:
+        pier start ./tasks/my-task -d ./workspace
+        pier start -d . --image ubuntu:24.04 --agent claude-code
+        pier start --agent claude-code
     """
-    # No task_path → operate on existing workspace from cwd
+    extra_mounts = _parse_mounts_json(mounts_json)
+
+    if no_mount and host:
+        raise click.ClickException("--no-mount and --host are mutually exclusive.")
+    if host and extra_env_cli:
+        raise click.ClickException("-e cannot be used with --host.")
+    if host and env_file:
+        raise click.ClickException("--env-file cannot be used with --host.")
+
+    # Collect and validate extra env vars from -e and --env-file.
+    # Stored in the session and forwarded on every pier exec.
+    extra_env_list: list[str] = []
+    for kv in extra_env_cli:
+        extra_env_list.append(_validate_env_kv(kv, "-e"))
+    if env_file:
+        extra_env_list.extend(_parse_env_file(Path(env_file)))
+
+    # Load into host env so task.toml resolution picks them up.
+    for kv in extra_env_list:
+        key, _, val = kv.partition("=")
+        if key and _:
+            os.environ[key] = val
+
+    # Task-free mode: --image without task_path
+    if task_path is None and image:
+        if not workspace_dir:
+            raise click.ClickException(
+                "Task-free mode requires -d/--dir to specify the workspace directory, "
+                "e.g. pier start -d . --image ubuntu:24.04 --agent claude-code"
+            )
+        p = Path(workspace_dir)
+        workspace = p if p.is_absolute() else Path.cwd().resolve() / p
+        workspace = workspace.resolve()
+        _start_task_free(
+            workspace,
+            image,
+            agents=[agent] if agent else None,
+            ports=list(ports),
+            extra_mounts=extra_mounts,
+            extra_env=extra_env_list,
+            no_mount=no_mount,
+            force=force,
+        )
+        return
+
+    # No task_path, no image → operate on existing workspace from cwd
     if task_path is None:
         _start_existing(agent=agent)
         return
+
+    if image:
+        click.echo(
+            "Warning: --image is ignored when a task path is provided.", err=True
+        )
 
     is_remote = _is_remote_task(task_path)
     task_dir = _resolve_task_path(task_path)
@@ -480,52 +655,66 @@ def start(
         mode = existing_sess.get("mode")
 
         if mode == "container":
-            harbor_bridge = _require_harbor("Container mode")
             hsid = _get_hsid(existing_sess, workspace)
             if harbor_bridge.is_environment_running(hsid):
                 if agent:
-                    # Install agent into the existing running container
-                    harbor_trial_dir = _harbor_trial_dir(workspace)
-                    _install_agent(
-                        harbor_bridge,
-                        Path(existing_sess["task_dir"]),
-                        hsid,
-                        harbor_trial_dir,
-                        agent,
-                    )
-                    existing_sess["agents"] = _add_agent(
-                        existing_sess.get("agents", []), agent
-                    )
-                    _save_session(workspace, existing_sess)
+                    _install_agents_into_running(existing_sess, workspace, [agent])
                     return
                 click.echo("Container is already running.")
                 return
             else:
                 # Container stopped — restart it
+                existing_task_dir = Path(existing_sess["task_dir"]).resolve()
+                if task_dir.resolve() != existing_task_dir:
+                    raise click.ClickException(
+                        "Workspace already exists for a different task. "
+                        "Restart it with the original task path or run from inside the workspace."
+                    )
                 agents = _add_agent(existing_sess.get("agents", []), agent)
-                _start_container(task_dir, workspace, agents=agents)
+                resolved_ports = _resolve_restart_ports(ports, existing_sess)
+                resolved_extra_mounts = _resolve_restart_mounts(
+                    extra_mounts, existing_sess
+                )
+                _start_container(
+                    task_dir,
+                    workspace,
+                    agents=agents,
+                    ports=resolved_ports,
+                    extra_mounts=resolved_extra_mounts,
+                    extra_env=extra_env_list or existing_sess.get("extra_env", []),
+                    no_mount=existing_sess.get("no_mount", False),
+                )
                 return
         else:
             # Host mode — workspace already exists, nothing to do
             click.echo(f"Workspace already exists at {workspace}.")
             return
 
-    # Create workspace
-    if workspace.exists():
+    # Safety check: don't write into a non-empty directory by accident.
+    if not force and workspace.exists() and any(workspace.iterdir()):
         raise click.ClickException(
-            f"Directory {workspace} already exists. Pick a different -d path."
+            f"Directory {workspace} is not empty. Use -f/--force to proceed anyway."
         )
-    workspace.mkdir(parents=True)
+    workspace.mkdir(parents=True, exist_ok=True)
 
     # Seed workspace with the same files the container WORKDIR would have.
-    _seed_workspace(task_dir, workspace, container=not host)
+    if not no_mount:
+        _seed_workspace(task_dir, workspace, container=not host)
 
     if host:
         if agent:
             click.echo("Hint: --agent is for container mode.")
         _start_host(task_dir, workspace)
     else:
-        _start_container(task_dir, workspace, agents=[agent] if agent else None)
+        _start_container(
+            task_dir,
+            workspace,
+            agents=[agent] if agent else None,
+            ports=list(ports),
+            extra_mounts=extra_mounts,
+            extra_env=extra_env_list,
+            no_mount=no_mount,
+        )
 
 
 def _start_existing(agent: str | None) -> None:
@@ -557,22 +746,24 @@ def _start_existing(agent: str | None) -> None:
         click.echo(f"Workspace already exists at {ws}.")
         return
 
-    harbor_bridge = _require_harbor("Container mode")
-
     hsid = _get_hsid(sess, ws)
-    task_dir = Path(sess["task_dir"])
 
     if not harbor_bridge.is_environment_running(hsid):
         # Restart the stopped container (reinstalls all agents)
         agents = _add_agent(sess.get("agents", []), agent)
-        _start_container(task_dir, ws, agents=agents)
+        _start_container(
+            Path(sess["task_dir"]),
+            ws,
+            agents=agents,
+            ports=_resolve_restart_ports(None, sess),
+            extra_mounts=_resolve_restart_mounts(None, sess),
+            extra_env=sess.get("extra_env", []),
+            no_mount=sess.get("no_mount", False),
+        )
         return
 
     if agent:
-        harbor_trial_dir = _harbor_trial_dir(ws)
-        _install_agent(harbor_bridge, task_dir, hsid, harbor_trial_dir, agent)
-        sess["agents"] = _add_agent(sess.get("agents", []), agent)
-        _save_session(ws, sess)
+        _install_agents_into_running(sess, ws, [agent])
     else:
         click.echo("Container is already running.")
 
@@ -591,41 +782,54 @@ def _start_host(task_dir: Path, workspace: Path) -> None:
     label = _workspace_label(workspace)
     click.echo(f"\nWorkspace {label!r} ready (host mode).")
     click.echo(f"  cd {workspace}")
-
-    skills_dir = task_dir / "environment" / "skills"
-    if skills_dir.is_dir() and any(skills_dir.iterdir()):
-        click.echo("  pier skills --install    # install task skills for your agent")
-
     click.echo("")
     click.echo("Task instruction is at .task/instruction.md.")
 
 
 def _install_agent(
-    harbor_bridge: object,
     task_dir: Path,
     harbor_session_id: str,
     trial_dir: Path,
     agent: str,
 ) -> None:
     """Validate and install a Harbor agent into a running container."""
-    if not harbor_bridge.is_valid_agent(agent):  # type: ignore[attr-defined]
+    if not harbor_bridge.is_valid_agent(agent):
         raise click.ClickException(f"Unknown agent {agent!r}.")
     click.echo(f"Installing {agent} in the container...")
     try:
-        harbor_bridge.setup_agent(  # type: ignore[attr-defined]
-            task_dir, harbor_session_id, trial_dir, agent
-        )
+        harbor_bridge.setup_agent(task_dir, harbor_session_id, trial_dir, agent)
         click.echo(f"{agent} installed.")
     except Exception as e:
         raise click.ClickException(f"Agent setup failed: {e}")
+
+
+def _install_agents_into_running(
+    sess: dict,
+    workspace: Path,
+    agents: list[str],
+) -> None:
+    """Install one or more agents into an already-running container and update session."""
+    task_dir = Path(sess["task_dir"])
+    hsid = _get_hsid(sess, workspace)
+    trial_dir = _harbor_trial_dir(workspace)
+    for agent in agents:
+        _install_agent(task_dir, hsid, trial_dir, agent)
+    current = sess.get("agents", [])
+    for agent in agents:
+        current = _add_agent(current, agent)
+    sess["agents"] = current
+    _save_session(workspace, sess)
 
 
 def _start_container(
     task_dir: Path,
     workspace: Path,
     agents: list[str] | None = None,
+    ports: list[int] | None = None,
+    extra_mounts: list[str] | None = None,
+    extra_env: list[str] | None = None,
+    no_mount: bool = False,
 ) -> None:
-    harbor_bridge = _require_harbor("Container mode")
 
     hsid = _harbor_session_id(workspace)
     harbor_trial_dir = _harbor_trial_dir(workspace)
@@ -637,13 +841,43 @@ def _start_container(
             task_dir,
             hsid,
             harbor_trial_dir,
-            workspace_dir=workspace,
+            workspace_dir=None if no_mount else workspace,
+            ports=ports,
+            extra_mounts=extra_mounts,
         )
     except Exception as e:
         raise click.ClickException(f"Failed to start container: {e}")
 
+    if no_mount:
+        container = harbor_bridge.get_container_name(hsid)
+        workdir = harbor_bridge.get_container_workdir(task_dir)
+
+        # Copy host workspace into container (excluding .pier/).
+        # Fix git ownership (files change uid across docker cp).
+        if (workspace / ".git").is_dir():
+            subprocess.run(
+                [
+                    "docker",
+                    "exec",
+                    container,
+                    "git",
+                    "config",
+                    "--global",
+                    "--add",
+                    "safe.directory",
+                    workdir,
+                ],
+                capture_output=True,
+            )
+        # Copy task instruction into workspace/.task/ (same as bind-mount mode)
+        # before tar so it's included in the transfer.
+        harbor_bridge.copy_task_files(task_dir, workspace / ".task")
+
+        if any(f for f in workspace.iterdir() if f.name != ".pier"):
+            _tar_copy_to_container(workspace, container, workdir)
+
     for agent in agents or []:
-        _install_agent(harbor_bridge, task_dir, hsid, harbor_trial_dir, agent)
+        _install_agent(task_dir, hsid, harbor_trial_dir, agent)
 
     _save_session(
         workspace,
@@ -653,6 +887,10 @@ def _start_container(
             "task_ref": task_dir.name,
             "harbor_session_id": hsid,
             "agents": agents or [],
+            "ports": ports or [],
+            "extra_mounts": extra_mounts or [],
+            "extra_env": extra_env or [],
+            "no_mount": no_mount,
             "started_at": datetime.now(timezone.utc).isoformat(),
         },
     )
@@ -663,18 +901,111 @@ def _start_container(
     if agents:
         names = ", ".join(agents)
         click.echo(f"  pier exec <agent-cli>    # run an installed agent ({names})")
-    click.echo("")
-    click.echo(
-        "Task instruction is at .task/instruction.md (inside the container too)."
+    if (task_dir / "instruction.md").exists() and (
+        task_dir / "instruction.md"
+    ).stat().st_size > 0:
+        click.echo("")
+        click.echo(
+            "Task instruction is at .task/instruction.md (inside the container too)."
+        )
+
+
+def _start_task_free(
+    workspace: Path,
+    image: str,
+    agents: list[str] | None = None,
+    ports: list[int] | None = None,
+    extra_mounts: list[str] | None = None,
+    extra_env: list[str] | None = None,
+    no_mount: bool = False,
+    force: bool = False,
+) -> None:
+    """Start a task-free container from a base image.
+
+    Creates a synthetic task directory (minimal Dockerfile + task.toml)
+    so we can reuse Harbor's standard environment machinery instead of
+    maintaining a separate code path.
+    """
+
+    # If workspace already has a session, handle like _start_existing
+    if _session_json_path(workspace).exists():
+        existing_sess = _load_session(workspace)
+        if existing_sess.get("mode") == "container":
+            hsid = _get_hsid(existing_sess, workspace)
+            if harbor_bridge.is_environment_running(hsid):
+                if agents:
+                    _install_agents_into_running(existing_sess, workspace, agents)
+                else:
+                    click.echo("Container is already running.")
+                return
+            else:
+                # Container stopped — restart it
+                existing_agents = _add_agent(existing_sess.get("agents", []), None)
+                if agents:
+                    for a in agents:
+                        existing_agents = _add_agent(existing_agents, a)
+                resolved_ports = _resolve_restart_ports(ports, existing_sess)
+                resolved_extra_mounts = _resolve_restart_mounts(
+                    extra_mounts, existing_sess
+                )
+                _start_container(
+                    harbor_bridge.create_synthetic_task_dir(
+                        image, _pier_dir(workspace)
+                    ),
+                    workspace,
+                    agents=existing_agents,
+                    ports=resolved_ports,
+                    extra_mounts=resolved_extra_mounts,
+                    extra_env=extra_env or existing_sess.get("extra_env", []),
+                    no_mount=existing_sess.get("no_mount", False),
+                )
+                sess = _load_session(workspace)
+                sess["image"] = image
+                _save_session(workspace, sess)
+                return
+
+    # Safety check for non-empty directory.
+    if not force and workspace.exists() and any(workspace.iterdir()):
+        raise click.ClickException(
+            f"Directory {workspace} is not empty. Use -f/--force to proceed anyway."
+        )
+    workspace.mkdir(parents=True, exist_ok=True)
+
+    # Create synthetic task so Harbor's environment machinery works
+    pier_dir = _pier_dir(workspace)
+    pier_dir.mkdir(parents=True, exist_ok=True)
+    task_dir = harbor_bridge.create_synthetic_task_dir(image, pier_dir)
+
+    # Reuse the standard container start path
+    _start_container(
+        task_dir,
+        workspace,
+        agents=agents,
+        ports=ports,
+        extra_mounts=extra_mounts,
+        extra_env=extra_env,
+        no_mount=no_mount,
     )
+
+    # Update session with task-free metadata (overwrite what _start_container wrote)
+    sess = _load_session(workspace)
+    sess["image"] = image
+    _save_session(workspace, sess)
 
 
 @cli.command(
     "exec",
     context_settings={"ignore_unknown_options": True, "allow_extra_args": True},
 )
+@click.option(
+    "-d",
+    "--detach",
+    is_flag=True,
+    default=False,
+    help="Run in the background (detached).",
+)
 @click.argument("command", nargs=-1, type=click.UNPROCESSED, required=True)
-def exec_cmd(command: tuple[str, ...]) -> None:
+def exec_cmd(detach: bool, command: tuple[str, ...]) -> None:
     """Run a command inside the workspace.
 
     Container mode uses docker exec (streaming output). Host mode runs
@@ -684,6 +1015,7 @@ def exec_cmd(command: tuple[str, ...]) -> None:
     Examples:
         pier exec bash
         pier exec claude
+        pier exec -d -- quarto preview --port 8888 --host 0.0.0.0 --no-browse
     """
     if not command:
         raise click.ClickException("No command specified.")
@@ -693,57 +1025,46 @@ def exec_cmd(command: tuple[str, ...]) -> None:
     if sess.get("mode") == "host":
         _exec_host(sess, ws, list(command))
     else:
-        _exec_container(sess, ws, list(command))
+        _exec_container(sess, ws, list(command), detach=detach)
 
 
-def _exec_container(sess: dict, workspace: Path, command: list[str]) -> None:
-    harbor_bridge = _require_harbor("Container exec")
-
+def _exec_container(
+    sess: dict, workspace: Path, command: list[str], *, detach: bool = False
+) -> None:
     hsid = _get_hsid(sess, workspace)
     if not harbor_bridge.is_environment_running(hsid):
         raise click.ClickException(
             "Container is not running. Start it with 'pier start'."
         )
-    container = harbor_bridge.get_container_name(hsid)
-    workdir = harbor_bridge.get_container_workdir(Path(sess["task_dir"]))
 
-    # Build env flags for docker exec.
-    env_flags: list[str] = []
+    # Build env vars from task config, session, and agent setup.
+    # TODO: -e/--env-file vars should ideally be scoped (agent-only vs container-wide)
+    # but pier exec can't distinguish agent from non-agent commands.
+    task_dir = Path(sess["task_dir"])
+    env: dict[str, str] = {}
+    env.update(harbor_bridge.resolve_task_env(task_dir))
+    for kv in sess.get("extra_env", []):
+        key, _, val = kv.partition("=")
+        if key:
+            env[key] = val
 
-    # Forward host API keys into the container.
-    for var, val in os.environ.items():
-        if var.endswith("_API_KEY"):
-            env_flags.extend(["-e", f"{var}={val}"])
-
-    # Forward behavioral env vars and PATH prefixes from all installed
-    # agents.  Merging is safe because the allowlisted vars don't conflict
-    # between agents.  Harbor is the single source of truth.
+    # Merge agent env vars and PATH prefixes.
     path_prefixes: list[str] = []
     for agent_name in sess.get("agents", []):
         agent_env, pfx = harbor_bridge.get_agent_exec_env(agent_name)
-        for var, val in agent_env.items():
-            env_flags.extend(["-e", f"{var}={val}"])
+        env.update(agent_env)
         if pfx:
             path_prefixes.append(pfx)
-    path_prefix = ":".join(path_prefixes)
 
-    if path_prefix:
-        import shlex
-
-        # Don't quote path_prefix — it may contain $HOME that must expand.
-        # It comes from Harbor (trusted), not user input.
-        shell_cmd = f"export PATH={path_prefix}:$PATH && exec " + " ".join(
-            shlex.quote(c) for c in command
-        )
-        run_command = [container, "sh", "-c", shell_cmd]
-    else:
-        run_command = [container, *command]
-
-    tty_flags = ["-it"] if sys.stdin.isatty() else []
-    result = subprocess.run(
-        ["docker", "exec", *tty_flags, "-w", workdir, *env_flags, *run_command],
+    rc = harbor_bridge.exec_in_container(
+        hsid,
+        task_dir,
+        command,
+        env=env,
+        path_prefix=":".join(path_prefixes),
+        detach=detach,
     )
-    raise SystemExit(result.returncode)
+    raise SystemExit(rc)
 
 
 def _exec_host(sess: dict, workspace: Path, command: list[str]) -> None:
@@ -824,7 +1145,6 @@ def _verify_container(
     agent: str | None = None,
     session_dir: str | None = None,
 ) -> None:
-    harbor_bridge = _require_harbor("Container verify")
 
     hsid = _get_hsid(sess, workspace)
     if not harbor_bridge.is_environment_running(hsid):
@@ -898,19 +1218,11 @@ def _verify_host(
 
     verify_trial_dir = Path(trial_dir) if trial_dir else _new_trial_dir(workspace)
 
-    # Default: run the verifier in a temporary container with the workspace
-    # mounted, since most task test.sh scripts assume a container environment.
-    # Fall back to local execution if Harbor/Docker isn't available.
-    try:
-        from pier import harbor_bridge
-
-        reward, start_time, end_time = _verify_host_in_container(
-            task_dir, workspace, verify_trial_dir, harbor_bridge
-        )
-    except ImportError:
-        reward, start_time, end_time = _verify_host_locally(
-            task_dir, workspace, verify_trial_dir
-        )
+    # Run the verifier in a temporary container with the workspace mounted,
+    # since most task test.sh scripts assume a container environment.
+    reward, start_time, end_time = _verify_host_in_container(
+        task_dir, workspace, verify_trial_dir
+    )
 
     _print_reward(reward)
 
@@ -930,14 +1242,13 @@ def _verify_host_in_container(
     task_dir: Path,
     workspace: Path,
     trial_dir: Path,
-    harbor_bridge: object,
 ) -> tuple[dict, datetime, datetime]:
     """Run the verifier in a temporary container with the workspace mounted."""
     hsid = _harbor_session_id(workspace, prefix="pier-verify")
 
     click.echo("Starting verifier container...")
     try:
-        harbor_bridge.start_environment(  # type: ignore[attr-defined]
+        harbor_bridge.start_environment(
             task_dir,
             hsid,
             trial_dir,
@@ -945,7 +1256,7 @@ def _verify_host_in_container(
         )
 
         start_time = datetime.now(timezone.utc)
-        reward = harbor_bridge.verify_environment(  # type: ignore[attr-defined]
+        reward = harbor_bridge.verify_environment(
             task_dir,
             hsid,
             trial_dir,
@@ -954,7 +1265,7 @@ def _verify_host_in_container(
     except Exception as e:
         # Best-effort cleanup
         try:
-            harbor_bridge.stop_environment(  # type: ignore[attr-defined]
+            harbor_bridge.stop_environment(
                 task_dir,
                 hsid,
                 trial_dir,
@@ -966,7 +1277,7 @@ def _verify_host_in_container(
 
     click.echo("Stopping verifier container...")
     try:
-        harbor_bridge.stop_environment(  # type: ignore[attr-defined]
+        harbor_bridge.stop_environment(
             task_dir,
             hsid,
             trial_dir,
@@ -976,45 +1287,6 @@ def _verify_host_in_container(
         pass  # non-fatal — container cleanup is best-effort
 
     return reward, start_time, end_time
-
-
-def _verify_host_locally(
-    task_dir: Path,
-    workspace: Path,
-    trial_dir: Path,
-) -> tuple[dict, datetime, datetime]:
-    """Run test.sh directly on the host (fallback when Harbor isn't installed)."""
-    test_sh = task_dir / "tests" / "test.sh"
-    if not test_sh.exists():
-        raise click.ClickException(f"No tests/test.sh in {task_dir}")
-
-    verifier_dir = trial_dir / "verifier"
-    verifier_dir.mkdir(parents=True, exist_ok=True)
-
-    env = {
-        **os.environ,
-        "TASK_WORKSPACE": str(workspace),
-        "VERIFIER_DIR": str(verifier_dir),
-    }
-
-    click.echo("Running verifier locally (no Harbor)...")
-    start_time = datetime.now(timezone.utc)
-    result = subprocess.run(
-        ["bash", str(test_sh)],
-        env=env,
-        capture_output=True,
-        text=True,
-    )
-    end_time = datetime.now(timezone.utc)
-
-    if result.returncode != 0:
-        if result.stderr:
-            click.echo(result.stderr, err=True)
-        if result.stdout:
-            click.echo(result.stdout)
-        raise click.ClickException(f"Verifier failed (exit {result.returncode})")
-
-    return _read_host_reward(verifier_dir), start_time, end_time
 
 
 @cli.command()
@@ -1032,19 +1304,29 @@ def stop(workspace_dir: str | None) -> None:
     if sess.get("mode") != "container":
         raise click.ClickException("No container to stop (host-mode workspace).")
 
+    if sess.get("no_mount"):
+        # Copy workspace files from container to host before stopping,
+        # excluding .pier/ to avoid overwriting session data.
+        hsid = _get_hsid(sess, workspace)
+        container = harbor_bridge.get_container_name(hsid)
+        workdir = harbor_bridge.get_container_workdir(Path(sess["task_dir"]))
+        if harbor_bridge.is_environment_running(hsid):
+            click.echo("Copying workspace files from container...")
+            _tar_copy_from_container(container, workdir, workspace)
+
     _stop_container_env(sess, workspace)
     click.echo(f"Container for {_workspace_label(workspace)!r} stopped.")
 
 
 def _stop_container_env(sess: dict, workspace: Path) -> None:
     """Stop the Docker container for a container-mode session."""
-    harbor_bridge = _require_harbor("Container stop")
-
     hsid = _get_hsid(sess, workspace)
     harbor_trial_dir = _harbor_trial_dir(workspace)
+    task_dir = Path(sess["task_dir"])
+
     try:
         harbor_bridge.stop_environment(
-            Path(sess["task_dir"]),
+            task_dir,
             hsid,
             harbor_trial_dir,
         )
@@ -1064,23 +1346,14 @@ def list_workspaces() -> None:
     click.echo(f"  {'─' * 40} {'─' * 30} {'─' * 8}")
     for s, ws in workspaces:
         if s.get("mode") == "container":
-            try:
-                from pier import harbor_bridge
-
-                hsid = _get_hsid(s, ws)
-                container_name = harbor_bridge.get_container_name(hsid)
-                if harbor_bridge.is_environment_running(hsid):
-                    status = "running"
-                elif harbor_bridge.does_environment_exist(hsid):
-                    status = "stopped"
-                else:
-                    status = "not found"
-            except ImportError:
-                hsid = _get_hsid(s, ws)
-                # Container name follows Harbor's convention: {project}-main-1
-                project = hsid.lower().replace(".", "-")
-                container_name = f"{project}-main-1"
-                status = "unknown (no Harbor)"
+            hsid = _get_hsid(s, ws)
+            container_name = harbor_bridge.get_container_name(hsid)
+            if harbor_bridge.is_environment_running(hsid):
+                status = "running"
+            elif harbor_bridge.does_environment_exist(hsid):
+                status = "stopped"
+            else:
+                status = "not found"
         else:
             container_name = "—"
             status = "—"
@@ -1097,8 +1370,8 @@ def list_workspaces() -> None:
 def skills() -> None:
     """Install task skills for your coding agent (host mode).
 
-    Finds skills in the task's environment/skills/ directory and registers
-    them via npx skills add.
+    Reads skills_dir from task.toml, extracts skills from the task's
+    container image, and registers them via npx skills add.
     In container mode with --agent, skills are installed automatically.
     """
     sess, ws = _resolve_workspace()
@@ -1109,26 +1382,273 @@ def skills() -> None:
         )
 
     task_dir = Path(sess["task_dir"])
-    skills_dir = task_dir / "environment" / "skills"
-    if not skills_dir.is_dir():
-        click.echo("No skills found for this task.")
+    task_toml = _read_task_toml(task_dir)
+    skills_dir_str = (task_toml.get("environment") or {}).get("skills_dir")
+    if not skills_dir_str:
+        click.echo("No skills_dir in task.toml.")
         return
 
+    # Skills live inside the container image. Spin up a temporary container,
+    # copy them out, and register with the host agent.
+    click.echo("Extracting skills from task image...")
+    hsid = _harbor_session_id(ws, prefix="pier-skills")
+    container = harbor_bridge.get_container_name(hsid)
+    with tempfile.TemporaryDirectory() as tmpdir:
+        try:
+            harbor_bridge.start_environment(
+                task_dir,
+                hsid,
+                Path(tmpdir) / "trial",
+            )
+            dest = Path(tmpdir) / "skills"
+            subprocess.run(
+                ["docker", "cp", f"{container}:{skills_dir_str}", str(dest)],
+                check=True,
+                capture_output=True,
+            )
+            _install_skills_from_dir(dest, ws)
+        except Exception as e:
+            raise click.ClickException(f"Failed to extract skills: {e}")
+        finally:
+            try:
+                harbor_bridge.stop_environment(
+                    task_dir, hsid, Path(tmpdir) / "trial", delete=True
+                )
+            except Exception:
+                pass
+
+
+def _install_skills_from_dir(skills_dir: Path, workspace: Path) -> None:
+    """Run npx skills add for all skills in a directory."""
     skill_paths = [
         str(d) for d in sorted(skills_dir.iterdir()) if (d / "SKILL.md").is_file()
     ]
     if not skill_paths:
-        click.echo("No skills found for this task.")
+        click.echo("No skills found.")
         return
 
     click.echo(f"Installing {len(skill_paths)} skill(s)...")
     result = subprocess.run(
         ["npx", "skills", "add", *skill_paths],
-        cwd=str(ws),
+        cwd=str(workspace),
     )
     if result.returncode != 0:
         raise click.ClickException("Skills installation failed.")
     click.echo("Skills installed.")
+
+
+# ---------------------------------------------------------------------------
+# pier capture — extract agent trajectory without verification
+# ---------------------------------------------------------------------------
+
+
+@cli.command()
+@click.option(
+    "-a",
+    "--agent",
+    default=None,
+    help="Agent name (e.g. claude-code). Auto-detected if omitted.",
+)
+@click.option(
+    "--session-dir",
+    default=None,
+    type=click.Path(exists=True, file_okay=False),
+    help="Agent session/log directory. Auto-discovered if omitted.",
+)
+def capture(agent: str | None, session_dir: str | None) -> None:
+    """Capture the agent's trajectory for the current workspace.
+
+    In container mode, the session directory is detected automatically.
+    Outside a container, pass --session-dir pointing to the agent's
+    log directory.  No Harbor task required.
+
+    \b
+    Examples:
+        pier capture --session-dir ~/.claude/projects/my-project
+        pier capture --session-dir PATH -a claude-code
+    """
+
+    # Resolve workspace if we're inside one, otherwise use cwd
+    try:
+        sess, ws = _resolve_workspace_from_cwd_only()
+    except click.ClickException:
+        sess = None
+        ws = Path.cwd().resolve()
+
+    # Discover session directory
+    resolved_session_dir: Path | None = None
+
+    if session_dir:
+        resolved_session_dir = Path(session_dir).resolve()
+    elif sess and sess.get("mode") == "container":
+        # Container mode: look inside the container's agent log directory
+        if not agent:
+            agents = sess.get("agents", [])
+            if len(agents) == 1:
+                agent = agents[0]
+            elif agents:
+                raise click.ClickException(
+                    f"Multiple agents installed ({', '.join(agents)}). "
+                    "Specify one with -a."
+                )
+        if agent:
+            harbor_td = _harbor_trial_dir(ws)
+            resolved_session_dir = harbor_bridge.find_container_agent_session_dir(
+                agent, harbor_td / "agent"
+            )
+        if resolved_session_dir is None:
+            raise click.ClickException(
+                "Could not find agent session files in container.\n"
+                "Pass --session-dir to specify explicitly."
+            )
+    else:
+        raise click.ClickException(
+            "Pass --session-dir pointing to the agent's log directory, e.g.:\n"
+            "  pier capture --session-dir ~/.claude/projects/<project-name>"
+        )
+
+    # Auto-detect agent if not specified
+    if not agent:
+        agent = harbor_bridge.detect_agent_from_session_dir(resolved_session_dir)
+        if not agent:
+            raise click.ClickException(
+                f"Could not detect agent from {resolved_session_dir}. Specify with -a."
+            )
+        click.echo(f"Detected agent: {agent}")
+
+    # Create trial directory and assemble (no reward — capture only)
+    trial_dir = _new_trial_dir(ws)
+    now = datetime.now(timezone.utc)
+    fake_sess = sess or {"task_dir": str(ws), "task_ref": ws.name}
+    _assemble_trial_output(
+        trial_dir,
+        fake_sess,
+        {},  # no reward
+        now,
+        now,
+        ws,
+        agent,
+        str(resolved_session_dir),
+    )
+
+
+# ---------------------------------------------------------------------------
+# pier traces export — package traces for sharing
+# ---------------------------------------------------------------------------
+
+
+@cli.command("traces")
+@click.argument("trial_name", required=False)
+@click.option(
+    "-o",
+    "--output",
+    default=None,
+    type=click.Path(),
+    help="Output file path. Without -o, lists trials instead of exporting.",
+)
+@click.option(
+    "--all",
+    "all_trials",
+    is_flag=True,
+    default=False,
+    help="Export all trials (default: latest only).",
+)
+def traces_cmd(trial_name: str | None, output: str | None, all_trials: bool) -> None:
+    """List or export captured traces.
+
+    Without -o, lists available trials. With -o, packages trials into
+    a tar.gz for sharing. TRIAL_NAME selects a specific trial by its
+    timestamp directory name.
+
+    \b
+    Examples:
+        pier traces                              # list trials
+        pier traces -o trace.tar.gz              # export latest trial
+        pier traces 2026-04-02_15-30-00 -o t.gz  # export specific trial
+        pier traces --all -o traces.tar.gz       # export all trials
+    """
+    try:
+        _, ws = _resolve_workspace_from_cwd_only()
+    except click.ClickException:
+        ws = Path.cwd().resolve()
+
+    trials_dir = _pier_dir(ws) / "trials"
+    if not trials_dir.is_dir() or not any(trials_dir.iterdir()):
+        if output:
+            raise click.ClickException(
+                "No trials found. Run 'pier capture' or 'pier verify' first."
+            )
+        click.echo("No trials found. Run 'pier capture' or 'pier verify' first.")
+        return
+
+    all_trial_dirs = sorted(
+        (d for d in trials_dir.iterdir() if d.is_dir()), key=lambda d: d.name
+    )
+
+    # List mode (no -o)
+    if not output:
+        for td in all_trial_dirs:
+            agent = ""
+            reward = ""
+            result_path = td / "result.json"
+            if result_path.exists():
+                try:
+                    result = json.loads(result_path.read_text())
+                    agent_info = (
+                        result.get("agent_info") or result.get("agent_result") or {}
+                    )
+                    if isinstance(agent_info, dict):
+                        agent = agent_info.get("name", "")
+                    r = result.get("reward")
+                    if r is None:
+                        rewards = result.get("rewards") or {}
+                        if isinstance(rewards, dict):
+                            r = rewards.get("reward")
+                    if r is None:
+                        verifier_result = result.get("verifier_result") or {}
+                        if isinstance(verifier_result, dict):
+                            verifier_rewards = verifier_result.get("rewards") or {}
+                            if isinstance(verifier_rewards, dict):
+                                r = verifier_rewards.get("reward")
+                    if r is not None:
+                        reward = f"reward={r}"
+                except (json.JSONDecodeError, KeyError):
+                    pass
+
+            has_trajectory = (td / "agent" / "trajectory.json").exists()
+            parts = [td.name]
+            if agent:
+                parts.append(agent)
+            if reward:
+                parts.append(reward)
+            if has_trajectory:
+                parts.append("trajectory")
+            click.echo("  ".join(parts))
+        return
+
+    # Export mode (-o)
+    import tarfile
+
+    if trial_name:
+        specific = trials_dir / trial_name
+        if not specific.is_dir():
+            raise click.ClickException(
+                f"Trial {trial_name!r} not found. Run 'pier traces' to see available trials."
+            )
+        export_dirs = [specific]
+    elif all_trials:
+        export_dirs = all_trial_dirs
+    else:
+        export_dirs = [all_trial_dirs[-1]]
+
+    out_path = Path(output)
+    with tarfile.open(out_path, "w:gz") as tar:
+        for td in export_dirs:
+            tar.add(td, arcname=td.name)
+
+    n = len(export_dirs)
+    label = "trial" if n == 1 else "trials"
+    click.echo(f"Exported {n} {label} to {out_path}")
 
 
 # ---------------------------------------------------------------------------
@@ -1147,11 +1667,14 @@ def _resolve_pier_dir(path: str | None) -> Path:
         if pier.is_dir():
             return pier
         raise click.ClickException(f"No {PIER_DIR}/ directory found in {p}")
-    _, ws = _resolve_workspace()
+    try:
+        _, ws = _resolve_workspace_from_cwd_only()
+    except click.ClickException:
+        ws = Path.cwd().resolve()
     pier = _pier_dir(ws)
     if not pier.is_dir():
         raise click.ClickException(
-            f"No {PIER_DIR}/ directory in {ws}. Run 'pier verify' first."
+            f"No {PIER_DIR}/ directory in {ws}. Run 'pier capture' or 'pier verify' first."
         )
     return pier
 
@@ -1167,13 +1690,7 @@ def view(path: str | None, port: str, bind_host: str) -> None:
     Requires Harbor to be installed.
     """
     pier_dir = _resolve_pier_dir(path)
-    try:
-        from harbor.cli.view import view_command
-    except ImportError:
-        raise click.ClickException(
-            f"'pier view' requires Harbor.\n{_HARBOR_INSTALL_HINT}"
-        )
-    view_command(folder=pier_dir, port=port, host=bind_host)
+    harbor_bridge.run_view_command(folder=pier_dir, port=port, host=bind_host)
 
 
 @cli.command()
@@ -1210,21 +1727,13 @@ def summarize(
             f"No trials found in {pier_dir}. Run 'pier verify' first."
         )
 
-    try:
-        from harbor.cli.summarize.summarizer import Summarizer
-    except ImportError:
-        raise click.ClickException(
-            f"'pier summarize' requires Harbor.\n{_HARBOR_INSTALL_HINT}"
-        )
-
-    summarizer = Summarizer(
+    summary_path = harbor_bridge.run_summarize(
         trials_dir,
         n_concurrent=n_concurrent,
         model=model,
         only_failed=not all_trials,
         overwrite=overwrite,
     )
-    summary_path = summarizer.summarize()
     if summary_path:
         click.echo(f"Summary: {summary_path}")
     else:

@@ -4,16 +4,20 @@ import json
 from datetime import datetime, timezone
 from pathlib import Path
 
+import pytest
+
 from pier.harbor_bridge import (
     _bridge_claude_code,
-    _extract_path_prefixes,
+    create_synthetic_task_dir,
     _get_dockerfile_workdir,
     _write_mounts_compose,
     build_trial_result_json,
     detect_agent_from_session_dir,
     find_container_agent_session_dir,
     get_compose_project,
+    get_agent_exec_env,
     get_container_name,
+    is_valid_agent,
 )
 
 
@@ -59,7 +63,7 @@ class TestWriteMountsCompose:
 
         path = _write_mounts_compose(trial_dir, ws, "/app")
 
-        assert path == trial_dir / "docker-compose-mounts.json"
+        assert path == trial_dir / "docker-compose-pier.json"
         data = json.loads(path.read_text())
         volumes = data["services"]["main"]["volumes"]
         assert len(volumes) == 1
@@ -88,8 +92,8 @@ class TestWriteMountsCompose:
         path = _write_mounts_compose(trial_dir, ws, "/workspace")
         assert path.exists()
 
-    def test_mounts_task_instruction(self, tmp_path: Path):
-        """task_dir adds instruction.md mount into .task/."""
+    def test_copies_task_instruction(self, tmp_path: Path):
+        """task_dir copies instruction.md into workspace/.task/."""
         trial_dir = tmp_path / "trial"
         trial_dir.mkdir()
         ws = tmp_path / "workspace"
@@ -98,36 +102,38 @@ class TestWriteMountsCompose:
         task_dir.mkdir()
         (task_dir / "instruction.md").write_text("Do the thing.\n")
 
-        path = _write_mounts_compose(
+        _write_mounts_compose(
             trial_dir, ws, "/app", include_bind_mount=False, task_dir=task_dir
         )
 
-        data = json.loads(path.read_text())
-        volumes = data["services"]["main"]["volumes"]
-        assert any("/app/.task/instruction.md:ro" in v for v in volumes)
+        assert (ws / ".task" / "instruction.md").read_text() == "Do the thing.\n"
 
-    def test_mounts_task_skills(self, tmp_path: Path):
-        """task_dir adds skills/ mount into .task/."""
+    def test_ports(self, tmp_path: Path):
+        """ports adds port mappings to compose override."""
         trial_dir = tmp_path / "trial"
         trial_dir.mkdir()
         ws = tmp_path / "workspace"
         ws.mkdir()
-        task_dir = tmp_path / "task"
-        task_dir.mkdir()
-        skills = task_dir / "environment" / "skills"
-        skills.mkdir(parents=True)
-        (skills / "SKILL.md").write_text("# Skill\n")
 
-        path = _write_mounts_compose(
-            trial_dir, ws, "/app", include_bind_mount=False, task_dir=task_dir
-        )
+        path = _write_mounts_compose(trial_dir, ws, "/app", ports=[8888, 4200])
 
         data = json.loads(path.read_text())
-        volumes = data["services"]["main"]["volumes"]
-        assert any("/app/.task/skills:ro" in v for v in volumes)
+        assert data["services"]["main"]["ports"] == ["8888:8888", "4200:4200"]
 
-    def test_creates_dot_task_dir_in_workspace(self, tmp_path: Path):
-        """_write_mounts_compose creates .task/ in workspace as a mount point."""
+    def test_no_ports_by_default(self, tmp_path: Path):
+        """No ports key when ports is not provided."""
+        trial_dir = tmp_path / "trial"
+        trial_dir.mkdir()
+        ws = tmp_path / "workspace"
+        ws.mkdir()
+
+        path = _write_mounts_compose(trial_dir, ws, "/app")
+
+        data = json.loads(path.read_text())
+        assert "ports" not in data["services"]["main"]
+
+    def test_copies_task_files_to_workspace(self, tmp_path: Path):
+        """_write_mounts_compose copies .task/ files into workspace."""
         trial_dir = tmp_path / "trial"
         trial_dir.mkdir()
         ws = tmp_path / "workspace"
@@ -139,9 +145,9 @@ class TestWriteMountsCompose:
         _write_mounts_compose(trial_dir, ws, "/app", task_dir=task_dir)
 
         assert (ws / ".task").is_dir()
-        # Should be a plain directory, not contain symlinks
-        for child in (ws / ".task").iterdir():
-            assert not child.is_symlink()
+        instruction = ws / ".task" / "instruction.md"
+        assert not instruction.is_symlink()
+        assert instruction.read_text() == "Do the thing.\n"
 
 
 def _make_task_dir(tmp_path: Path) -> Path:
@@ -230,44 +236,6 @@ class TestBuildTrialResultJson:
         assert result.verifier_result.rewards["accuracy"] == 0.85
 
 
-class TestExtractPathPrefixes:
-    def test_double_quoted_home(self):
-        cmd = 'export PATH="$HOME/.local/bin:$PATH" && claude --print'
-        assert _extract_path_prefixes([cmd]) == "$HOME/.local/bin"
-
-    def test_double_quoted_absolute(self):
-        cmd = 'export PATH="/root/.local/bin:$PATH" && goose run'
-        assert _extract_path_prefixes([cmd]) == "/root/.local/bin"
-
-    def test_single_quoted(self):
-        cmd = "export PATH='/opt/agent/bin:$PATH' && agent run"
-        assert _extract_path_prefixes([cmd]) == "/opt/agent/bin"
-
-    def test_unquoted(self):
-        cmd = "export PATH=/usr/local/agent:$PATH; agent run"
-        assert _extract_path_prefixes([cmd]) == "/usr/local/agent"
-
-    def test_multiple_prefixes_across_commands(self):
-        cmds = [
-            'export PATH="/a:$PATH" && setup',
-            'export PATH="/b:$PATH" && run',
-        ]
-        assert _extract_path_prefixes(cmds) == "/a:/b"
-
-    def test_no_path_modification(self):
-        assert _extract_path_prefixes(["echo hello", "run agent"]) == ""
-
-    def test_deduplicates(self):
-        cmds = [
-            'export PATH="/same:$PATH"',
-            'export PATH="/same:$PATH"',
-        ]
-        assert _extract_path_prefixes(cmds) == "/same"
-
-    def test_empty_commands(self):
-        assert _extract_path_prefixes([]) == ""
-
-
 class TestContainerNaming:
     def test_compose_project_lowercases(self):
         assert get_compose_project("Pier-WS-AbCd") == "pier-ws-abcd"
@@ -349,6 +317,52 @@ class TestFindContainerAgentSessionDir:
         result = find_container_agent_session_dir("claude-code", agent_dir)
         assert result == real
 
+    def test_finds_single_codex_session(self, tmp_path: Path):
+        agent_dir = tmp_path / "agent"
+        session = agent_dir / "sessions" / "2026" / "04" / "codex-session"
+        session.mkdir(parents=True)
+
+        result = find_container_agent_session_dir("codex", agent_dir)
+        assert result == session
+
+    def test_codex_returns_none_for_multiple_sessions(self, tmp_path: Path):
+        agent_dir = tmp_path / "agent"
+        (agent_dir / "sessions" / "a" / "one").mkdir(parents=True)
+        (agent_dir / "sessions" / "b" / "two").mkdir(parents=True)
+
+        result = find_container_agent_session_dir("codex", agent_dir)
+        assert result is None
+
+    @pytest.mark.parametrize(
+        ("agent_name", "filename"),
+        [
+            ("cursor-cli", "cursor-cli.txt"),
+            ("gemini-cli", "gemini-cli.trajectory.json"),
+            ("kimi-cli", "kimi-cli.txt"),
+            ("opencode", "opencode.txt"),
+        ],
+    )
+    def test_finds_direct_log_agents(
+        self, tmp_path: Path, agent_name: str, filename: str
+    ):
+        agent_dir = tmp_path / "agent"
+        agent_dir.mkdir()
+        (agent_dir / filename).write_text("log\n")
+
+        result = find_container_agent_session_dir(agent_name, agent_dir)
+
+        assert result == agent_dir
+
+    def test_finds_qwen_coder_session_root(self, tmp_path: Path):
+        agent_dir = tmp_path / "agent"
+        session = agent_dir / "qwen-sessions" / "project-a"
+        session.mkdir(parents=True)
+        (session / "events.jsonl").write_text("{}\n")
+
+        result = find_container_agent_session_dir("qwen-coder", agent_dir)
+
+        assert result == agent_dir
+
 
 class TestBridgeClaudeCode:
     def test_creates_symlink_structure(self, tmp_path: Path):
@@ -374,3 +388,155 @@ class TestBridgeClaudeCode:
 
         link = logs_dir / "sessions" / "projects" / "my-session"
         assert link.is_symlink()
+
+
+class TestGetAgentExecEnv:
+    def test_claude_code_env(self):
+        env, path_prefix = get_agent_exec_env("claude-code")
+        assert env["CLAUDE_CONFIG_DIR"] == "/logs/agent/sessions"
+        assert env["IS_SANDBOX"] == "1"
+        assert path_prefix == "$HOME/.local/bin"
+
+    @pytest.mark.parametrize(
+        "agent_name", ["cursor-cli", "kimi-cli", "goose", "hermes"]
+    )
+    def test_local_bin_agent_path_prefix(self, agent_name: str):
+        env, path_prefix = get_agent_exec_env(agent_name)
+        assert env == {}
+        assert path_prefix == "$HOME/.local/bin"
+
+    @pytest.mark.parametrize(
+        "agent_name", ["codex", "gemini-cli", "qwen-coder", "opencode"]
+    )
+    def test_nvm_agent_path_prefix(self, agent_name: str):
+        env, path_prefix = get_agent_exec_env(agent_name)
+        if agent_name == "codex":
+            assert env["CODEX_HOME"] == "/logs/agent"
+        else:
+            assert env == {}
+        assert (
+            path_prefix
+            == '$(find "$HOME/.nvm/versions/node" -mindepth 1 -maxdepth 1 -type d '
+            "2>/dev/null | sort | tail -n1)/bin"
+        )
+
+    def test_unknown_agent_has_no_special_env(self):
+        env, path_prefix = get_agent_exec_env("unknown-agent")
+        assert env == {}
+        assert path_prefix == ""
+
+
+class TestIsValidAgent:
+    @pytest.mark.parametrize(
+        "agent_name",
+        [
+            "claude-code",
+            "codex",
+            "cursor-cli",
+            "gemini-cli",
+            "kimi-cli",
+            "opencode",
+            "qwen-coder",
+        ],
+    )
+    def test_accepts_known_harbor_agent_names(self, agent_name: str):
+        assert is_valid_agent(agent_name) is True
+
+    def test_rejects_old_qwen_alias(self):
+        assert is_valid_agent("qwen-code") is False
+
+
+class TestCreateSyntheticTaskDir:
+    def test_creates_dockerfile(self, tmp_path: Path):
+        task_dir = create_synthetic_task_dir("ubuntu:24.04", tmp_path)
+        dockerfile = task_dir / "environment" / "Dockerfile"
+        assert dockerfile.exists()
+        assert "FROM ubuntu:24.04" in dockerfile.read_text()
+        assert "WORKDIR /app" in dockerfile.read_text()
+
+    def test_creates_task_toml(self, tmp_path: Path):
+        task_dir = create_synthetic_task_dir("ubuntu:24.04", tmp_path)
+        assert (task_dir / "task.toml").exists()
+
+    def test_idempotent(self, tmp_path: Path):
+        """Calling twice doesn't overwrite existing files."""
+        task_dir = create_synthetic_task_dir("ubuntu:24.04", tmp_path)
+        (task_dir / "task.toml").write_text("custom")
+        task_dir2 = create_synthetic_task_dir("different:image", tmp_path)
+        assert task_dir == task_dir2
+        assert (task_dir / "task.toml").read_text() == "custom"
+
+    def test_path_is_under_temp_root(self, tmp_path: Path):
+        task_dir = create_synthetic_task_dir("myimage:latest", tmp_path)
+        assert str(task_dir).startswith(str(tmp_path))
+
+
+class TestExecInContainer:
+    def test_basic_exec(self, tmp_path: Path):
+        from unittest.mock import MagicMock, patch
+
+        from pier.harbor_bridge import exec_in_container
+
+        with patch("subprocess.run", return_value=MagicMock(returncode=0)) as mock_run:
+            rc = exec_in_container("pier-ws", tmp_path, ["echo", "hi"])
+        assert rc == 0
+        args = mock_run.call_args[0][0]
+        assert args[0] == "docker"
+        assert "exec" in args
+        assert "echo" in args
+
+    def test_detach_mode(self, tmp_path: Path):
+        from unittest.mock import MagicMock, patch
+
+        from pier.harbor_bridge import exec_in_container
+
+        with patch("subprocess.run", return_value=MagicMock(returncode=0)) as mock_run:
+            exec_in_container("pier-ws", tmp_path, ["sleep", "999"], detach=True)
+        args = mock_run.call_args[0][0]
+        assert "-d" in args
+        assert "-it" not in args
+
+    def test_no_detach_has_tty(self, tmp_path: Path):
+        from unittest.mock import MagicMock, patch
+
+        from pier.harbor_bridge import exec_in_container
+
+        with (
+            patch("subprocess.run", return_value=MagicMock(returncode=0)) as mock_run,
+            patch("sys.stdin") as mock_stdin,
+        ):
+            mock_stdin.isatty.return_value = True
+            exec_in_container("pier-ws", tmp_path, ["bash"])
+        args = mock_run.call_args[0][0]
+        assert "-it" in args
+        assert "-d" not in args
+
+    def test_env_vars_forwarded(self, tmp_path: Path):
+        from unittest.mock import MagicMock, patch
+
+        from pier.harbor_bridge import exec_in_container
+
+        with patch("subprocess.run", return_value=MagicMock(returncode=0)) as mock_run:
+            exec_in_container(
+                "pier-ws", tmp_path, ["cmd"], env={"FOO": "bar", "BAZ": "qux"}
+            )
+        args = mock_run.call_args[0][0]
+        assert "FOO=bar" in args
+        assert "BAZ=qux" in args
+
+    def test_path_prefix(self, tmp_path: Path):
+        from unittest.mock import MagicMock, patch
+
+        from pier.harbor_bridge import exec_in_container
+
+        with patch("subprocess.run", return_value=MagicMock(returncode=0)) as mock_run:
+            exec_in_container(
+                "pier-ws", tmp_path, ["claude"], path_prefix="$HOME/.local/bin"
+            )
+        args = mock_run.call_args[0][0]
+        # Should wrap in sh -c with PATH export
+        assert "sh" in args
+        assert "-c" in args
+        cmd_str = " ".join(args)
+        assert "$HOME/.local/bin" in cmd_str
+        assert "claude" in cmd_str

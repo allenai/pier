@@ -23,11 +23,13 @@ only this file changes.
 from __future__ import annotations
 
 import asyncio
-import functools
+import contextlib
 import json
 import logging
+import os
 import re
 import subprocess
+import sys
 from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
@@ -155,6 +157,25 @@ def extract_image_workdir(task_dir: Path, workspace: Path) -> None:
         subprocess.run(["docker", "rm", cid], capture_output=True, check=False)
 
 
+def copy_task_files(task_dir: Path, dest_dir: Path) -> None:
+    """Copy task instruction into a target directory.
+
+    All modes (host, bind-mount, --no-mount) use this to populate
+    workspace/.task/. Skills are handled by Harbor via skills_dir
+    in task.toml.
+    """
+    import shutil
+
+    dest_dir.mkdir(exist_ok=True)
+
+    instruction = task_dir / "instruction.md"
+    dest_instruction = dest_dir / "instruction.md"
+    if instruction.exists() and instruction.stat().st_size > 0:
+        if dest_instruction.is_symlink():
+            dest_instruction.unlink()
+        shutil.copy2(instruction, dest_instruction)
+
+
 def _write_mounts_compose(
     trial_dir: Path,
     workspace_dir: Path,
@@ -162,48 +183,40 @@ def _write_mounts_compose(
     *,
     include_bind_mount: bool = True,
     task_dir: Path | None = None,
+    ports: list[int] | None = None,
 ) -> Path:
     """Write a docker-compose override for workspace mounts.
 
     Always adds a tmpfs over .pier/ so pier's session data is hidden from
-    the container. Optionally includes the workspace bind mount (needed on
-    older Harbor without mounts_json support).
+    the container. The workspace bind mount is handled by Harbor via mounts_json;
+    this override adds the tmpfs and port mappings.
 
-    When task_dir is provided, mounts instruction.md and skills/ read-only
-    into {workdir}/.task/ so agents can discover the task without leaking
-    tests or task.toml.
+    When task_dir is provided, copies task instruction into workspace/.task/
+    so agents can discover the task without leaking tests or task.toml.
+    Skills are handled by Harbor via skills_dir in task.toml.
+
+    When ports is provided, exposes those container ports to the host.
     """
     service: dict = {"tmpfs": [f"{container_workdir}/.pier"]}
     volumes: list[str] = []
     if include_bind_mount:
         volumes.append(f"{workspace_dir.resolve()}:{container_workdir}:rw")
     if task_dir:
-        dot_task = f"{container_workdir}/.task"
-        instruction = task_dir / "instruction.md"
-        if instruction.exists():
-            # Ensure .task/ exists in the workspace so Docker can mount into it
-            (workspace_dir / ".task").mkdir(exist_ok=True)
-            volumes.append(f"{instruction.resolve()}:{dot_task}/instruction.md:ro")
-        skills_dir = task_dir / "environment" / "skills"
-        if skills_dir.is_dir():
-            volumes.append(f"{skills_dir.resolve()}:{dot_task}/skills:ro")
+        # Copy task files into workspace/.task/ — the workspace is bind-mounted
+        # (via mounts_json or compose), so files placed there are visible inside
+        # the container. Direct volume mounts inside a bind-mounted directory
+        # fail on macOS with VirtioFS.
+        dot_task = workspace_dir / ".task"
+        copy_task_files(task_dir, dot_task)
     if volumes:
         service["volumes"] = volumes
+    if ports:
+        service["ports"] = [f"{p}:{p}" for p in ports]
     compose = {"services": {"main": service}}
-    path = trial_dir / "docker-compose-mounts.json"
+    path = trial_dir / "docker-compose-pier.json"
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(compose, indent=2))
     return path
-
-
-@functools.cache
-def _harbor_supports_mounts_json() -> bool:
-    """Check if the installed Harbor supports mounts_json in DockerEnvironment."""
-    import inspect
-
-    from harbor.environments.docker.docker import DockerEnvironment
-
-    return "mounts_json" in inspect.signature(DockerEnvironment.__init__).parameters
 
 
 def _make_environment(
@@ -211,6 +224,8 @@ def _make_environment(
     harbor_session_id: str,
     trial_dir: Path,
     workspace_dir: Path | None = None,
+    ports: list[int] | None = None,
+    extra_mounts: list[str] | None = None,
 ):
     """Reconstruct a Harbor Docker environment from pier session data.
 
@@ -235,9 +250,14 @@ def _make_environment(
         else None
     )
 
+    mounts = []
+    if mount_spec:
+        mounts.append(mount_spec)
+    if extra_mounts:
+        mounts.extend(extra_mounts)
     kwargs: dict = {}
-    if mount_spec and _harbor_supports_mounts_json():
-        kwargs["mounts_json"] = [mount_spec]
+    if mounts:
+        kwargs["mounts_json"] = mounts
 
     environment = EnvironmentFactory.create_environment(
         type="docker",
@@ -257,12 +277,23 @@ def _make_environment(
             trial_dir,
             workspace_dir,
             container_workdir,
-            include_bind_mount=not _harbor_supports_mounts_json(),
+            include_bind_mount=False,
             task_dir=task_dir,
+            ports=ports,
+        )
+        _patch_compose_paths(environment, mounts_path)
+    elif ports:
+        # No workspace mount, but still need ports exposed.
+        mounts_path = _write_mounts_compose(
+            trial_dir,
+            workspace_dir or Path("/unused"),
+            container_workdir,
+            include_bind_mount=False,
+            ports=ports,
         )
         _patch_compose_paths(environment, mounts_path)
     else:
-        mounts_path = trial_dir / "docker-compose-mounts.json"
+        mounts_path = trial_dir / "docker-compose-pier.json"
         if mounts_path.exists():
             _patch_compose_paths(environment, mounts_path)
 
@@ -270,12 +301,13 @@ def _make_environment(
 
 
 def _patch_compose_paths(environment: object, mounts_path: Path) -> None:
-    """Monkey-patch _docker_compose_paths to include the mounts override.
+    """Monkey-patch _docker_compose_paths to include pier's compose override.
 
-    Older Harbor versions don't support mounts_json, so we append our
-    compose override file to the paths property.  This is intentionally
-    fragile — the version check in _make_environment ensures we only
-    reach here on older Harbor, and the TODO above tracks removal.
+    TODO: Replace when Harbor supports a public API for compose overrides.
+
+    Pier writes a separate compose override (docker-compose-pier.json) for
+    the tmpfs that hides .pier/ from the container. This must be a different
+    file from Harbor's docker-compose-mounts.json to avoid being overwritten.
     """
     orig_property = type(environment)._docker_compose_paths  # type: ignore[attr-defined]
 
@@ -301,12 +333,16 @@ async def _async_start_environment(
     harbor_session_id: str,
     trial_dir: Path,
     workspace_dir: Path | None = None,
+    ports: list[int] | None = None,
+    extra_mounts: list[str] | None = None,
 ) -> None:
     environment, task, _ = _make_environment(
         task_dir,
         harbor_session_id,
         trial_dir,
         workspace_dir=workspace_dir,
+        ports=ports,
+        extra_mounts=extra_mounts,
     )
     await environment.start(force_build=False)
 
@@ -351,18 +387,132 @@ def start_environment(
     harbor_session_id: str,
     trial_dir: Path,
     workspace_dir: Path | None = None,
+    ports: list[int] | None = None,
+    extra_mounts: list[str] | None = None,
 ) -> None:
     """Build (if needed), start a Harbor Docker environment.
 
-    If workspace_dir is provided, it is bind-mounted into /workspace.
+    If workspace_dir is provided, it is bind-mounted into the container.
+    If ports is provided, those container ports are exposed to the host.
+    If extra_mounts is provided, they are added as volume mounts.
     """
-    asyncio.run(
-        _async_start_environment(
-            task_dir,
-            harbor_session_id,
-            trial_dir,
-            workspace_dir=workspace_dir,
+    with _placeholder_task_env_vars(task_dir):
+        asyncio.run(
+            _async_start_environment(
+                task_dir,
+                harbor_session_id,
+                trial_dir,
+                workspace_dir=workspace_dir,
+                ports=ports,
+                extra_mounts=extra_mounts,
+            )
         )
+
+
+def create_synthetic_task_dir(image: str, temp_root: Path) -> Path:
+    """Create a minimal task directory for task-free container mode.
+
+    Generates a temporary task with a Dockerfile that just pulls the
+    given image and a minimal task.toml.  This lets task-free mode
+    reuse Harbor's standard environment machinery instead of
+    maintaining a separate code path.
+
+    The temp_root should be a persistent directory (e.g., inside
+    .pier/) so the task survives container restarts.
+    """
+    task_dir = temp_root / "pier-task-free"
+    task_dir.mkdir(parents=True, exist_ok=True)
+
+    env_dir = task_dir / "environment"
+    env_dir.mkdir(exist_ok=True)
+
+    dockerfile = env_dir / "Dockerfile"
+    expected = f"FROM {image}\nWORKDIR /app\n"
+    if not dockerfile.exists() or dockerfile.read_text() != expected:
+        dockerfile.write_text(expected)
+
+    toml = task_dir / "task.toml"
+    if not toml.exists():
+        toml.write_text(
+            '[metadata]\nauthor_name = "pier"\n[environment]\n[verifier]\n[agent]\n'
+        )
+
+    # Harbor's Task() reads instruction.md eagerly
+    instruction = task_dir / "instruction.md"
+    if not instruction.exists():
+        instruction.write_text("")
+
+    return task_dir
+
+
+def _claude_config_dir() -> str:
+    """Return the CLAUDE_CONFIG_DIR path used inside Harbor containers."""
+    from harbor.agents.installed.claude_code import EnvironmentPaths
+
+    return (EnvironmentPaths.agent_dir / "sessions").as_posix()
+
+
+def _codex_home_dir() -> str:
+    """Return the CODEX_HOME path used inside Harbor containers."""
+    from harbor.agents.installed.codex import EnvironmentPaths
+
+    return EnvironmentPaths.agent_dir.as_posix()
+
+
+def _codex_path_prefix() -> str:
+    """Return the Node bin dir Harbor's NVM-based installers place on disk."""
+    return (
+        '$(find "$HOME/.nvm/versions/node" -mindepth 1 -maxdepth 1 -type d '
+        "2>/dev/null | sort | tail -n1)/bin"
+    )
+
+
+def _local_bin_path_prefix() -> str:
+    """Return the default user-local bin dir used by several agent installers."""
+    return "$HOME/.local/bin"
+
+
+async def _run_interactive_setup(
+    agent: object, agent_name: str, environment: object
+) -> None:
+    """Run agent-specific interactive setup after install.
+
+    Harbor's run() registers skills, MCP servers, and marks onboarding
+    complete, but pier doesn't call run() — the user drives the agent
+    interactively.  This replicates the setup portions of run().
+
+    TODO: Replace with a Harbor public API for interactive agent setup.
+    Currently calls private methods (_build_register_skills_command, etc.).
+    """
+    if agent_name != "claude-code":
+        return
+
+    config_dir = _claude_config_dir()
+    env = {"CLAUDE_CONFIG_DIR": config_dir}
+
+    setup_parts = [
+        f"mkdir -p {config_dir}/debug {config_dir}/projects/-app "
+        f"{config_dir}/shell-snapshots {config_dir}/statsig "
+        f"{config_dir}/todos {config_dir}/skills",
+        f"if [ -d ~/.claude/skills ]; then "
+        f"cp -r ~/.claude/skills/. {config_dir}/skills/ 2>/dev/null || true; fi",
+    ]
+
+    skills_cmd = agent._build_register_skills_command()  # type: ignore[attr-defined]
+    if skills_cmd:
+        setup_parts.append(skills_cmd)
+
+    mcp_cmd = agent._build_register_mcp_servers_command()  # type: ignore[attr-defined]
+    if mcp_cmd:
+        setup_parts.append(mcp_cmd)
+
+    # Mark onboarding complete so `claude` doesn't prompt
+    setup_parts.append(
+        f"echo '{{\"hasCompletedOnboarding\": true}}' > {config_dir}/.claude.json"
+    )
+
+    await environment.exec(  # type: ignore[attr-defined]
+        command=" && ".join(setup_parts), env=env
     )
 
 
@@ -379,35 +529,17 @@ async def _async_setup_agent(
         task_dir, harbor_session_id, trial_dir
     )
 
+    extra_kwargs: dict = {}
+    if task.config.environment.skills_dir:
+        extra_kwargs["skills_dir"] = task.config.environment.skills_dir
+    if task.config.environment.mcp_servers:
+        extra_kwargs["mcp_servers"] = task.config.environment.mcp_servers
+
     agent = AgentFactory.create_agent_from_name(
-        AgentName(agent_name), logs_dir=trial_paths.agent_dir
+        AgentName(agent_name), logs_dir=trial_paths.agent_dir, **extra_kwargs
     )
     await agent.setup(environment)
-
-    # Prepare the container for interactive use via `pier exec`.
-    # Harbor normally runs setup commands as the first step of
-    # create_run_agent_commands before the actual agent invocation.
-    # Claude Code's first ExecInput is a dedicated setup command (mkdir,
-    # skills, MCP config); we run it and also mark onboarding complete
-    # so interactive claude skips the login prompt.
-    if agent_name == "claude-code":
-        exec_inputs = agent.create_run_agent_commands(instruction="setup")
-        if exec_inputs:
-            setup = exec_inputs[0]
-            config_dir = (setup.env or {}).get("CLAUDE_CONFIG_DIR", "")
-            # Combine Harbor's setup command with onboarding flag in a
-            # single docker exec to avoid an extra subprocess round-trip.
-            # Harbor's --print mode bypasses onboarding, but pier exec
-            # is interactive and needs hasCompletedOnboarding set.
-            onboarding_cmd = (
-                f" && echo '{{\"hasCompletedOnboarding\": true}}'"
-                f" > {config_dir}/.claude.json"
-                if config_dir
-                else ""
-            )
-            await environment.exec(
-                command=setup.command + onboarding_cmd, env=setup.env
-            )
+    await _run_interactive_setup(agent, agent_name, environment)
 
 
 def setup_agent(
@@ -422,14 +554,18 @@ def setup_agent(
     script (e.g. install-claude-code.sh).  Does NOT call run() — the user
     drives the agent interactively via ``pier exec``.
     """
-    asyncio.run(_async_setup_agent(task_dir, harbor_session_id, trial_dir, agent_name))
+    with _placeholder_task_env_vars(task_dir):
+        asyncio.run(
+            _async_setup_agent(task_dir, harbor_session_id, trial_dir, agent_name)
+        )
 
 
 def verify_environment(task_dir: Path, harbor_session_id: str, trial_dir: Path) -> dict:
     """Run Harbor's verifier on a running environment. Returns reward dict."""
-    return asyncio.run(
-        _async_verify_environment(task_dir, harbor_session_id, trial_dir)
-    )
+    with _placeholder_task_env_vars(task_dir):
+        return asyncio.run(
+            _async_verify_environment(task_dir, harbor_session_id, trial_dir)
+        )
 
 
 def stop_environment(
@@ -444,9 +580,34 @@ def stop_environment(
     delete=False (default): removes the container but keeps images (fast restart).
     delete=True: removes the container, images, and volumes (full cleanup).
     """
-    asyncio.run(
-        _async_stop_environment(task_dir, harbor_session_id, trial_dir, delete=delete)
-    )
+    # Harbor reconstructs the environment on stop, resolving task env vars.
+    # Set placeholders for missing vars so stop doesn't fail.
+    # TODO: Harbor should not require env vars for stop.
+    with _placeholder_task_env_vars(task_dir):
+        asyncio.run(
+            _async_stop_environment(
+                task_dir, harbor_session_id, trial_dir, delete=delete
+            )
+        )
+
+
+@contextlib.contextmanager
+def _placeholder_task_env_vars(task_dir: Path):
+    """Temporarily set empty placeholders for task env vars not in the host env."""
+    toml_path = task_dir / "task.toml"
+    added: list[str] = []
+    if toml_path.exists():
+        content = toml_path.read_text()
+        for match in re.finditer(r"\$\{(\w+)(?::-.+?)?\}", content):
+            var = match.group(1)
+            if var not in os.environ:
+                os.environ[var] = ""
+                added.append(var)
+    try:
+        yield
+    finally:
+        for var in added:
+            os.environ.pop(var, None)
 
 
 # ---------------------------------------------------------------------------
@@ -507,6 +668,29 @@ def build_trial_result_json(
         finished_at=end_time,
     )
     return result.model_dump_json(indent=2)
+
+
+def write_trial_config_json(
+    trial_dir: Path,
+    task_dir: Path,
+    session_name: str,
+    agent_name: str | None,
+) -> None:
+    """Write config.json as a Harbor TrialConfig.
+
+    Skips gracefully if the task directory is incomplete (e.g. missing
+    instruction.md) — config.json is optional metadata.
+    """
+    try:
+        from harbor.models.trial.config import AgentConfig, TaskConfig, TrialConfig
+
+        kwargs: dict = dict(task=TaskConfig(path=task_dir), trial_name=session_name)
+        if agent_name:
+            kwargs["agent"] = AgentConfig(name=agent_name)
+        trial_config = TrialConfig(**kwargs)
+        (trial_dir / "config.json").write_text(trial_config.model_dump_json(indent=2))
+    except Exception as e:
+        logger.debug("Skipping config.json: %s", e)
 
 
 # ---------------------------------------------------------------------------
@@ -599,6 +783,12 @@ def find_container_agent_session_dir(
     Returns None if the agent isn't supported or no unambiguous session is found.
     """
     detect = _AGENT_DETECT.get(agent_name)
+    direct_log_agents = {
+        "cursor-cli": "cursor-cli.txt",
+        "gemini-cli": "gemini-cli.trajectory.json",
+        "kimi-cli": "kimi-cli.txt",
+        "opencode": "opencode.txt",
+    }
     if agent_name == "claude-code" and detect:
         projects_dir = harbor_agent_dir / "sessions" / "projects"
         if projects_dir.is_dir():
@@ -613,85 +803,122 @@ def find_container_agent_session_dir(
                     "pass --session-dir explicitly",
                     projects_dir,
                 )
+    elif agent_name == "codex":
+        sessions_dir = harbor_agent_dir / "sessions"
+        if sessions_dir.is_dir():
+            session_dirs = [d for d in sessions_dir.rglob("*") if d.is_dir()]
+            if session_dirs:
+                max_depth = max(len(d.parts) for d in session_dirs)
+                session_dirs = [d for d in session_dirs if len(d.parts) == max_depth]
+                if len(session_dirs) == 1:
+                    return session_dirs[0]
+                if len(session_dirs) > 1:
+                    logger.warning(
+                        "Multiple Codex session dirs found in %s; "
+                        "pass --session-dir explicitly",
+                        sessions_dir,
+                    )
+    elif agent_name == "qwen-coder":
+        sessions_dir = harbor_agent_dir / "qwen-sessions"
+        if sessions_dir.is_dir() and any(sessions_dir.rglob("*.jsonl")):
+            return harbor_agent_dir
+    elif agent_name in direct_log_agents:
+        if (harbor_agent_dir / direct_log_agents[agent_name]).exists():
+            return harbor_agent_dir
     return None
 
 
-def _extract_path_prefixes(commands: list[str]) -> str:
-    """Extract PATH prefixes from shell command strings.
-
-    Parses ``export PATH="...:$PATH"`` patterns and returns the
-    prefix segments joined by ``:``, e.g. ``"$HOME/.local/bin"``
-    or ``"/root/.local/bin:/other/bin"``.  Returns empty string
-    if no PATH modifications are found.
-    """
-    path_prefixes: list[str] = []
-    for cmd in commands:
-        for m in re.finditer(
-            r"""PATH=["']?([^"'\s;]+):\$PATH["']?""",
-            cmd,
-        ):
-            for segment in m.group(1).split(":"):
-                if segment and segment not in path_prefixes:
-                    path_prefixes.append(segment)
-    return ":".join(path_prefixes)
-
-
-# Env vars from Harbor's run commands that are safe to forward to
-# interactive pier exec sessions.  We use an allowlist (not denylist)
-# because most agent env vars are secrets or model names populated from
-# pier's dummy values.  Behavioral flags and container-correct paths
-# (derived from EnvironmentPaths class constants, not the dummy logs_dir)
-# belong here.
-_AGENT_ENV_ALLOW = frozenset(
-    {
-        # Claude Code
-        "CLAUDE_CONFIG_DIR",  # /logs/agent/sessions — session logs go to mounted dir
-        "IS_SANDBOX",  # skip interactive onboarding
-        "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC",  # no telemetry
-        "FORCE_AUTO_BACKGROUND_TASKS",
-        "ENABLE_BACKGROUND_TASKS",
-    }
-)
-
-
 def get_agent_exec_env(agent_name: str) -> tuple[dict[str, str], str]:
-    """Return env vars and PATH prefix Harbor sets when running an agent.
-
-    Asks Harbor for the agent's ``create_run_agent_commands()`` output and
-    extracts:
-    - Behavioral env vars (e.g. ``IS_SANDBOX=1``) that affect how the agent
-      runs, filtering out secrets and paths specific to ``--print`` mode.
-    - PATH prefixes from ``export PATH="...:$PATH"`` in command strings.
+    """Return env vars and PATH prefix needed to run an agent interactively.
 
     Returns ``(env_dict, path_prefix)`` where *path_prefix* is a string like
-    ``"$HOME/.local/bin"`` or empty.  Harbor is the single source of truth.
+    ``"$HOME/.local/bin"`` or empty.
+
+    TODO: Harbor should expose an API for this so pier doesn't hardcode
+    agent-specific env vars.
     """
-    from harbor.agents.factory import AgentFactory
-    from harbor.models.agent.name import AgentName
+    env: dict[str, str] = {}
+    path_prefix = ""
 
-    # Use a dummy model_name so agents that validate it don't raise early.
-    agent = AgentFactory.create_agent_from_name(
-        AgentName(agent_name),
-        logs_dir=Path("/tmp"),
-        model_name="anthropic/dummy",
-    )
+    if agent_name == "claude-code":
+        env["CLAUDE_CONFIG_DIR"] = _claude_config_dir()
+        env["IS_SANDBOX"] = "1"
+        env["CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"] = "1"
+        path_prefix = _local_bin_path_prefix()
+    elif agent_name == "codex":
+        env["CODEX_HOME"] = _codex_home_dir()
+        path_prefix = _codex_path_prefix()
+    elif agent_name in {"cursor-cli", "kimi-cli", "goose", "hermes"}:
+        path_prefix = _local_bin_path_prefix()
+    elif agent_name in {"gemini-cli", "qwen-coder", "opencode"}:
+        path_prefix = _codex_path_prefix()
+    return env, path_prefix
+
+
+def resolve_task_env(task_dir: Path) -> dict[str, str]:
+    """Resolve [environment.env] from task.toml using Harbor's resolver.
+
+    Returns resolved {VAR: value} dict. Returns empty dict if task.toml
+    is missing or has no env vars.
+    """
+    if not (task_dir / "task.toml").exists():
+        return {}
     try:
-        exec_inputs = agent.create_run_agent_commands("__pier_dummy__")
+        import tomllib
+
+        from harbor.utils.env import resolve_env_vars
+
+        config = tomllib.loads((task_dir / "task.toml").read_text())
+        env_config = (config.get("environment") or {}).get("env")
+        if not env_config:
+            return {}
+        with _placeholder_task_env_vars(task_dir):
+            return resolve_env_vars(env_config)
     except Exception:
-        logger.debug("Could not get run commands for agent %s", agent_name)
-        return {}, ""
+        return {}
 
-    # Merge env from all ExecInput steps, keeping only allowlisted vars.
-    merged: dict[str, str] = {}
-    for ei in exec_inputs:
-        if ei.env:
-            for k, v in ei.env.items():
-                if k in _AGENT_ENV_ALLOW and v:
-                    merged[k] = v
 
-    path_prefix = _extract_path_prefixes([ei.command for ei in exec_inputs])
+def exec_in_container(
+    harbor_session_id: str,
+    task_dir: Path,
+    command: list[str],
+    *,
+    env: dict[str, str] | None = None,
+    path_prefix: str = "",
+    detach: bool = False,
+) -> int:
+    """Run a command in a running container via docker exec.
 
-    return merged, path_prefix
+    Returns the process exit code. Handles TTY allocation, env vars,
+    PATH prefix, and detached mode.
+    """
+    import shlex
+
+    container = get_container_name(harbor_session_id)
+    workdir = get_container_workdir(task_dir)
+
+    env_flags: list[str] = []
+    for var, val in (env or {}).items():
+        env_flags.extend(["-e", f"{var}={val}"])
+
+    if path_prefix:
+        shell_cmd = f"export PATH={path_prefix}:$PATH && exec " + " ".join(
+            shlex.quote(c) for c in command
+        )
+        run_command = [container, "sh", "-c", shell_cmd]
+    else:
+        run_command = [container, *command]
+
+    if detach:
+        result = subprocess.run(
+            ["docker", "exec", "-d", "-w", workdir, *env_flags, *run_command],
+        )
+    else:
+        tty_flags = ["-it"] if sys.stdin.isatty() else []
+        result = subprocess.run(
+            ["docker", "exec", *tty_flags, "-w", workdir, *env_flags, *run_command],
+        )
+    return result.returncode
 
 
 def is_valid_agent(agent_name: str) -> bool:
@@ -761,3 +988,35 @@ def extract_agent_logs(
 
     result = context.model_dump(exclude_none=True)
     return result if result else None
+
+
+# ---------------------------------------------------------------------------
+# Harbor CLI wrappers
+# ---------------------------------------------------------------------------
+
+
+def run_view_command(folder: Path, port: str, host: str) -> None:
+    """Launch the Harbor trial viewer web dashboard."""
+    from harbor.cli.view import view_command
+
+    view_command(folder=folder, port=port, host=host)
+
+
+def run_summarize(
+    trials_dir: Path,
+    n_concurrent: int,
+    model: str,
+    only_failed: bool,
+    overwrite: bool,
+) -> Path | None:
+    """Summarize trial results using Harbor's Summarizer."""
+    from harbor.cli.summarize.summarizer import Summarizer
+
+    summarizer = Summarizer(
+        trials_dir,
+        n_concurrent=n_concurrent,
+        model=model,
+        only_failed=only_failed,
+        overwrite=overwrite,
+    )
+    return summarizer.summarize()

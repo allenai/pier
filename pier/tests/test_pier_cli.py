@@ -2,10 +2,10 @@
 
 import json
 import shutil
-import sys
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+import click
 import pytest
 from click.testing import CliRunner
 
@@ -57,6 +57,10 @@ def _container_session(
         "task_ref": "my-task",
         "harbor_session_id": harbor_session_id,
         "agents": agents or [],
+        "ports": [],
+        "extra_mounts": [],
+        "extra_env": [],
+        "no_mount": False,
         "started_at": "2026-02-24T12:00:00+00:00",
     }
 
@@ -92,6 +96,8 @@ def _write_session(workspace: Path, data: dict, index_path: Path) -> None:
 def test_help(runner):
     result = runner.invoke(cli, ["--help"])
     assert result.exit_code == 0
+    assert "capture" in result.output
+    assert "traces" in result.output
     assert "start" in result.output
     assert "exec" in result.output
     assert "verify" in result.output
@@ -167,20 +173,6 @@ def test_start_remote_download_failure(mock_download, runner, index_path):
     assert "failed" in result.output.lower()
 
 
-@patch(
-    "pier.harbor_bridge.download_task",
-    side_effect=ImportError("No module named 'harbor'"),
-)
-def test_start_remote_harbor_import_error(mock_download, runner, index_path):
-    """When Harbor's internals fail to import, error mentions Harbor."""
-    result = runner.invoke(
-        cli,
-        ["start", "https://github.com/org/repo#tasks/my-task", "--host"],
-    )
-    assert result.exit_code != 0
-    assert "harbor" in result.output.lower()
-
-
 def test_start_local_requires_dir(runner, index_path, task_dir):
     """Local tasks without -d should fail."""
     result = runner.invoke(cli, ["start", str(task_dir)])
@@ -244,18 +236,14 @@ def test_start_creates_workspace_with_env_files(
 
 
 @patch("pier.harbor_bridge.start_environment")
-def test_start_container_no_task_symlinks(
-    mock_start, runner, index_path, task_dir, tmp_path
-):
-    """Container mode does NOT create .task/ symlinks (Docker mounts handle it)."""
+def test_start_container_task_files(mock_start, runner, index_path, task_dir, tmp_path):
+    """Container mode populates .task/ with task instruction."""
     ws = tmp_path / "ws"
     runner.invoke(cli, ["start", str(task_dir), "-d", str(ws)], catch_exceptions=False)
     dot_task = ws / ".task"
-    # .task/ dir should not exist (created later by _write_mounts_compose)
-    # or if it exists, should not contain symlinks
+    # .task/ is populated by _write_mounts_compose, not _seed_workspace
     if dot_task.exists():
-        for child in dot_task.iterdir():
-            assert not child.is_symlink(), f"{child} should not be a symlink"
+        assert (dot_task / "instruction.md").read_text() == "# Do the thing\n"
 
 
 @patch("pier.harbor_bridge.start_environment")
@@ -308,6 +296,55 @@ def test_start_restarts_stopped_container(
     mock_start.assert_called_once()
 
 
+@patch("pier.harbor_bridge.is_environment_running", return_value=False)
+@patch("pier.harbor_bridge.start_environment")
+def test_start_restart_rejects_mismatched_task_path(
+    mock_start, mock_running, runner, index_path, task_dir, tmp_path
+):
+    """Restarting an existing workspace must not silently swap its task."""
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    _write_session(ws, _container_session(task_dir=str(task_dir)), index_path)
+
+    other_task = tmp_path / "other-task"
+    other_task.mkdir()
+    (other_task / "task.toml").write_text(
+        '[metadata]\nauthor_name = "test"\n[environment]\n[verifier]\n[agent]\n'
+    )
+
+    result = runner.invoke(cli, ["start", str(other_task), "-d", str(ws)])
+
+    assert result.exit_code != 0
+    assert "different task" in result.output.lower()
+    mock_start.assert_not_called()
+
+
+@patch("pier.harbor_bridge.is_environment_running", return_value=False)
+@patch("pier.harbor_bridge.start_environment")
+def test_start_restart_passes_mounts_json(
+    mock_start, mock_running, runner, index_path, task_dir, tmp_path
+):
+    """Restarting a stopped container passes --mounts-json through."""
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    _write_session(ws, _container_session(task_dir=str(task_dir)), index_path)
+    result = runner.invoke(
+        cli,
+        [
+            "start",
+            str(task_dir),
+            "-d",
+            str(ws),
+            "--mounts-json",
+            '["/host/data:/data:ro"]',
+        ],
+        catch_exceptions=False,
+    )
+    assert result.exit_code == 0
+    call_kwargs = mock_start.call_args[1]
+    assert "/host/data:/data:ro" in call_kwargs["extra_mounts"]
+
+
 @patch("pier.harbor_bridge.setup_agent")
 @patch("pier.harbor_bridge.is_valid_agent", return_value=True)
 @patch("pier.harbor_bridge.start_environment")
@@ -332,6 +369,23 @@ def test_start_with_agent_calls_setup(
     assert session["agents"] == ["claude-code"]
 
 
+@patch("pier.harbor_bridge.setup_agent")
+@patch("pier.harbor_bridge.start_environment")
+def test_start_with_real_qwen_coder_name_is_accepted(
+    mock_start, mock_setup, runner, index_path, task_dir, tmp_path
+):
+    """qwen-coder should be accepted using Harbor's real agent enum value."""
+    ws = tmp_path / "ws"
+    result = runner.invoke(
+        cli,
+        ["start", str(task_dir), "-d", str(ws), "--agent", "qwen-coder"],
+        catch_exceptions=False,
+    )
+    assert result.exit_code == 0, result.output
+    assert "qwen-coder installed" in result.output
+    mock_setup.assert_called_once()
+
+
 @patch("pier.harbor_bridge.is_valid_agent", return_value=False)
 @patch("pier.harbor_bridge.start_environment")
 def test_start_with_unknown_agent_fails(
@@ -342,6 +396,20 @@ def test_start_with_unknown_agent_fails(
     result = runner.invoke(
         cli,
         ["start", str(task_dir), "-d", str(ws), "--agent", "unknown-agent"],
+    )
+    assert result.exit_code != 0
+    assert "Unknown agent" in result.output
+
+
+@patch("pier.harbor_bridge.start_environment")
+def test_start_with_old_qwen_code_alias_fails(
+    mock_start, runner, index_path, task_dir, tmp_path
+):
+    """qwen-code should fail so docs/tests track Harbor's actual name."""
+    ws = tmp_path / "ws"
+    result = runner.invoke(
+        cli,
+        ["start", str(task_dir), "-d", str(ws), "--agent", "qwen-code"],
     )
     assert result.exit_code != 0
     assert "Unknown agent" in result.output
@@ -573,7 +641,7 @@ def test_start_host_creates_workspace(runner, index_path, task_dir, tmp_path):
 
 
 def test_start_host_creates_task_symlinks(runner, index_path, task_dir, tmp_path):
-    """Host mode creates .task/ symlinks so edits to the task propagate."""
+    """Host mode symlinks .task/ so edits to the task source propagate."""
     ws = tmp_path / "ws"
     runner.invoke(
         cli,
@@ -600,13 +668,44 @@ def test_start_host_existing_session_is_noop(runner, index_path, task_dir, tmp_p
     assert "already exists" in result.output.lower()
 
 
-def test_start_host_collision_no_session(runner, index_path, task_dir, tmp_path):
-    """Can't start if workspace dir already exists without a session."""
+def test_start_nonempty_dir_blocked(runner, index_path, task_dir, tmp_path):
+    """Starting in a non-empty directory is blocked by default."""
     ws = tmp_path / "ws"
     ws.mkdir()
+    (ws / "existing-file.txt").write_text("important")
     result = runner.invoke(cli, ["start", str(task_dir), "--host", "-d", str(ws)])
     assert result.exit_code != 0
-    assert "already exists" in result.output
+    assert "not empty" in result.output
+
+
+def test_start_nonempty_dir_allowed_with_force(runner, index_path, task_dir, tmp_path):
+    """--force allows starting in a non-empty directory."""
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    (ws / "existing-file.txt").write_text("important")
+    result = runner.invoke(
+        cli,
+        ["start", str(task_dir), "--host", "-d", str(ws), "--force"],
+        catch_exceptions=False,
+    )
+    assert result.exit_code == 0
+
+
+def test_start_git_dir_needs_force(runner, index_path, task_dir, tmp_path):
+    """Directory with .git needs --force."""
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    (ws / ".git").mkdir()
+    result = runner.invoke(cli, ["start", str(task_dir), "--host", "-d", str(ws)])
+    assert result.exit_code != 0
+    assert "not empty" in result.output
+
+    result = runner.invoke(
+        cli,
+        ["start", str(task_dir), "--host", "-d", str(ws), "--force"],
+        catch_exceptions=False,
+    )
+    assert result.exit_code == 0
 
 
 def test_start_host_no_docker_image_ok(runner, index_path, tmp_path):
@@ -644,6 +743,21 @@ def test_exec_container(mock_running, runner, index_path, tmp_path):
     assert "/app" in args
     assert "my-tool" in args
     assert "list" in args
+
+
+@patch("pier.harbor_bridge.is_environment_running", return_value=True)
+def test_exec_detach(mock_running, runner, index_path, tmp_path):
+    """pier exec -d passes -d to docker exec and skips TTY."""
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    _write_session(ws, _container_session(), index_path)
+    with patch("subprocess.run", return_value=MagicMock(returncode=0)) as mock_run:
+        runner.invoke(cli, ["exec", "-d", "--", "quarto", "preview"])
+    args = mock_run.call_args[0][0]
+    assert args[0] == "docker"
+    assert "-d" in args
+    assert "-it" not in args
+    assert "quarto" in args
 
 
 @patch(
@@ -696,22 +810,110 @@ def test_exec_container_without_path_prefix_runs_directly(
 
 
 @patch("pier.harbor_bridge.is_environment_running", return_value=True)
-def test_exec_container_forwards_api_keys(
+def test_exec_container_forwards_extra_env(
     mock_running, runner, index_path, tmp_path, monkeypatch
 ):
-    """pier exec forwards *_API_KEY env vars into the container."""
+    """pier exec forwards extra_env from session into the container."""
     ws = tmp_path / "ws"
     ws.mkdir()
-    _write_session(ws, _container_session(), index_path)
-    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test-123")
-    monkeypatch.setenv("OPENAI_API_KEY", "sk-openai-456")
+    sess = _container_session()
+    sess["extra_env"] = ["ASTA_TOKEN=abc123", "ANTHROPIC_API_KEY=sk-test"]
+    _write_session(ws, sess, index_path)
     with patch("subprocess.run", return_value=MagicMock(returncode=0)) as mock_run:
         runner.invoke(cli, ["exec", "bash"])
     args = mock_run.call_args[0][0]
-    # Should have -e flags for both keys
     assert "-e" in args
-    assert "ANTHROPIC_API_KEY=sk-test-123" in args
-    assert "OPENAI_API_KEY=sk-openai-456" in args
+    assert "ASTA_TOKEN=abc123" in args
+    assert "ANTHROPIC_API_KEY=sk-test" in args
+
+
+@patch(
+    "pier.harbor_bridge.resolve_task_env", return_value={"ASTA_TOKEN": "resolved-token"}
+)
+@patch("pier.harbor_bridge.is_environment_running", return_value=True)
+def test_exec_container_forwards_task_env(
+    mock_running, mock_resolve, runner, index_path, tmp_path, monkeypatch
+):
+    """pier exec forwards resolved task env vars from task.toml."""
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    _write_session(ws, _container_session(), index_path)
+    with patch("subprocess.run", return_value=MagicMock(returncode=0)) as mock_run:
+        runner.invoke(cli, ["exec", "bash"])
+    args = mock_run.call_args[0][0]
+    assert "ASTA_TOKEN=resolved-token" in args
+
+
+@patch("pier.harbor_bridge.start_environment")
+def test_start_with_env_file(mock_start, runner, index_path, task_dir, tmp_path):
+    """pier start --env-file loads env vars into session."""
+    env_file = tmp_path / ".env"
+    env_file.write_text("ASTA_TOKEN=from-file\n# comment\nOTHER_VAR=value\n")
+    ws = tmp_path / "ws"
+    runner.invoke(
+        cli,
+        ["start", str(task_dir), "-d", str(ws), "--env-file", str(env_file)],
+        catch_exceptions=False,
+    )
+    import json
+
+    sess = json.loads((ws / ".pier" / "session.json").read_text())
+    assert "ASTA_TOKEN=from-file" in sess["extra_env"]
+    assert "OTHER_VAR=value" in sess["extra_env"]
+
+
+@patch("pier.harbor_bridge.start_environment")
+def test_start_with_e_flag(mock_start, runner, index_path, task_dir, tmp_path):
+    """pier start -e stores env vars in session."""
+    ws = tmp_path / "ws"
+    runner.invoke(
+        cli,
+        [
+            "start",
+            str(task_dir),
+            "-d",
+            str(ws),
+            "-e",
+            "MY_KEY=val1",
+            "-e",
+            "OTHER=val2",
+        ],
+        catch_exceptions=False,
+    )
+    import json
+
+    sess = json.loads((ws / ".pier" / "session.json").read_text())
+    assert "MY_KEY=val1" in sess["extra_env"]
+    assert "OTHER=val2" in sess["extra_env"]
+
+
+@patch("pier.harbor_bridge.start_environment")
+def test_start_e_and_env_file_merged(
+    mock_start, runner, index_path, task_dir, tmp_path
+):
+    """-e and --env-file are merged in session."""
+    env_file = tmp_path / ".env"
+    env_file.write_text("FILE_VAR=from-file\n")
+    ws = tmp_path / "ws"
+    runner.invoke(
+        cli,
+        [
+            "start",
+            str(task_dir),
+            "-d",
+            str(ws),
+            "--env-file",
+            str(env_file),
+            "-e",
+            "CLI_VAR=from-cli",
+        ],
+        catch_exceptions=False,
+    )
+    import json
+
+    sess = json.loads((ws / ".pier" / "session.json").read_text())
+    assert "FILE_VAR=from-file" in sess["extra_env"]
+    assert "CLI_VAR=from-cli" in sess["extra_env"]
 
 
 @patch("pier.harbor_bridge.is_environment_running", return_value=True)
@@ -1075,82 +1277,6 @@ def test_verify_host_container_failure_cleans_up(
 # ---------------------------------------------------------------------------
 
 
-@patch("pier.cli._verify_host_in_container", side_effect=ImportError("no harbor"))
-def test_verify_host_falls_back_to_local(
-    mock_container,
-    runner,
-    index_path,
-    task_dir,
-    tmp_path,
-):
-    """When Harbor isn't available, host verify runs test.sh locally."""
-    ws = tmp_path / "ws"
-    ws.mkdir()
-    _write_session(
-        ws,
-        {
-            "mode": "host",
-            "task_dir": str(task_dir),
-            "task_ref": "my-task",
-            "started_at": "2026-02-24T12:00:00+00:00",
-        },
-        index_path,
-    )
-    with patch("subprocess.run") as mock_run:
-
-        def fake_run(cmd, **kw):
-            vdir = Path(kw.get("env", {}).get("VERIFIER_DIR", "/tmp/v"))
-            vdir.mkdir(parents=True, exist_ok=True)
-            (vdir / "reward.json").write_text('{"reward": 0.91}')
-            return MagicMock(returncode=0, stdout="", stderr="")
-
-        mock_run.side_effect = fake_run
-        result = runner.invoke(cli, ["verify"], catch_exceptions=False)
-
-    assert result.exit_code == 0
-    assert "0.91" in result.output
-    assert "locally" in result.output
-
-
-@patch("pier.cli._verify_host_in_container", side_effect=ImportError("no harbor"))
-@pytest.mark.skipif(sys.platform == "win32", reason="bash not available on Windows")
-def test_verify_host_local_runs_real_test_sh(
-    mock_container,
-    runner,
-    index_path,
-    tmp_path,
-):
-    """Integration test: actually runs test.sh instead of mocking subprocess.run."""
-    task = tmp_path / "real-task"
-    task.mkdir()
-    (task / "task.toml").write_text(
-        '[metadata]\nauthor_name = "test"\n[environment]\n[verifier]\n[agent]\n'
-    )
-    tests = task / "tests"
-    tests.mkdir()
-    (tests / "test.sh").write_text(
-        '#!/bin/bash\nmkdir -p "$VERIFIER_DIR"\n'
-        'echo \'{"reward": 0.75}\' > "$VERIFIER_DIR/reward.json"\n'
-    )
-    (tests / "test.sh").chmod(0o755)
-
-    ws = tmp_path / "ws"
-    ws.mkdir()
-    _write_session(
-        ws,
-        {
-            "mode": "host",
-            "task_dir": str(task),
-            "task_ref": "real-task",
-            "started_at": "2026-02-24T12:00:00+00:00",
-        },
-        index_path,
-    )
-    result = runner.invoke(cli, ["verify"], catch_exceptions=False)
-    assert result.exit_code == 0
-    assert "0.75" in result.output
-
-
 def test_verify_host_missing_workspace(runner, index_path, tmp_path):
     ws = tmp_path / "nonexistent"
     sess_data = {
@@ -1473,20 +1599,17 @@ def test_verify_host_custom_trial_dir(runner, index_path, task_dir, tmp_path):
         index_path,
     )
     custom = tmp_path / "my-trial"
-    with (
-        patch(
-            "pier.cli._verify_host_in_container", side_effect=ImportError("no harbor")
-        ),
-        patch("subprocess.run") as mock_run,
-    ):
 
-        def fake_run(cmd, **kw):
-            vdir = Path(kw.get("env", {}).get("VERIFIER_DIR", "/tmp/v"))
-            vdir.mkdir(parents=True, exist_ok=True)
-            (vdir / "reward.json").write_text('{"reward": 1.0}')
-            return MagicMock(returncode=0, stdout="", stderr="")
+    def fake_verify(task_dir, workspace, trial_dir):
+        from datetime import datetime, timezone
 
-        mock_run.side_effect = fake_run
+        vdir = trial_dir / "verifier"
+        vdir.mkdir(parents=True, exist_ok=True)
+        (vdir / "reward.json").write_text('{"reward": 1.0}')
+        now = datetime.now(timezone.utc)
+        return {"reward": 1.0}, now, now
+
+    with patch("pier.cli._verify_host_in_container", side_effect=fake_verify):
         result = runner.invoke(
             cli,
             ["verify", "--trial-dir", str(custom)],
@@ -1520,6 +1643,99 @@ def test_skills_no_skills(runner, index_path, tmp_path):
     result = runner.invoke(cli, ["skills"], catch_exceptions=False)
     assert result.exit_code == 0
     assert "no skills" in result.output.lower()
+
+
+@patch("subprocess.run")
+@patch("pier.harbor_bridge.stop_environment")
+@patch("pier.harbor_bridge.start_environment")
+@patch("pier.harbor_bridge.get_container_name", return_value="pier-skills-abc-main-1")
+def test_skills_extracts_from_container(
+    mock_container_name,
+    mock_start,
+    mock_stop,
+    mock_run,
+    runner,
+    index_path,
+    tmp_path,
+):
+    """pier skills extracts skills from the container image when skills_dir is set."""
+    td = tmp_path / "my-task"
+    td.mkdir()
+    (td / "task.toml").write_text(
+        '[metadata]\n[environment]\nskills_dir = "/opt/skills"\n[verifier]\n[agent]\n'
+    )
+    env = td / "environment"
+    env.mkdir()
+    (env / "Dockerfile").write_text("FROM ubuntu:24.04\nWORKDIR /app\n")
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    _write_session(
+        ws,
+        {
+            "mode": "host",
+            "task_dir": str(td),
+            "task_ref": "my-task",
+            "started_at": "2026-02-24T12:00:00+00:00",
+        },
+        index_path,
+    )
+
+    def fake_docker_cp(cmd, **kwargs):
+        """Simulate docker cp by creating a skill in the dest."""
+        if cmd[0] == "docker" and cmd[1] == "cp":
+            dest = Path(cmd[3])
+            skill = dest / "greet"
+            skill.mkdir(parents=True)
+            (skill / "SKILL.md").write_text("# Greet\n")
+            return MagicMock(returncode=0)
+        # npx skills add
+        return MagicMock(returncode=0)
+
+    mock_run.side_effect = fake_docker_cp
+    result = runner.invoke(cli, ["skills"], catch_exceptions=False)
+    assert result.exit_code == 0
+    assert "1 skill" in result.output.lower()
+    mock_start.assert_called_once()
+    mock_stop.assert_called_once()  # cleanup via Harbor, not docker rm
+
+
+@patch("subprocess.run")
+@patch("pier.harbor_bridge.start_environment", side_effect=Exception("build failed"))
+@patch("pier.harbor_bridge.get_container_name", return_value="pier-skills-abc-main-1")
+def test_skills_extract_failure(
+    mock_container_name,
+    mock_start,
+    mock_run,
+    runner,
+    index_path,
+    tmp_path,
+):
+    """pier skills reports error when container extraction fails."""
+    td = tmp_path / "my-task"
+    td.mkdir()
+    (td / "task.toml").write_text(
+        '[metadata]\n[environment]\nskills_dir = "/opt/skills"\n[verifier]\n[agent]\n'
+    )
+    env = td / "environment"
+    env.mkdir()
+    (env / "Dockerfile").write_text("FROM ubuntu:24.04\nWORKDIR /app\n")
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    _write_session(
+        ws,
+        {
+            "mode": "host",
+            "task_dir": str(td),
+            "task_ref": "my-task",
+            "started_at": "2026-02-24T12:00:00+00:00",
+        },
+        index_path,
+    )
+    # docker rm cleanup
+    mock_run.return_value = MagicMock(returncode=0)
+    result = runner.invoke(cli, ["skills"])
+    assert result.exit_code != 0
+    assert "failed" in result.output.lower()
 
 
 def test_skills_container_mode_error(runner, index_path, tmp_path):
@@ -1682,3 +1898,939 @@ def test_summarize_all_flag(runner, index_path, tmp_path, monkeypatch):
     assert result.exit_code == 0
     call_kwargs = mock_summarizer_cls.call_args[1]
     assert call_kwargs["only_failed"] is False
+
+
+# ---------------------------------------------------------------------------
+# pier capture
+# ---------------------------------------------------------------------------
+
+
+@patch("pier.harbor_bridge.extract_agent_logs", return_value={"cost_usd": 0.05})
+@patch("pier.harbor_bridge.detect_agent_from_session_dir", return_value="claude-code")
+def test_capture_explicit_session_dir(
+    mock_detect, mock_extract, runner, index_path, tmp_path, monkeypatch
+):
+    """pier capture --session-dir skips auto-discovery."""
+    session_dir = tmp_path / "session"
+    session_dir.mkdir()
+    (session_dir / "main.jsonl").write_text("{}\n")
+
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    _write_session(ws, _host_session(), index_path)
+    monkeypatch.chdir(ws)
+    monkeypatch.setenv("PWD", str(ws))
+
+    result = runner.invoke(
+        cli, ["capture", "--session-dir", str(session_dir)], catch_exceptions=False
+    )
+    assert result.exit_code == 0
+    assert "trajectory extracted" in result.output.lower()
+
+
+def test_capture_host_no_session_dir_fails(runner, index_path, tmp_path, monkeypatch):
+    """pier capture without --session-dir in host mode gives a clear error."""
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    _write_session(ws, _host_session(), index_path)
+    monkeypatch.chdir(ws)
+    monkeypatch.setenv("PWD", str(ws))
+
+    result = runner.invoke(cli, ["capture"])
+    assert result.exit_code != 0
+    assert "--session-dir" in result.output
+
+
+@patch("pier.harbor_bridge.extract_agent_logs", return_value={"cost_usd": 0.05})
+@patch("pier.harbor_bridge.detect_agent_from_session_dir", return_value="claude-code")
+def test_capture_creates_trial_dir(
+    mock_detect, mock_extract, runner, index_path, tmp_path, monkeypatch
+):
+    """pier capture creates a timestamped trial directory under .pier/trials/."""
+    session_dir = tmp_path / "session"
+    session_dir.mkdir()
+    (session_dir / "main.jsonl").write_text("{}\n")
+
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    _write_session(ws, _host_session(), index_path)
+    monkeypatch.chdir(ws)
+    monkeypatch.setenv("PWD", str(ws))
+
+    runner.invoke(
+        cli, ["capture", "--session-dir", str(session_dir)], catch_exceptions=False
+    )
+
+    trials_dir = ws / ".pier" / "trials"
+    assert trials_dir.is_dir()
+    trial_dirs = list(trials_dir.iterdir())
+    assert len(trial_dirs) == 1
+    assert (trial_dirs[0] / "result.json").exists()
+
+
+@patch("pier.harbor_bridge.extract_agent_logs", return_value={"cost_usd": 0.05})
+@patch("pier.harbor_bridge.detect_agent_from_session_dir", return_value="claude-code")
+def test_capture_outside_workspace(
+    mock_detect, mock_extract, runner, index_path, tmp_path, monkeypatch
+):
+    """pier capture works outside a pier workspace (no session.json)."""
+    session_dir = tmp_path / "session"
+    session_dir.mkdir()
+    (session_dir / "main.jsonl").write_text("{}\n")
+
+    project = tmp_path / "my-project"
+    project.mkdir()
+    monkeypatch.chdir(project)
+    monkeypatch.setenv("PWD", str(project))
+
+    result = runner.invoke(
+        cli, ["capture", "--session-dir", str(session_dir)], catch_exceptions=False
+    )
+    assert result.exit_code == 0
+    assert (project / ".pier" / "trials").is_dir()
+
+
+@patch("pier.harbor_bridge.extract_agent_logs", return_value={"cost_usd": 0.05})
+@patch("pier.harbor_bridge.detect_agent_from_session_dir", return_value="claude-code")
+def test_capture_outside_workspace_does_not_attach_to_unrelated_active_workspace(
+    mock_detect, mock_extract, runner, index_path, tmp_path, monkeypatch
+):
+    """capture from a non-workspace directory should write into cwd, not another active workspace."""
+    session_dir = tmp_path / "session"
+    session_dir.mkdir()
+    (session_dir / "main.jsonl").write_text("{}\n")
+
+    active_ws = tmp_path / "active-ws"
+    active_ws.mkdir()
+    _write_session(active_ws, _host_session(), index_path)
+
+    project = tmp_path / "my-project"
+    project.mkdir()
+    monkeypatch.chdir(project)
+    monkeypatch.setenv("PWD", str(project))
+
+    result = runner.invoke(
+        cli, ["capture", "--session-dir", str(session_dir)], catch_exceptions=False
+    )
+
+    assert result.exit_code == 0
+    assert (project / ".pier" / "trials").is_dir()
+    assert not (active_ws / ".pier" / "trials").exists()
+
+
+@patch("pier.harbor_bridge.extract_agent_logs", return_value={"cost_usd": 0.05})
+@patch(
+    "pier.harbor_bridge.find_container_agent_session_dir",
+    return_value=Path("/tmp/fake-session"),
+)
+@patch("pier.harbor_bridge.detect_agent_from_session_dir", return_value="claude-code")
+def test_capture_container_auto_discover(
+    mock_detect,
+    mock_find,
+    mock_extract,
+    runner,
+    index_path,
+    tmp_path,
+    monkeypatch,
+):
+    """pier capture in container mode auto-discovers session from agent logs."""
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    sess = _container_session(agents=["claude-code"])
+    _write_session(ws, sess, index_path)
+    monkeypatch.chdir(ws)
+    monkeypatch.setenv("PWD", str(ws))
+
+    result = runner.invoke(cli, ["capture"], catch_exceptions=False)
+    assert result.exit_code == 0
+    assert "trajectory extracted" in result.output.lower()
+    mock_find.assert_called_once()
+
+
+@patch(
+    "pier.harbor_bridge.find_container_agent_session_dir",
+    return_value=None,
+)
+def test_capture_container_no_session_found(
+    mock_find, runner, index_path, tmp_path, monkeypatch
+):
+    """pier capture in container mode fails clearly when no session found."""
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    sess = _container_session(agents=["claude-code"])
+    _write_session(ws, sess, index_path)
+    monkeypatch.chdir(ws)
+    monkeypatch.setenv("PWD", str(ws))
+
+    result = runner.invoke(cli, ["capture"])
+    assert result.exit_code != 0
+    assert "could not find" in result.output.lower()
+
+
+def test_capture_container_multiple_agents_requires_flag(
+    runner, index_path, tmp_path, monkeypatch
+):
+    """pier capture with multiple agents requires -a."""
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    sess = _container_session(agents=["claude-code", "codex"])
+    _write_session(ws, sess, index_path)
+    monkeypatch.chdir(ws)
+    monkeypatch.setenv("PWD", str(ws))
+
+    result = runner.invoke(cli, ["capture"])
+    assert result.exit_code != 0
+    assert "multiple agents" in result.output.lower()
+
+
+# ---------------------------------------------------------------------------
+# pier traces
+# ---------------------------------------------------------------------------
+
+
+def test_traces_list_no_trials(runner, index_path, tmp_path, monkeypatch):
+    """pier traces with no trials prints a message."""
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    _write_session(ws, _host_session(), index_path)
+    monkeypatch.chdir(ws)
+    monkeypatch.setenv("PWD", str(ws))
+
+    result = runner.invoke(cli, ["traces"], catch_exceptions=False)
+    assert result.exit_code == 0
+    assert "no trials" in result.output.lower()
+
+
+def test_traces_list_shows_trials(runner, index_path, tmp_path, monkeypatch):
+    """pier traces lists available trials."""
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    _write_session(ws, _host_session(), index_path)
+    trials = ws / ".pier" / "trials"
+    trial = trials / "2026-04-02_10-00-00"
+    trial.mkdir(parents=True)
+    (trial / "result.json").write_text(
+        '{"reward": 0.75, "agent_info": {"name": "claude-code"}}'
+    )
+    (trial / "agent").mkdir()
+    (trial / "agent" / "trajectory.json").write_text("{}")
+
+    monkeypatch.chdir(ws)
+    monkeypatch.setenv("PWD", str(ws))
+
+    result = runner.invoke(cli, ["traces"], catch_exceptions=False)
+    assert result.exit_code == 0
+    assert "2026-04-02" in result.output
+    assert "claude-code" in result.output
+    assert "trajectory" in result.output
+
+
+def test_traces_list_shows_zero_reward(runner, index_path, tmp_path, monkeypatch):
+    """pier traces should display a real zero reward instead of dropping it."""
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    _write_session(ws, _host_session(), index_path)
+    trials = ws / ".pier" / "trials"
+    trial = trials / "2026-04-02_10-00-00"
+    trial.mkdir(parents=True)
+    (trial / "result.json").write_text(
+        '{"verifier_result": {"rewards": {"reward": 0}}, "agent_info": {"name": "claude-code"}}'
+    )
+
+    monkeypatch.chdir(ws)
+    monkeypatch.setenv("PWD", str(ws))
+
+    result = runner.invoke(cli, ["traces"], catch_exceptions=False)
+
+    assert result.exit_code == 0
+    assert "reward=0" in result.output
+
+
+def test_traces_export_no_trials_errors(runner, index_path, tmp_path, monkeypatch):
+    """pier traces -o fails when no trials exist."""
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    _write_session(ws, _host_session(), index_path)
+    monkeypatch.chdir(ws)
+    monkeypatch.setenv("PWD", str(ws))
+
+    result = runner.invoke(cli, ["traces", "-o", str(tmp_path / "out.tar.gz")])
+    assert result.exit_code != 0
+    assert "no trials" in result.output.lower()
+
+
+def test_traces_export_latest(runner, index_path, tmp_path, monkeypatch):
+    """pier traces -o packages the latest trial."""
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    _write_session(ws, _host_session(), index_path)
+    trials = ws / ".pier" / "trials"
+    trial1 = trials / "2026-04-01_10-00-00"
+    trial1.mkdir(parents=True)
+    (trial1 / "result.json").write_text('{"reward": 0.5}')
+    trial2 = trials / "2026-04-02_10-00-00"
+    trial2.mkdir(parents=True)
+    (trial2 / "result.json").write_text('{"reward": 1.0}')
+
+    monkeypatch.chdir(ws)
+    monkeypatch.setenv("PWD", str(ws))
+    out = tmp_path / "trace.tar.gz"
+
+    result = runner.invoke(cli, ["traces", "-o", str(out)], catch_exceptions=False)
+    assert result.exit_code == 0
+    assert "Exported 1 trial" in result.output
+    assert out.exists()
+
+    import tarfile
+
+    with tarfile.open(out) as tar:
+        names = tar.getnames()
+        assert any("2026-04-02" in n for n in names)
+        assert not any("2026-04-01" in n for n in names)
+
+
+def test_traces_export_specific(runner, index_path, tmp_path, monkeypatch):
+    """pier traces <name> -o exports a specific trial."""
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    _write_session(ws, _host_session(), index_path)
+    trials = ws / ".pier" / "trials"
+    for name in ["2026-04-01_10-00-00", "2026-04-02_10-00-00"]:
+        d = trials / name
+        d.mkdir(parents=True)
+        (d / "result.json").write_text('{"reward": 1.0}')
+
+    monkeypatch.chdir(ws)
+    monkeypatch.setenv("PWD", str(ws))
+    out = tmp_path / "trace.tar.gz"
+
+    result = runner.invoke(
+        cli, ["traces", "2026-04-01_10-00-00", "-o", str(out)], catch_exceptions=False
+    )
+    assert result.exit_code == 0
+
+    import tarfile
+
+    with tarfile.open(out) as tar:
+        names = tar.getnames()
+        assert any("2026-04-01" in n for n in names)
+        assert not any("2026-04-02" in n for n in names)
+
+
+def test_traces_export_specific_not_found(runner, index_path, tmp_path, monkeypatch):
+    """pier traces <bad-name> -o gives a clear error."""
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    _write_session(ws, _host_session(), index_path)
+    trials = ws / ".pier" / "trials"
+    (trials / "2026-04-02_10-00-00").mkdir(parents=True)
+
+    monkeypatch.chdir(ws)
+    monkeypatch.setenv("PWD", str(ws))
+
+    result = runner.invoke(
+        cli, ["traces", "nonexistent", "-o", str(tmp_path / "out.tar.gz")]
+    )
+    assert result.exit_code != 0
+    assert "not found" in result.output.lower()
+
+
+def test_traces_export_all(runner, index_path, tmp_path, monkeypatch):
+    """pier traces --all -o packages all trials."""
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    _write_session(ws, _host_session(), index_path)
+    trials = ws / ".pier" / "trials"
+    for name in ["2026-04-01_10-00-00", "2026-04-02_10-00-00"]:
+        d = trials / name
+        d.mkdir(parents=True)
+        (d / "result.json").write_text('{"reward": 1.0}')
+
+    monkeypatch.chdir(ws)
+    monkeypatch.setenv("PWD", str(ws))
+    out = tmp_path / "trace.tar.gz"
+
+    result = runner.invoke(
+        cli, ["traces", "--all", "-o", str(out)], catch_exceptions=False
+    )
+    assert result.exit_code == 0
+    assert "Exported 2 trials" in result.output
+
+
+# ---------------------------------------------------------------------------
+# pier start --image (task-free mode)
+# ---------------------------------------------------------------------------
+
+
+@patch("pier.harbor_bridge.start_environment")
+def test_start_task_free(mock_start, runner, index_path, tmp_path):
+    """pier start -d . --image starts a task-free container."""
+    ws = tmp_path / "ws"
+    result = runner.invoke(
+        cli,
+        ["start", "-d", str(ws), "--image", "ubuntu:24.04"],
+        catch_exceptions=False,
+    )
+    assert result.exit_code == 0, result.output
+    assert "ready" in result.output.lower()
+    mock_start.assert_called_once()
+
+    session = json.loads((ws / ".pier" / "session.json").read_text())
+    assert session["mode"] == "container"
+    assert session["image"] == "ubuntu:24.04"
+    # task_dir points to synthetic task
+    assert session["task_dir"] is not None
+    assert "pier-task-free" in session["task_dir"]
+
+
+@patch("pier.harbor_bridge.setup_agent")
+@patch("pier.harbor_bridge.is_valid_agent", return_value=True)
+@patch("pier.harbor_bridge.start_environment")
+def test_start_task_free_with_agent(
+    mock_start, mock_valid, mock_setup, runner, index_path, tmp_path
+):
+    """pier start -d . --image --agent installs agent in task-free container."""
+    ws = tmp_path / "ws"
+    result = runner.invoke(
+        cli,
+        ["start", "-d", str(ws), "--image", "ubuntu:24.04", "--agent", "claude-code"],
+        catch_exceptions=False,
+    )
+    assert result.exit_code == 0, result.output
+    assert "claude-code installed" in result.output
+    mock_setup.assert_called_once()
+
+    session = json.loads((ws / ".pier" / "session.json").read_text())
+    assert session["agents"] == ["claude-code"]
+    assert session["image"] == "ubuntu:24.04"
+
+
+def test_start_task_free_requires_dir(runner, index_path):
+    """pier start --image without -d fails."""
+    result = runner.invoke(cli, ["start", "--image", "ubuntu:24.04"])
+    assert result.exit_code != 0
+    assert "-d" in result.output
+
+
+@patch("pier.harbor_bridge.start_environment")
+def test_start_task_free_creates_synthetic_task(
+    mock_start, runner, index_path, tmp_path
+):
+    """pier start --image creates a synthetic task with Dockerfile."""
+    ws = tmp_path / "ws"
+    runner.invoke(
+        cli,
+        ["start", "-d", str(ws), "--image", "ubuntu:24.04"],
+        catch_exceptions=False,
+    )
+    # Synthetic task should exist in .pier/
+    synthetic = ws / ".pier" / "pier-task-free"
+    assert synthetic.is_dir()
+    dockerfile = synthetic / "environment" / "Dockerfile"
+    assert dockerfile.exists()
+    assert "FROM ubuntu:24.04" in dockerfile.read_text()
+    assert (synthetic / "task.toml").exists()
+
+
+def _task_free_session(
+    tmp_path: Path,
+    harbor_session_id: str = "pier-ws-abc",
+    agents: list[str] | None = None,
+) -> dict:
+    """Build a minimal task-free container session dict with synthetic task."""
+    synthetic = tmp_path / "pier-task-free"
+    synthetic.mkdir(parents=True, exist_ok=True)
+    env_dir = synthetic / "environment"
+    env_dir.mkdir(exist_ok=True)
+    (env_dir / "Dockerfile").write_text("FROM ubuntu:24.04\nWORKDIR /app\n")
+    (synthetic / "task.toml").write_text(
+        '[metadata]\nauthor_name = "pier"\n[environment]\n[verifier]\n[agent]\n'
+    )
+    return {
+        "mode": "container",
+        "task_dir": str(synthetic),
+        "task_ref": "pier-task-free",
+        "image": "ubuntu:24.04",
+        "harbor_session_id": harbor_session_id,
+        "agents": agents or [],
+        "ports": [],
+        "extra_mounts": [],
+        "extra_env": [],
+        "no_mount": False,
+        "started_at": "2026-04-02T12:00:00+00:00",
+    }
+
+
+@patch("pier.harbor_bridge.start_environment")
+def test_start_task_free_with_ports(mock_start, runner, index_path, tmp_path):
+    """pier start --ports writes port mappings to compose override."""
+    ws = tmp_path / "ws"
+    runner.invoke(
+        cli,
+        [
+            "start",
+            "-d",
+            str(ws),
+            "--image",
+            "ubuntu:24.04",
+            "--ports",
+            "8888",
+            "--ports",
+            "4200",
+        ],
+        catch_exceptions=False,
+    )
+    # Ports should be passed through to start_environment
+    call_kwargs = mock_start.call_args[1]
+    assert call_kwargs["ports"] == [8888, 4200]
+
+
+@patch("pier.harbor_bridge.start_environment")
+def test_start_no_mount_passes_none_workspace(mock_start, runner, index_path, tmp_path):
+    """pier start --no-mount passes workspace_dir=None to start_environment."""
+    ws = tmp_path / "ws"
+    with patch("pier.cli._tar_copy_to_container"):
+        runner.invoke(
+            cli,
+            ["start", "-d", str(ws), "--image", "ubuntu:24.04", "--no-mount"],
+            catch_exceptions=False,
+        )
+    call_kwargs = mock_start.call_args[1]
+    assert call_kwargs["workspace_dir"] is None
+
+
+@patch("pier.harbor_bridge.start_environment")
+def test_start_no_mount_stores_in_session(mock_start, runner, index_path, tmp_path):
+    """pier start --no-mount stores no_mount=True in session."""
+    ws = tmp_path / "ws"
+    with patch("pier.cli._tar_copy_to_container"):
+        runner.invoke(
+            cli,
+            ["start", "-d", str(ws), "--image", "ubuntu:24.04", "--no-mount"],
+            catch_exceptions=False,
+        )
+    import json
+
+    sess = json.loads((ws / ".pier" / "session.json").read_text())
+    assert sess["no_mount"] is True
+
+
+@patch("pier.harbor_bridge.get_container_workdir", return_value="/app")
+@patch("pier.harbor_bridge.get_container_name", return_value="pier-test-main-1")
+@patch("pier.harbor_bridge.start_environment")
+def test_start_no_mount_copies_workspace_to_container(
+    mock_start, mock_name, mock_workdir, runner, index_path, tmp_path
+):
+    """--no-mount copies host workspace files into the container."""
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    (ws / "notes.md").write_text("# Hello")
+    (ws / ".gitignore").write_text(".pier/\n")
+
+    with patch("pier.cli._tar_copy_to_container") as mock_tar:
+        runner.invoke(
+            cli,
+            [
+                "start",
+                "-d",
+                str(ws),
+                "--image",
+                "ubuntu:24.04",
+                "--no-mount",
+                "--force",
+            ],
+            catch_exceptions=False,
+        )
+    mock_tar.assert_called_once()
+
+
+@patch("pier.harbor_bridge.get_container_workdir", return_value="/app")
+@patch("pier.harbor_bridge.get_container_name", return_value="pier-test-main-1")
+@patch("pier.harbor_bridge.start_environment")
+def test_start_no_mount_sets_git_safe_directory(
+    mock_start, mock_name, mock_workdir, runner, index_path, tmp_path
+):
+    """--no-mount sets git safe.directory when .git/ exists."""
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    (ws / ".git").mkdir()
+
+    with (
+        patch("subprocess.run", return_value=MagicMock(returncode=0)) as mock_run,
+        patch("pier.cli._tar_copy_to_container"),
+    ):
+        runner.invoke(
+            cli,
+            [
+                "start",
+                "-d",
+                str(ws),
+                "--image",
+                "ubuntu:24.04",
+                "--no-mount",
+                "--force",
+            ],
+            catch_exceptions=False,
+        )
+    git_calls = [c for c in mock_run.call_args_list if "safe.directory" in str(c)]
+    assert len(git_calls) == 1, "Expected git safe.directory call"
+
+
+@patch("pier.harbor_bridge.get_container_workdir", return_value="/app")
+@patch("pier.harbor_bridge.get_container_name", return_value="pier-test-main-1")
+@patch("pier.harbor_bridge.start_environment")
+def test_start_no_mount_no_git_safe_directory_without_git(
+    mock_start, mock_name, mock_workdir, runner, index_path, tmp_path
+):
+    """--no-mount skips git safe.directory when no .git/ exists."""
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    (ws / "notes.md").write_text("# Hello")
+
+    with (
+        patch("subprocess.run", return_value=MagicMock(returncode=0)) as mock_run,
+        patch("pier.cli._tar_copy_to_container"),
+    ):
+        runner.invoke(
+            cli,
+            [
+                "start",
+                "-d",
+                str(ws),
+                "--image",
+                "ubuntu:24.04",
+                "--no-mount",
+                "--force",
+            ],
+            catch_exceptions=False,
+        )
+    git_calls = [c for c in mock_run.call_args_list if "safe.directory" in str(c)]
+    assert len(git_calls) == 0, "Should not call git safe.directory without .git/"
+
+
+@patch("pier.harbor_bridge.is_environment_running", return_value=True)
+@patch("pier.harbor_bridge.get_container_workdir", return_value="/app")
+@patch("pier.harbor_bridge.get_container_name", return_value="pier-test-main-1")
+@patch("pier.harbor_bridge.stop_environment")
+def test_stop_no_mount_copies_container_to_host(
+    mock_stop, mock_name, mock_workdir, mock_running, runner, index_path, tmp_path
+):
+    """pier stop with no_mount copies container files back to host."""
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    sess = _container_session()
+    sess["no_mount"] = True
+    _write_session(ws, sess, index_path)
+
+    with patch("pier.cli._tar_copy_from_container") as mock_tar:
+        runner.invoke(cli, ["stop"], catch_exceptions=False)
+    mock_tar.assert_called_once()
+
+
+@patch("pier.harbor_bridge.stop_environment")
+def test_stop_without_no_mount_skips_copy(mock_stop, runner, index_path, tmp_path):
+    """pier stop without no_mount does not copy files."""
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    _write_session(ws, _container_session(), index_path)
+
+    with patch("subprocess.run") as mock_run:
+        runner.invoke(cli, ["stop"], catch_exceptions=False)
+    tar_calls = [c for c in mock_run.call_args_list if "tar" in str(c)]
+    assert len(tar_calls) == 0, "Should not tar without no_mount"
+
+
+@patch("pier.harbor_bridge.start_environment")
+def test_start_task_free_with_mounts_json(mock_start, runner, index_path, tmp_path):
+    """pier start --mounts-json passes mounts through to start_environment."""
+    ws = tmp_path / "ws"
+    runner.invoke(
+        cli,
+        [
+            "start",
+            "-d",
+            str(ws),
+            "--image",
+            "ubuntu:24.04",
+            "--mounts-json",
+            '["/host/skills:/opt/skills:ro"]',
+        ],
+        catch_exceptions=False,
+    )
+    call_kwargs = mock_start.call_args[1]
+    assert "/host/skills:/opt/skills:ro" in call_kwargs["extra_mounts"]
+
+
+@patch("pier.harbor_bridge.start_environment")
+def test_start_mounts_json_validates_format(mock_start, runner, index_path, tmp_path):
+    """pier start --mounts-json rejects non-array JSON."""
+    ws = tmp_path / "ws"
+    result = runner.invoke(
+        cli,
+        [
+            "start",
+            "-d",
+            str(ws),
+            "--image",
+            "ubuntu:24.04",
+            "--mounts-json",
+            '"not-an-array"',
+        ],
+    )
+    assert result.exit_code != 0
+    assert "JSON array" in result.output
+
+
+@patch("pier.harbor_bridge.start_environment")
+def test_start_with_task_passes_mounts_json(
+    mock_start, runner, index_path, task_dir, tmp_path
+):
+    """pier start <task> --mounts-json passes mounts through."""
+    ws = tmp_path / "ws"
+    runner.invoke(
+        cli,
+        [
+            "start",
+            str(task_dir),
+            "-d",
+            str(ws),
+            "--mounts-json",
+            '["/host/data:/data:ro"]',
+        ],
+        catch_exceptions=False,
+    )
+    call_kwargs = mock_start.call_args[1]
+    assert "/host/data:/data:ro" in call_kwargs["extra_mounts"]
+
+
+@patch("pier.harbor_bridge.setup_agent")
+@patch("pier.harbor_bridge.is_valid_agent", return_value=True)
+@patch("pier.harbor_bridge.is_environment_running", return_value=True)
+def test_start_task_free_already_running_installs_agent(
+    mock_running, mock_valid, mock_setup, runner, index_path, tmp_path
+):
+    """pier start --image on already-running task-free container installs agent."""
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    _write_session(ws, _task_free_session(tmp_path), index_path)
+    result = runner.invoke(
+        cli,
+        ["start", "-d", str(ws), "--image", "ubuntu:24.04", "--agent", "claude-code"],
+        catch_exceptions=False,
+    )
+    assert result.exit_code == 0
+    assert "claude-code installed" in result.output
+    mock_setup.assert_called_once()
+
+
+@patch("pier.harbor_bridge.is_environment_running", return_value=True)
+def test_start_task_free_already_running_no_agent(
+    mock_running, runner, index_path, tmp_path
+):
+    """pier start --image on already-running task-free container is noop."""
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    _write_session(ws, _task_free_session(tmp_path), index_path)
+    result = runner.invoke(
+        cli,
+        ["start", "-d", str(ws), "--image", "ubuntu:24.04"],
+        catch_exceptions=False,
+    )
+    assert result.exit_code == 0
+    assert "already running" in result.output.lower()
+
+
+@patch("pier.harbor_bridge.stop_environment")
+def test_stop_task_free_container(mock_stop, runner, index_path, tmp_path):
+    """pier stop works for task-free containers."""
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    _write_session(ws, _task_free_session(tmp_path), index_path)
+    result = runner.invoke(cli, ["stop"], catch_exceptions=False)
+    assert result.exit_code == 0
+    assert "stopped" in result.output.lower()
+    mock_stop.assert_called_once()
+
+
+@patch("pier.harbor_bridge.is_environment_running", return_value=True)
+def test_exec_task_free_uses_default_workdir(
+    mock_running, runner, index_path, tmp_path
+):
+    """pier exec in task-free mode uses /app as workdir (from synthetic Dockerfile)."""
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    _write_session(ws, _task_free_session(tmp_path), index_path)
+    with patch("subprocess.run", return_value=MagicMock(returncode=0)) as mock_run:
+        runner.invoke(cli, ["exec", "bash"])
+    args = mock_run.call_args[0][0]
+    assert "-w" in args
+    assert "/app" in args
+
+
+# ---------------------------------------------------------------------------
+# Tests from copilot review round 2
+# ---------------------------------------------------------------------------
+
+
+@patch("pier.harbor_bridge.start_environment")
+def test_start_task_passes_ports(mock_start, runner, index_path, task_dir, tmp_path):
+    """pier start <task> --ports passes ports to start_environment."""
+    ws = tmp_path / "ws"
+    runner.invoke(
+        cli,
+        ["start", str(task_dir), "-d", str(ws), "--ports", "8888"],
+        catch_exceptions=False,
+    )
+    call_kwargs = mock_start.call_args[1]
+    assert call_kwargs["ports"] == [8888]
+
+
+def test_start_e_without_equals_errors(runner, index_path, tmp_path):
+    """Host mode rejects -e before env entry parsing."""
+    ws = tmp_path / "ws"
+    result = runner.invoke(cli, ["start", "--host", "-d", str(ws), "-e", "NOVALUE"])
+    assert result.exit_code != 0
+    assert "-e cannot be used with --host" in result.output
+
+
+def test_start_host_rejects_e(runner, index_path, task_dir, tmp_path):
+    """--host does not accept container env forwarding flags."""
+    ws = tmp_path / "ws"
+    result = runner.invoke(
+        cli, ["start", str(task_dir), "--host", "-d", str(ws), "-e", "FOO=bar"]
+    )
+    assert result.exit_code != 0
+    assert "--host" in result.output
+    assert "-e" in result.output
+
+
+def test_start_host_rejects_env_file(runner, index_path, task_dir, tmp_path):
+    """--host rejects --env-file for a clearer product contract."""
+    env_file = tmp_path / ".env"
+    env_file.write_text("FOO=bar\n")
+    ws = tmp_path / "ws"
+    result = runner.invoke(
+        cli,
+        ["start", str(task_dir), "--host", "-d", str(ws), "--env-file", str(env_file)],
+    )
+    assert result.exit_code != 0
+    assert "--host" in result.output
+    assert "--env-file" in result.output
+
+
+def test_start_env_file_rejects_export_syntax(runner, index_path, task_dir, tmp_path):
+    """--env-file accepts strict KEY=VALUE entries only."""
+    env_file = tmp_path / ".env"
+    env_file.write_text("export ASTA_TOKEN=from-file\n")
+    ws = tmp_path / "ws"
+    result = runner.invoke(
+        cli,
+        ["start", str(task_dir), "-d", str(ws), "--env-file", str(env_file)],
+    )
+    assert result.exit_code != 0
+    assert "without 'export '" in result.output
+
+
+@patch("pier.harbor_bridge.is_environment_running", return_value=False)
+@patch("pier.harbor_bridge.start_environment")
+def test_restart_preserves_session_env(
+    mock_start, mock_running, runner, index_path, task_dir, tmp_path
+):
+    """Restarting without -e preserves env vars from the original session."""
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    sess = _container_session(task_dir=str(task_dir))
+    sess["extra_env"] = ["KEPT=yes"]
+    _write_session(ws, sess, index_path)
+    runner.invoke(
+        cli,
+        ["start", str(task_dir), "-d", str(ws)],
+        catch_exceptions=False,
+    )
+    # extra_env should come from session since no new -e was passed
+    import json
+
+    new_sess = json.loads((ws / ".pier" / "session.json").read_text())
+    assert "KEPT=yes" in new_sess.get("extra_env", [])
+
+
+@patch("pier.harbor_bridge.is_environment_running", return_value=False)
+@patch("pier.harbor_bridge.start_environment")
+def test_restart_preserves_session_ports_and_mounts(
+    mock_start, mock_running, runner, index_path, task_dir, tmp_path
+):
+    """Restarting without new flags preserves persisted ports and mounts."""
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    sess = _container_session(task_dir=str(task_dir))
+    sess["ports"] = [8888, 4200]
+    sess["extra_mounts"] = ["/host/data:/data:ro"]
+    _write_session(ws, sess, index_path)
+
+    result = runner.invoke(
+        cli,
+        ["start", str(task_dir), "-d", str(ws)],
+        catch_exceptions=False,
+    )
+
+    assert result.exit_code == 0
+    call_kwargs = mock_start.call_args[1]
+    assert call_kwargs["ports"] == [8888, 4200]
+    assert call_kwargs["extra_mounts"] == ["/host/data:/data:ro"]
+    new_sess = json.loads((ws / ".pier" / "session.json").read_text())
+    assert new_sess["ports"] == [8888, 4200]
+    assert new_sess["extra_mounts"] == ["/host/data:/data:ro"]
+
+
+@patch("pier.harbor_bridge.is_environment_running", return_value=False)
+@patch("pier.harbor_bridge.start_environment")
+def test_start_existing_reuses_session_ports_and_mounts(
+    mock_start, mock_running, runner, index_path, task_dir, tmp_path, monkeypatch
+):
+    """pier start from inside a workspace reuses persisted ports and mounts."""
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    sess = _container_session(task_dir=str(task_dir))
+    sess["ports"] = [9000]
+    sess["extra_mounts"] = ["/host/skills:/opt/skills:ro"]
+    _write_session(ws, sess, index_path)
+    monkeypatch.chdir(ws)
+
+    result = runner.invoke(cli, ["start"], catch_exceptions=False)
+
+    assert result.exit_code == 0
+    call_kwargs = mock_start.call_args[1]
+    assert call_kwargs["ports"] == [9000]
+    assert call_kwargs["extra_mounts"] == ["/host/skills:/opt/skills:ro"]
+
+
+@patch("pier.harbor_bridge.get_container_workdir", return_value="/app")
+@patch("pier.harbor_bridge.get_container_name", return_value="pier-test-main-1")
+@patch("pier.harbor_bridge.start_environment")
+def test_start_no_mount_copy_failure_errors(
+    mock_start, mock_name, mock_workdir, runner, index_path, tmp_path
+):
+    """--no-mount aborts if copying the workspace into the container fails."""
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    (ws / "notes.md").write_text("# Hello")
+
+    with patch(
+        "pier.cli._tar_copy_to_container",
+        side_effect=click.ClickException("copy failed"),
+    ):
+        result = runner.invoke(
+            cli,
+            [
+                "start",
+                "-d",
+                str(ws),
+                "--image",
+                "ubuntu:24.04",
+                "--no-mount",
+                "--force",
+            ],
+        )
+
+    assert result.exit_code != 0
+    assert "copy failed" in result.output
