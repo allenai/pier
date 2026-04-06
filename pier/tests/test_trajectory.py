@@ -9,6 +9,16 @@ from pier.trajectory import assemble_trial
 
 
 class TestAssembleTrial:
+    @staticmethod
+    def _make_task(tmp_path: Path) -> Path:
+        task = tmp_path / "task"
+        task.mkdir()
+        (task / "task.toml").write_text(
+            '[metadata]\nauthor_name = "test"\n[environment]\n[verifier]\n[agent]\n'
+        )
+        (task / "instruction.md").write_text("Test instruction")
+        return task
+
     def _call(self, trial_dir: Path, task_dir: Path, **kwargs):
         defaults = {
             "task_ref": "my-task",
@@ -22,8 +32,7 @@ class TestAssembleTrial:
 
     def test_creates_directory_structure(self, tmp_path: Path):
         trial = tmp_path / "trial"
-        task = tmp_path / "task"
-        task.mkdir()
+        task = self._make_task(tmp_path)
         self._call(trial, task)
 
         assert (trial / "agent").is_dir()
@@ -35,8 +44,7 @@ class TestAssembleTrial:
     def test_config_json_is_valid_trial_config(self, tmp_path: Path):
         """config.json must be parseable by Harbor's TrialConfig."""
         trial = tmp_path / "trial"
-        task = tmp_path / "task"
-        task.mkdir()
+        task = self._make_task(tmp_path)
         self._call(trial, task)
 
         from harbor.models.trial.config import TrialConfig
@@ -47,8 +55,7 @@ class TestAssembleTrial:
 
     def test_config_json_includes_agent(self, tmp_path: Path):
         trial = tmp_path / "trial"
-        task = tmp_path / "task"
-        task.mkdir()
+        task = self._make_task(tmp_path)
         self._call(trial, task, agent_name="claude-code")
 
         from harbor.models.trial.config import TrialConfig
@@ -58,8 +65,7 @@ class TestAssembleTrial:
 
     def test_writes_verifier_reward_json(self, tmp_path: Path):
         trial = tmp_path / "trial"
-        task = tmp_path / "task"
-        task.mkdir()
+        task = self._make_task(tmp_path)
         self._call(trial, task, reward={"reward": 0.9, "accuracy": 0.85})
 
         reward = json.loads((trial / "verifier" / "reward.json").read_text())
@@ -68,8 +74,7 @@ class TestAssembleTrial:
 
     def test_does_not_overwrite_existing_reward(self, tmp_path: Path):
         trial = tmp_path / "trial"
-        task = tmp_path / "task"
-        task.mkdir()
+        task = self._make_task(tmp_path)
         (trial / "verifier").mkdir(parents=True)
         (trial / "verifier" / "reward.json").write_text('{"reward": 1.0}')
 
@@ -79,60 +84,6 @@ class TestAssembleTrial:
         assert reward["reward"] == 1.0  # original preserved
 
 
-class TestResultJsonFallback:
-    """When Harbor is not installed, result.json uses pier's own format."""
-
-    def test_fallback_format(self, tmp_path: Path):
-        trial = tmp_path / "trial"
-        task = tmp_path / "task"
-        task.mkdir()
-
-        with patch(
-            "pier.harbor_bridge.build_trial_result_json",
-            side_effect=ImportError("no harbor"),
-        ):
-            assemble_trial(
-                trial,
-                task,
-                "my-task",
-                "s",
-                {"reward": 0.75},
-                start_time=datetime(2026, 1, 1, tzinfo=timezone.utc),
-                end_time=datetime(2026, 1, 1, 0, 5, tzinfo=timezone.utc),
-            )
-
-        result = json.loads((trial / "result.json").read_text())
-        assert result["task_name"] == "my-task"
-        assert result["trial_name"] == "s"
-        assert result["reward"] == 0.75
-        assert result["rewards"] == {"reward": 0.75}
-        assert "started_at" in result
-        assert "finished_at" in result
-
-    def test_fallback_with_agent(self, tmp_path: Path):
-        trial = tmp_path / "trial"
-        task = tmp_path / "task"
-        task.mkdir()
-
-        with patch(
-            "pier.harbor_bridge.build_trial_result_json",
-            side_effect=ImportError("no harbor"),
-        ):
-            assemble_trial(
-                trial,
-                task,
-                "my-task",
-                "s",
-                {"reward": 1.0},
-                agent_name="claude-code",
-                agent_context={"cost_usd": 0.05},
-            )
-
-        result = json.loads((trial / "result.json").read_text())
-        assert result["agent_info"] == {"name": "claude-code"}
-        assert result["agent_context"] == {"cost_usd": 0.05}
-
-
 class TestResultJsonHarbor:
     """When Harbor is installed, result.json uses Harbor's TrialResult format."""
 
@@ -140,6 +91,10 @@ class TestResultJsonHarbor:
         trial = tmp_path / "trial"
         task = tmp_path / "task"
         task.mkdir()
+        (task / "task.toml").write_text(
+            '[metadata]\nauthor_name = "test"\n[environment]\n[verifier]\n[agent]\n'
+        )
+        (task / "instruction.md").write_text("Test")
 
         fake_json = json.dumps(
             {
@@ -167,3 +122,51 @@ class TestResultJsonHarbor:
         result = json.loads((trial / "result.json").read_text())
         assert result["task_name"] == "my-task"
         assert result["verifier_result"]["rewards"]["reward"] == 0.75
+
+    def test_falls_back_when_harbor_result_build_fails(self, tmp_path: Path):
+        trial = tmp_path / "trial"
+        task = tmp_path / "task"
+        task.mkdir()
+
+        with patch(
+            "pier.harbor_bridge.build_trial_result_json",
+            side_effect=RuntimeError("missing Harbor task metadata"),
+        ):
+            assemble_trial(
+                trial,
+                task,
+                "retro-task",
+                "retro-session",
+                {"reward": 0.0, "accuracy": 1.0},
+                start_time=datetime(2026, 1, 1, tzinfo=timezone.utc),
+                end_time=datetime(2026, 1, 1, 0, 5, tzinfo=timezone.utc),
+                agent_name="codex",
+                agent_context={"cost_usd": 1.25},
+            )
+
+        result = json.loads((trial / "result.json").read_text())
+        assert result["task_name"] == "retro-task"
+        assert result["trial_name"] == "retro-session"
+        assert result["reward"] == 0.0
+        assert result["rewards"]["accuracy"] == 1.0
+        assert result["agent_info"]["name"] == "codex"
+        assert result["agent_context"]["cost_usd"] == 1.25
+
+    def test_fallback_still_writes_trial_config(self, tmp_path: Path):
+        trial = tmp_path / "trial"
+        task = tmp_path / "task"
+        task.mkdir()
+
+        with patch(
+            "pier.harbor_bridge.build_trial_result_json",
+            side_effect=RuntimeError("missing Harbor task metadata"),
+        ):
+            assemble_trial(
+                trial,
+                task,
+                "retro-task",
+                "retro-session",
+                {"reward": 0.5},
+            )
+
+        assert (trial / "config.json").exists()

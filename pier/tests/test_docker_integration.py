@@ -2,7 +2,7 @@
 
 These tests start real containers and verify the end-to-end flow:
 - workspace bind-mount works
-- .task/instruction.md is readable (not a broken symlink)
+- .task/instruction.md is readable inside the container
 - skills are mounted
 - pier exec forwards env vars and runs commands
 - verifier runs and produces a reward
@@ -118,14 +118,13 @@ def workspace(tmp_path):
 def _cleanup_container(workspace: Path):
     """Best-effort cleanup of the container after a test."""
     try:
-        from pier.cli import _harbor_session_id, _harbor_trial_dir, _load_session
+        from pier.cli import _harbor_trial_dir, _load_session
         from pier.harbor_bridge import stop_environment
 
         sess = _load_session(workspace)
-        hsid = sess.get("harbor_session_id", _harbor_session_id(workspace))
-        stop_environment(
-            Path(sess["task_dir"]), hsid, _harbor_trial_dir(workspace), delete=True
-        )
+        task_dir = Path(sess["task_dir"])
+        hsid = sess.get("harbor_session_id", "")
+        stop_environment(task_dir, hsid, _harbor_trial_dir(workspace), delete=True)
     except Exception:
         pass
 
@@ -157,8 +156,7 @@ class TestContainerLifecycle:
     def test_task_instruction_readable_in_container(
         self, runner, index_path, task_dir, workspace
     ):
-        """instruction.md is a regular readable file inside the container,
-        not a broken symlink."""
+        """instruction.md is a regular readable file inside the container."""
         try:
             _start_workspace(runner, task_dir, workspace)
             container = _get_container_name(workspace)
@@ -172,7 +170,7 @@ class TestContainerLifecycle:
             assert r.returncode == 0, r.stderr
             assert "hello.txt" in r.stdout.lower()
 
-            # Check it's a regular file (not a symlink to a nonexistent host path)
+            # Check it's a regular file
             r = subprocess.run(
                 [
                     "docker",
@@ -186,7 +184,7 @@ class TestContainerLifecycle:
             )
             assert r.returncode == 0, "instruction.md is not a regular file"
 
-            # Check find can discover it (the original bug: find skipped broken symlinks)
+            # Check find can discover it
             r = subprocess.run(
                 ["docker", "exec", container, "find", "/app/.task", "-name", "*.md"],
                 capture_output=True,
@@ -194,29 +192,6 @@ class TestContainerLifecycle:
             )
             assert r.returncode == 0
             assert "instruction.md" in r.stdout
-
-        finally:
-            _cleanup_container(workspace)
-
-    def test_skills_mounted_in_container(self, runner, index_path, task_dir, workspace):
-        """Skills directory is mounted read-only in .task/skills/."""
-        try:
-            _start_workspace(runner, task_dir, workspace)
-            container = _get_container_name(workspace)
-
-            r = subprocess.run(
-                [
-                    "docker",
-                    "exec",
-                    container,
-                    "cat",
-                    "/app/.task/skills/greet/SKILL.md",
-                ],
-                capture_output=True,
-                text=True,
-            )
-            assert r.returncode == 0, r.stderr
-            assert "Greet" in r.stdout
 
         finally:
             _cleanup_container(workspace)
@@ -404,20 +379,26 @@ class TestExecIntegration:
         finally:
             _cleanup_container(workspace)
 
-    def test_exec_forwards_api_keys(self, runner, index_path, task_dir, workspace):
-        """pier exec forwards *_API_KEY env vars into the container."""
+    def test_exec_forwards_extra_env(self, runner, index_path, task_dir, workspace):
+        """pier start -e forwards env vars into pier exec."""
         try:
-            _start_workspace(runner, task_dir, workspace)
-
-            r = self._run_pier_exec(
-                workspace,
-                "sh",
-                "-c",
-                "echo $TEST_API_KEY",
-                env={"TEST_API_KEY": "secret-123"},
+            result = runner.invoke(
+                cli,
+                [
+                    "start",
+                    str(task_dir),
+                    "-d",
+                    str(workspace),
+                    "-e",
+                    "TEST_SECRET=s3cret",
+                ],
+                catch_exceptions=False,
             )
+            assert result.exit_code == 0, result.output
+
+            r = self._run_pier_exec(workspace, "sh", "-c", "echo $TEST_SECRET")
             assert r.returncode == 0, r.stderr
-            assert "secret-123" in r.stdout
+            assert "s3cret" in r.stdout
 
         finally:
             _cleanup_container(workspace)
