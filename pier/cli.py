@@ -619,7 +619,14 @@ def cli():
     "--force",
     is_flag=True,
     default=False,
-    help="Allow non-empty workspace dirs; if a pier session already exists at -d, remove it and start fresh.",
+    help="Allow starting in a workspace directory that already has files (non-empty).",
+)
+@click.option(
+    "--delete",
+    "delete_workspace",
+    is_flag=True,
+    default=False,
+    help="Remove any existing pier session at -d (stop container, delete workspace tree) before starting.",
 )
 @click.option(
     "--ae",
@@ -633,7 +640,7 @@ def cli():
     "--environment-env",
     "environment_env",
     multiple=True,
-    help="Container env at compose start (KEY=VALUE). Repeatable.",
+    help="Compose service env at container start (KEY=VALUE). For exec-time vars use -e, --env-file, or --ae.",
 )
 @click.option(
     "--exec",
@@ -653,6 +660,7 @@ def start(
     env_file: str | None,
     no_mount: bool,
     force: bool,
+    delete_workspace: bool,
     agent_env: tuple[str, ...],
     environment_env: tuple[str, ...],
     exec_cmd_str: str | None,
@@ -725,6 +733,7 @@ def start(
             extra_env=extra_env_list,
             no_mount=no_mount,
             force=force,
+            delete_workspace=delete_workspace,
             agent_env=list(agent_env),
             environment_env=list(environment_env),
         )
@@ -763,7 +772,7 @@ def start(
         )
 
     workspace = workspace.resolve()
-    if force and _session_json_path(workspace).exists():
+    if delete_workspace and _session_json_path(workspace).exists():
         _force_teardown(workspace)
 
     # Collision check — existing session in this workspace
@@ -1097,6 +1106,7 @@ def _start_task_free(
     extra_env: list[str] | None = None,
     no_mount: bool = False,
     force: bool = False,
+    delete_workspace: bool = False,
     agent_env: list[str] | None = None,
     environment_env: list[str] | None = None,
 ) -> None:
@@ -1109,7 +1119,7 @@ def _start_task_free(
     ae_list = agent_env or []
     ee_list = environment_env or []
 
-    if force and _session_json_path(workspace).exists():
+    if delete_workspace and _session_json_path(workspace).exists():
         _force_teardown(workspace)
 
     # If workspace already has a session, handle like _start_existing

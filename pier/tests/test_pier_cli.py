@@ -1371,16 +1371,16 @@ def test_stop_fallback_removes_container(
 
 
 # ---------------------------------------------------------------------------
-# pier start --force
+# pier start --delete
 # ---------------------------------------------------------------------------
 
 
 @patch("pier.harbor_bridge.stop_environment")
 @patch("pier.harbor_bridge.start_environment")
-def test_start_force_tears_down_existing(
+def test_start_delete_tears_down_existing(
     mock_start, mock_stop, runner, index_path, task_dir, tmp_path
 ):
-    """pier start --force removes existing workspace before starting."""
+    """pier start --delete removes existing workspace before starting."""
     ws = tmp_path / "ws"
     ws.mkdir()
     _write_session(ws, _container_session(), index_path)
@@ -1388,7 +1388,7 @@ def test_start_force_tears_down_existing(
 
     result = runner.invoke(
         cli,
-        ["start", str(task_dir), "-d", str(ws), "--force"],
+        ["start", str(task_dir), "-d", str(ws), "--delete"],
         catch_exceptions=False,
     )
     assert result.exit_code == 0, result.output
