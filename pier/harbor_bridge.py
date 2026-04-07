@@ -524,7 +524,7 @@ async def _run_interactive_setup(
 
     # Mark onboarding complete so `claude` doesn't prompt
     setup_parts.append(
-        f"echo '{{\"hasCompletedOnboarding\": true}}' > {config_dir}/.claude.json"
+        f'echo \'{{"hasCompletedOnboarding":true,"numStartups":1}}\' > {config_dir}/.claude.json'
     )
 
     await environment.exec(  # type: ignore[attr-defined]
