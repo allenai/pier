@@ -145,6 +145,7 @@ pier start --agent claude-code              # install agent in current workspace
 pier start                                  # restart a stopped container
 pier start ./tasks/my-task -d ./ws -f       # replace an existing session at ./ws
 pier start ./tasks/my-task -d ./ws --exec "claude --help"
+pier start ./tasks/my-task -d ./my-workspace --env-file ./.env   # secrets off argv (shell wrappers, CI)
 ```
 
 - `task_path` can be a local directory or a remote git reference (`URL#path`). Optional — omit for task-free mode.
@@ -153,7 +154,7 @@ pier start ./tasks/my-task -d ./ws --exec "claude --help"
 - `--ports` exposes container ports to the host (e.g., `--ports 8888`).
 - `--mounts-json` adds volume mounts as a JSON array (e.g., `--mounts-json '["./skills:/opt/skills:ro"]'`).
 - `-e` passes container-mode environment variables in `KEY=VALUE` format (repeatable). Stored in the session and forwarded on every `pier exec`.
-- `--env-file` loads container-mode environment variables from a `.env` file. Same behavior as `-e` for each line.
+- `--env-file` loads container-mode environment variables from a `.env` file. Same behavior as `-e` for each line. Prefer this over many `-e` / `--ae` flags when forwarding secrets so values are not visible on the process command line.
 - `--no-mount` keeps files inside the container only (no bind-mount to host). `pier stop` copies files back.
 - `-f` / `--force` allows starting in a non-empty directory. If a session already exists at the target `-d`, removes that workspace (and stops its container) before creating a new one.
 - `--ae` / `--agent-env` and `--ee` / `--environment-env` pass `KEY=VALUE` pairs (repeatable); `--ae` values are persisted and merged into `pier exec` (overriding host `*_API_KEY` for the same key). `--ee` values are applied in the compose service environment at container start.
