@@ -34,7 +34,6 @@ pier skills             # install task skills for your agent
 - `--agent` installs a [supported coding agent](https://github.com/laude-institute/harbor) and registers skills from `skills_dir` in task.toml. Optional — without it you get a plain workspace. To install multiple agents, run `pier start --agent <name>` again from the workspace.
 - `--image` accepts any Docker image — a stock OS, a project image with tools pre-installed, etc.
 - `--no-mount` keeps files inside the container only (no bind-mount to host). `pier stop` copies files back.
-- `-f` / `--force` allows starting in a workspace directory that already has files (non-empty), without deleting an existing session.
 - **`--delete`** stops the container (if any), removes the entire workspace directory at `-d`, and starts fresh — use when you want to discard a previous pier session there.
 - **`--ae` / `--agent-env`**, **`-e`**, and **`--env-file`**: variables persisted for **`pier exec`** and agent CLIs run that way (e.g. API keys for Claude). Prefer **`--env-file`** for secrets so values stay off the shell argv.
 - **`--ee` / `--environment-env`**: variables injected into the **Docker Compose service environment** when the container is created — use when something must see the var at **container startup** (entrypoint, install hooks, or any process that does not go through `pier exec`). Example: `DEBIAN_FRONTEND=noninteractive` for apt during image bring-up; use **`-e` / `--ae`** for keys only needed when you run the agent via **`pier exec`**.
@@ -157,7 +156,6 @@ pier start ./tasks/my-task -d ./my-workspace --env-file ./.env   # secrets off a
 - `-e` passes container-mode environment variables in `KEY=VALUE` format (repeatable). Stored in the session and forwarded on every `pier exec`.
 - `--env-file` loads container-mode environment variables from a `.env` file. Same behavior as `-e` for each line. Prefer this over many `-e` / `--ae` flags when forwarding secrets so values are not visible on the process command line.
 - `--no-mount` keeps files inside the container only (no bind-mount to host). `pier stop` copies files back.
-- `-f` / `--force` allows starting when the workspace directory is **non-empty** (does not remove an existing pier session).
 - **`--delete`** removes any existing session at `-d` (stop container, delete workspace tree) before creating a new one.
 - **`-e` / `--env-file` / `--ae` / `--agent-env`**: exec-time / session env (forwarded on `pier exec`; `--ae` overrides host `*_API_KEY` for the same key). **`--ee` / `--environment-env`**: compose service env at **container start** — use when the variable must exist before or outside `pier exec` (see quick start above).
 - `--exec` runs one command in the container right after start (container mode only).

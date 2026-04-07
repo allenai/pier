@@ -615,13 +615,6 @@ def cli():
     help="Don't bind-mount the workspace into the container. Files stay inside the container only.",
 )
 @click.option(
-    "-f",
-    "--force",
-    is_flag=True,
-    default=False,
-    help="Allow starting in a workspace directory that already has files (non-empty).",
-)
-@click.option(
     "--delete",
     "delete_workspace",
     is_flag=True,
@@ -659,7 +652,6 @@ def start(
     extra_env_cli: tuple[str, ...],
     env_file: str | None,
     no_mount: bool,
-    force: bool,
     delete_workspace: bool,
     agent_env: tuple[str, ...],
     environment_env: tuple[str, ...],
@@ -732,14 +724,18 @@ def start(
             extra_mounts=extra_mounts,
             extra_env=extra_env_list,
             no_mount=no_mount,
-            force=force,
             delete_workspace=delete_workspace,
             agent_env=list(agent_env),
             environment_env=list(environment_env),
         )
         if exec_cmd_str:
             sess, ws = _resolve_workspace(str(workspace))
-            _exec_container(sess, ws, shlex.split(exec_cmd_str))
+            try:
+                _exec_container(sess, ws, shlex.split(exec_cmd_str))
+            except SystemExit as e:
+                if e.code:
+                    click.echo(f"--exec command exited with code {e.code}.", err=True)
+                    raise
         return
 
     # No task_path, no image → operate on existing workspace from cwd
@@ -836,11 +832,8 @@ def start(
             click.echo(f"Workspace already exists at {workspace}.")
             return
 
-    # Safety check: don't write into a non-empty directory by accident.
-    if not force and workspace.exists() and any(workspace.iterdir()):
-        raise click.ClickException(
-            f"Directory {workspace} is not empty. Use -f/--force to proceed anyway."
-        )
+    if workspace.exists() and any(workspace.iterdir()):
+        click.echo(f"Note: directory {workspace} is not empty.", err=True)
     workspace.mkdir(parents=True, exist_ok=True)
 
     # Seed workspace with the same files the container WORKDIR would have.
@@ -865,7 +858,12 @@ def start(
         )
         if exec_cmd_str:
             sess, ws = _resolve_workspace(str(workspace))
-            _exec_container(sess, ws, shlex.split(exec_cmd_str))
+            try:
+                _exec_container(sess, ws, shlex.split(exec_cmd_str))
+            except SystemExit as e:
+                if e.code:
+                    click.echo(f"--exec command exited with code {e.code}.", err=True)
+                    raise
 
 
 def _start_existing(
@@ -1105,7 +1103,6 @@ def _start_task_free(
     extra_mounts: list[str] | None = None,
     extra_env: list[str] | None = None,
     no_mount: bool = False,
-    force: bool = False,
     delete_workspace: bool = False,
     agent_env: list[str] | None = None,
     environment_env: list[str] | None = None,
@@ -1129,7 +1126,13 @@ def _start_task_free(
             hsid = _get_hsid(existing_sess, workspace)
             if harbor_bridge.is_environment_running(hsid):
                 if agents:
-                    _install_agents_into_running(existing_sess, workspace, agents)
+                    _install_agents_into_running(
+                        existing_sess,
+                        workspace,
+                        agents,
+                        agent_env=tuple(ae_list),
+                        environment_env=tuple(ee_list),
+                    )
                 else:
                     click.echo("Container is already running.")
                 return
@@ -1173,11 +1176,8 @@ def _start_task_free(
                 _save_session(workspace, sess)
                 return
 
-    # Safety check for non-empty directory.
-    if not force and workspace.exists() and any(workspace.iterdir()):
-        raise click.ClickException(
-            f"Directory {workspace} is not empty. Use -f/--force to proceed anyway."
-        )
+    if workspace.exists() and any(workspace.iterdir()):
+        click.echo(f"Note: directory {workspace} is not empty.", err=True)
     workspace.mkdir(parents=True, exist_ok=True)
 
     # Create synthetic task so Harbor's environment machinery works

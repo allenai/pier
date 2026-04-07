@@ -668,41 +668,27 @@ def test_start_host_existing_session_is_noop(runner, index_path, task_dir, tmp_p
     assert "already exists" in result.output.lower()
 
 
-def test_start_nonempty_dir_blocked(runner, index_path, task_dir, tmp_path):
-    """Starting in a non-empty directory is blocked by default."""
-    ws = tmp_path / "ws"
-    ws.mkdir()
-    (ws / "existing-file.txt").write_text("important")
-    result = runner.invoke(cli, ["start", str(task_dir), "--host", "-d", str(ws)])
-    assert result.exit_code != 0
-    assert "not empty" in result.output
-
-
-def test_start_nonempty_dir_allowed_with_force(runner, index_path, task_dir, tmp_path):
-    """--force allows starting in a non-empty directory."""
+def test_start_nonempty_dir_warns(runner, index_path, task_dir, tmp_path):
+    """Starting in a non-empty directory succeeds with a warning."""
     ws = tmp_path / "ws"
     ws.mkdir()
     (ws / "existing-file.txt").write_text("important")
     result = runner.invoke(
         cli,
-        ["start", str(task_dir), "--host", "-d", str(ws), "--force"],
+        ["start", str(task_dir), "--host", "-d", str(ws)],
         catch_exceptions=False,
     )
     assert result.exit_code == 0
 
 
-def test_start_git_dir_needs_force(runner, index_path, task_dir, tmp_path):
-    """Directory with .git needs --force."""
+def test_start_git_dir_allowed(runner, index_path, task_dir, tmp_path):
+    """Directory with .git is allowed without any extra flag."""
     ws = tmp_path / "ws"
     ws.mkdir()
     (ws / ".git").mkdir()
-    result = runner.invoke(cli, ["start", str(task_dir), "--host", "-d", str(ws)])
-    assert result.exit_code != 0
-    assert "not empty" in result.output
-
     result = runner.invoke(
         cli,
-        ["start", str(task_dir), "--host", "-d", str(ws), "--force"],
+        ["start", str(task_dir), "--host", "-d", str(ws)],
         catch_exceptions=False,
     )
     assert result.exit_code == 0
@@ -2555,7 +2541,6 @@ def test_start_no_mount_copies_workspace_to_container(
                 "--image",
                 "ubuntu:24.04",
                 "--no-mount",
-                "--force",
             ],
             catch_exceptions=False,
         )
@@ -2586,7 +2571,6 @@ def test_start_no_mount_sets_git_safe_directory(
                 "--image",
                 "ubuntu:24.04",
                 "--no-mount",
-                "--force",
             ],
             catch_exceptions=False,
         )
@@ -2618,7 +2602,6 @@ def test_start_no_mount_no_git_safe_directory_without_git(
                 "--image",
                 "ubuntu:24.04",
                 "--no-mount",
-                "--force",
             ],
             catch_exceptions=False,
         )
@@ -2946,7 +2929,6 @@ def test_start_no_mount_copy_failure_errors(
                 "--image",
                 "ubuntu:24.04",
                 "--no-mount",
-                "--force",
             ],
         )
 
