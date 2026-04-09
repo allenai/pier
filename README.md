@@ -34,7 +34,10 @@ pier skills             # install task skills for your agent
 - `--agent` installs a [supported coding agent](https://github.com/laude-institute/harbor) and registers skills from `skills_dir` in task.toml. Optional — without it you get a plain workspace. To install multiple agents, run `pier start --agent <name>` again from the workspace.
 - `--image` accepts any Docker image — a stock OS, a project image with tools pre-installed, etc.
 - `--no-mount` keeps files inside the container only (no bind-mount to host). `pier stop` copies files back.
-- `-f` / `--force` allows starting in a non-empty directory.
+- **`--delete`** stops the container (if any), removes the entire workspace directory at `-d`, and starts fresh — use when you want to discard a previous pier session there.
+- **`--ae` / `--agent-env`**, **`-e`**, and **`--env-file`**: variables persisted for **`pier exec`** and agent CLIs run that way (e.g. API keys for Claude). Prefer **`--env-file`** for secrets so values stay off the shell argv.
+- **`--ee` / `--environment-env`**: variables injected into the **Docker Compose service environment** when the container is created — use when something must see the var at **container startup** (entrypoint, install hooks, or any process that does not go through `pier exec`). Example: `DEBIAN_FRONTEND=noninteractive` for apt during image bring-up; use **`-e` / `--ae`** for keys only needed when you run the agent via **`pier exec`**.
+- `--exec "<cmd>"` runs a command in the container immediately after a successful container start (not supported with `--host`).
 
 ### Work in the workspace
 
@@ -140,6 +143,9 @@ pier start https://github.com/org/repo#tasks/my-task
 # Manage existing workspace
 pier start --agent claude-code              # install agent in current workspace
 pier start                                  # restart a stopped container
+pier start ./tasks/my-task -d ./ws --delete  # remove prior session at ./ws, then start
+pier start ./tasks/my-task -d ./ws --exec "claude --help"
+pier start ./tasks/my-task -d ./my-workspace --env-file ./.env   # secrets off argv (shell wrappers, CI)
 ```
 
 - `task_path` can be a local directory or a remote git reference (`URL#path`). Optional — omit for task-free mode.
@@ -148,9 +154,11 @@ pier start                                  # restart a stopped container
 - `--ports` exposes container ports to the host (e.g., `--ports 8888`).
 - `--mounts-json` adds volume mounts as a JSON array (e.g., `--mounts-json '["./skills:/opt/skills:ro"]'`).
 - `-e` passes container-mode environment variables in `KEY=VALUE` format (repeatable). Stored in the session and forwarded on every `pier exec`.
-- `--env-file` loads container-mode environment variables from a `.env` file. Same behavior as `-e` for each line.
+- `--env-file` loads container-mode environment variables from a `.env` file. Same behavior as `-e` for each line. Prefer this over many `-e` / `--ae` flags when forwarding secrets so values are not visible on the process command line.
 - `--no-mount` keeps files inside the container only (no bind-mount to host). `pier stop` copies files back.
-- `-f` / `--force` allows starting in a non-empty directory.
+- **`--delete`** removes any existing session at `-d` (stop container, delete workspace tree) before creating a new one.
+- **`-e` / `--env-file` / `--ae` / `--agent-env`**: exec-time / session env (forwarded on `pier exec`; `--ae` overrides host `*_API_KEY` for the same key). **`--ee` / `--environment-env`**: compose service env at **container start** — use when the variable must exist before or outside `pier exec` (see quick start above).
+- `--exec` runs one command in the container right after start (container mode only).
 - `--host` skips the container (workspace only).
 - `--agent` installs a coding agent. To install additional agents, run `pier start --agent <name>` again from the workspace. When `task_path` is omitted, it operates on the current workspace.
 
@@ -164,7 +172,7 @@ pier exec claude
 pier exec -d -- quarto preview --port 8888 --host 0.0.0.0 --no-browse
 ```
 
-- **Container mode**: delegates to `docker exec` in the container's working directory
+- **Container mode**: delegates to `docker exec` in the container's working directory. Host `*_API_KEY` environment variables are forwarded unless the session has the same key from `--ae` / `--agent-env` (session wins).
 - **Host mode**: runs the command directly with `TASK_WORKSPACE` set
 - `-d` / `--detach`: runs in the background (useful for servers like quarto preview)
 
@@ -182,6 +190,13 @@ pier verify
 ### `pier stop`
 
 Stop the Docker container for the current workspace (container mode only). The workspace directory is preserved. Restart later with `pier start` (no arguments, from inside the workspace).
+
+```bash
+pier stop              # stop the current workspace's container
+pier stop --all        # stop every container-mode workspace pier knows about
+```
+
+If Harbor cannot tear down the environment (for example the task directory was removed), pier falls back to `docker rm -f` and clears the local session.
 
 ### `pier list`
 

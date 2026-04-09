@@ -22,6 +22,7 @@ import tempfile
 import logging
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import tomllib
@@ -265,6 +266,28 @@ def _validate_env_kv(entry: str, source: str) -> str:
     return f"{key}={value}"
 
 
+def _validate_env_vars(env_list: tuple[str, ...], label: str) -> None:
+    for entry in env_list:
+        if "=" not in entry or entry.startswith("="):
+            raise click.ClickException(
+                f"Invalid {label} format: {entry!r}. Use KEY=VALUE."
+            )
+
+
+def _merge_env_lists(
+    old: list[str] | None, new: tuple[str, ...] | list[str]
+) -> list[str]:
+    """Merge new env vars into old list, overriding by key."""
+    merged: dict[str, str] = {}
+    for entry in old or []:
+        k, _, v = entry.partition("=")
+        merged[k] = v
+    for entry in new:
+        k, _, v = entry.partition("=")
+        merged[k] = v
+    return [f"{k}={v}" for k, v in merged.items()]
+
+
 def _resolve_restart_ports(
     requested_ports: tuple[int, ...] | list[int] | None, existing_sess: dict
 ) -> list[int]:
@@ -416,6 +439,57 @@ def _resolve_task_path(task_path: str) -> Path:
     return task_dir
 
 
+def _force_teardown(workspace: Path) -> None:
+    """Remove an existing workspace directory and stop its container (if any)."""
+    if _session_json_path(workspace).exists():
+        try:
+            sess = _load_session(workspace)
+            if sess.get("mode") == "container":
+                hsid = _get_hsid(sess, workspace)
+                harbor_trial_dir = _harbor_trial_dir(workspace)
+                try:
+                    harbor_bridge.stop_environment(
+                        Path(sess["task_dir"]),
+                        hsid,
+                        harbor_trial_dir,
+                    )
+                    click.echo(
+                        f"Stopped existing container for {_workspace_label(workspace)!r}."
+                    )
+                except Exception as e:
+                    click.echo(
+                        f"Warning: could not stop container cleanly: {e}",
+                        err=True,
+                    )
+                    _force_remove_container(hsid, workspace)
+        except Exception as e:
+            click.echo(f"Warning: could not load session: {e}", err=True)
+
+        index = _index_load()
+        ws_str = str(workspace.resolve())
+        if ws_str in index:
+            index.remove(ws_str)
+            _index_save(index)
+
+    if workspace.exists():
+        shutil.rmtree(workspace)
+        click.echo(f"Removed existing workspace at {workspace}.")
+
+
+def _force_remove_container(hsid: str, workspace: Path) -> None:
+    """Fallback: remove the container via Docker and clean up the session."""
+    container = harbor_bridge.get_container_name(hsid)
+    subprocess.run(["docker", "rm", "-f", container], capture_output=True)
+    sp = _session_json_path(workspace)
+    if sp.exists():
+        sp.unlink()
+    index = _index_load()
+    ws_str = str(workspace.resolve())
+    if ws_str in index:
+        index.remove(ws_str)
+        _index_save(index)
+
+
 def _print_reward(reward: dict) -> None:
     """Print reward value and any extra details from a reward dict."""
     click.echo(f"Reward: {reward.get('reward', 'N/A')}")
@@ -541,11 +615,31 @@ def cli():
     help="Don't bind-mount the workspace into the container. Files stay inside the container only.",
 )
 @click.option(
-    "-f",
-    "--force",
+    "--delete",
+    "delete_workspace",
     is_flag=True,
     default=False,
-    help="Allow starting in a non-empty directory.",
+    help="Remove any existing pier session at -d (stop container, delete workspace tree) before starting.",
+)
+@click.option(
+    "--ae",
+    "--agent-env",
+    "agent_env",
+    multiple=True,
+    help="Agent/session env (KEY=VALUE). Persisted and passed to pier exec; overrides host *_API_KEY for the same name.",
+)
+@click.option(
+    "--ee",
+    "--environment-env",
+    "environment_env",
+    multiple=True,
+    help="Compose service env at container start (KEY=VALUE). For exec-time vars use -e, --env-file, or --ae.",
+)
+@click.option(
+    "--exec",
+    "exec_cmd_str",
+    default=None,
+    help="Run a command in the container after start (container mode only).",
 )
 def start(
     task_path: str | None,
@@ -558,7 +652,10 @@ def start(
     extra_env_cli: tuple[str, ...],
     env_file: str | None,
     no_mount: bool,
-    force: bool,
+    delete_workspace: bool,
+    agent_env: tuple[str, ...],
+    environment_env: tuple[str, ...],
+    exec_cmd_str: str | None,
 ) -> None:
     """Launch a workspace, or install an agent into an existing one.
 
@@ -580,6 +677,13 @@ def start(
         pier start --agent claude-code
     """
     extra_mounts = _parse_mounts_json(mounts_json)
+
+    if agent_env:
+        _validate_env_vars(agent_env, "--ae/--agent-env")
+    if environment_env:
+        _validate_env_vars(environment_env, "--ee/--environment-env")
+    if exec_cmd_str and host:
+        raise click.ClickException("--exec is not supported with --host.")
 
     if no_mount and host:
         raise click.ClickException("--no-mount and --host are mutually exclusive.")
@@ -620,13 +724,27 @@ def start(
             extra_mounts=extra_mounts,
             extra_env=extra_env_list,
             no_mount=no_mount,
-            force=force,
+            delete_workspace=delete_workspace,
+            agent_env=list(agent_env),
+            environment_env=list(environment_env),
         )
+        if exec_cmd_str:
+            sess, ws = _resolve_workspace(str(workspace))
+            try:
+                _exec_container(sess, ws, shlex.split(exec_cmd_str))
+            except SystemExit as e:
+                if e.code:
+                    click.echo(f"--exec command exited with code {e.code}.", err=True)
+                    raise
         return
 
     # No task_path, no image → operate on existing workspace from cwd
     if task_path is None:
-        _start_existing(agent=agent)
+        _start_existing(
+            agent=agent,
+            agent_env=agent_env,
+            environment_env=environment_env,
+        )
         return
 
     if image:
@@ -649,6 +767,10 @@ def start(
             "e.g. pier start ./tasks/my-task -d ./my-workspace"
         )
 
+    workspace = workspace.resolve()
+    if delete_workspace and _session_json_path(workspace).exists():
+        _force_teardown(workspace)
+
     # Collision check — existing session in this workspace
     if _session_json_path(workspace).exists():
         existing_sess = _load_session(workspace)
@@ -658,7 +780,13 @@ def start(
             hsid = _get_hsid(existing_sess, workspace)
             if harbor_bridge.is_environment_running(hsid):
                 if agent:
-                    _install_agents_into_running(existing_sess, workspace, [agent])
+                    _install_agents_into_running(
+                        existing_sess,
+                        workspace,
+                        [agent],
+                        agent_env=agent_env,
+                        environment_env=environment_env,
+                    )
                     return
                 click.echo("Container is already running.")
                 return
@@ -675,6 +803,18 @@ def start(
                 resolved_extra_mounts = _resolve_restart_mounts(
                     extra_mounts, existing_sess
                 )
+                merged_ae = (
+                    _merge_env_lists(existing_sess.get("agent_env"), agent_env)
+                    if agent_env
+                    else list(existing_sess.get("agent_env", []))
+                )
+                merged_ee = (
+                    _merge_env_lists(
+                        existing_sess.get("environment_env"), environment_env
+                    )
+                    if environment_env
+                    else list(existing_sess.get("environment_env", []))
+                )
                 _start_container(
                     task_dir,
                     workspace,
@@ -683,6 +823,8 @@ def start(
                     extra_mounts=resolved_extra_mounts,
                     extra_env=extra_env_list or existing_sess.get("extra_env", []),
                     no_mount=existing_sess.get("no_mount", False),
+                    agent_env=merged_ae,
+                    environment_env=merged_ee,
                 )
                 return
         else:
@@ -690,11 +832,8 @@ def start(
             click.echo(f"Workspace already exists at {workspace}.")
             return
 
-    # Safety check: don't write into a non-empty directory by accident.
-    if not force and workspace.exists() and any(workspace.iterdir()):
-        raise click.ClickException(
-            f"Directory {workspace} is not empty. Use -f/--force to proceed anyway."
-        )
+    if workspace.exists() and any(workspace.iterdir()):
+        click.echo(f"Note: directory {workspace} is not empty.", err=True)
     workspace.mkdir(parents=True, exist_ok=True)
 
     # Seed workspace with the same files the container WORKDIR would have.
@@ -714,10 +853,24 @@ def start(
             extra_mounts=extra_mounts,
             extra_env=extra_env_list,
             no_mount=no_mount,
+            agent_env=list(agent_env),
+            environment_env=list(environment_env),
         )
+        if exec_cmd_str:
+            sess, ws = _resolve_workspace(str(workspace))
+            try:
+                _exec_container(sess, ws, shlex.split(exec_cmd_str))
+            except SystemExit as e:
+                if e.code:
+                    click.echo(f"--exec command exited with code {e.code}.", err=True)
+                    raise
 
 
-def _start_existing(agent: str | None) -> None:
+def _start_existing(
+    agent: str | None,
+    agent_env: tuple[str, ...] = (),
+    environment_env: tuple[str, ...] = (),
+) -> None:
     """Operate on an existing workspace (no task_path given).
 
     Without --agent: restart a stopped container.
@@ -751,6 +904,16 @@ def _start_existing(agent: str | None) -> None:
     if not harbor_bridge.is_environment_running(hsid):
         # Restart the stopped container (reinstalls all agents)
         agents = _add_agent(sess.get("agents", []), agent)
+        merged_ae = (
+            _merge_env_lists(sess.get("agent_env"), agent_env)
+            if agent_env
+            else list(sess.get("agent_env", []))
+        )
+        merged_ee = (
+            _merge_env_lists(sess.get("environment_env"), environment_env)
+            if environment_env
+            else list(sess.get("environment_env", []))
+        )
         _start_container(
             Path(sess["task_dir"]),
             ws,
@@ -759,11 +922,19 @@ def _start_existing(agent: str | None) -> None:
             extra_mounts=_resolve_restart_mounts(None, sess),
             extra_env=sess.get("extra_env", []),
             no_mount=sess.get("no_mount", False),
+            agent_env=merged_ae,
+            environment_env=merged_ee,
         )
         return
 
     if agent:
-        _install_agents_into_running(sess, ws, [agent])
+        _install_agents_into_running(
+            sess,
+            ws,
+            [agent],
+            agent_env=agent_env,
+            environment_env=environment_env,
+        )
     else:
         click.echo("Container is already running.")
 
@@ -786,6 +957,32 @@ def _start_host(task_dir: Path, workspace: Path) -> None:
     click.echo("Task instruction is at .task/instruction.md.")
 
 
+_AGENT_BINARY: dict[str, str] = {
+    "claude-code": "claude",
+    "codex": "codex",
+    "goose": "goose",
+}
+
+
+def _is_agent_installed(harbor_session_id: str, agent: str) -> bool:
+    """Probe the container to check if the agent binary is already on PATH."""
+    binary = _AGENT_BINARY.get(agent)
+    if not binary:
+        return False
+    _, path_prefix = harbor_bridge.get_agent_exec_env(agent)
+    container = harbor_bridge.get_container_name(harbor_session_id)
+    if path_prefix:
+        cmd = ["docker", "exec", container, "sh", "-c",
+               f"export PATH={path_prefix}:$PATH && which {binary}"]
+    else:
+        cmd = ["docker", "exec", container, "which", binary]
+    try:
+        result = subprocess.run(cmd, capture_output=True, timeout=5)
+        return result.returncode == 0
+    except Exception:
+        return False
+
+
 def _install_agent(
     task_dir: Path,
     harbor_session_id: str,
@@ -795,10 +992,17 @@ def _install_agent(
     """Validate and install a Harbor agent into a running container."""
     if not harbor_bridge.is_valid_agent(agent):
         raise click.ClickException(f"Unknown agent {agent!r}.")
-    click.echo(f"Installing {agent} in the container...")
+    already = _is_agent_installed(harbor_session_id, agent)
+    if already:
+        click.echo(f"{agent} already installed, skipping install step...")
+    else:
+        click.echo(f"Installing {agent} in the container...")
     try:
-        harbor_bridge.setup_agent(task_dir, harbor_session_id, trial_dir, agent)
-        click.echo(f"{agent} installed.")
+        harbor_bridge.setup_agent(
+            task_dir, harbor_session_id, trial_dir, agent,
+            skip_install=already,
+        )
+        click.echo(f"{agent} ready.")
     except Exception as e:
         raise click.ClickException(f"Agent setup failed: {e}")
 
@@ -807,6 +1011,9 @@ def _install_agents_into_running(
     sess: dict,
     workspace: Path,
     agents: list[str],
+    *,
+    agent_env: tuple[str, ...] = (),
+    environment_env: tuple[str, ...] = (),
 ) -> None:
     """Install one or more agents into an already-running container and update session."""
     task_dir = Path(sess["task_dir"])
@@ -818,6 +1025,12 @@ def _install_agents_into_running(
     for agent in agents:
         current = _add_agent(current, agent)
     sess["agents"] = current
+    if agent_env:
+        sess["agent_env"] = _merge_env_lists(sess.get("agent_env"), agent_env)
+    if environment_env:
+        sess["environment_env"] = _merge_env_lists(
+            sess.get("environment_env"), environment_env
+        )
     _save_session(workspace, sess)
 
 
@@ -829,6 +1042,8 @@ def _start_container(
     extra_mounts: list[str] | None = None,
     extra_env: list[str] | None = None,
     no_mount: bool = False,
+    agent_env: list[str] | None = None,
+    environment_env: list[str] | None = None,
 ) -> None:
 
     hsid = _harbor_session_id(workspace)
@@ -844,6 +1059,7 @@ def _start_container(
             workspace_dir=None if no_mount else workspace,
             ports=ports,
             extra_mounts=extra_mounts,
+            environment_env=environment_env or [],
         )
     except Exception as e:
         raise click.ClickException(f"Failed to start container: {e}")
@@ -879,21 +1095,23 @@ def _start_container(
     for agent in agents or []:
         _install_agent(task_dir, hsid, harbor_trial_dir, agent)
 
-    _save_session(
-        workspace,
-        {
-            "mode": "container",
-            "task_dir": str(task_dir),
-            "task_ref": task_dir.name,
-            "harbor_session_id": hsid,
-            "agents": agents or [],
-            "ports": ports or [],
-            "extra_mounts": extra_mounts or [],
-            "extra_env": extra_env or [],
-            "no_mount": no_mount,
-            "started_at": datetime.now(timezone.utc).isoformat(),
-        },
-    )
+    session_data: dict = {
+        "mode": "container",
+        "task_dir": str(task_dir),
+        "task_ref": task_dir.name,
+        "harbor_session_id": hsid,
+        "agents": agents or [],
+        "ports": ports or [],
+        "extra_mounts": extra_mounts or [],
+        "extra_env": extra_env or [],
+        "no_mount": no_mount,
+        "started_at": datetime.now(timezone.utc).isoformat(),
+    }
+    if agent_env:
+        session_data["agent_env"] = agent_env
+    if environment_env:
+        session_data["environment_env"] = environment_env
+    _save_session(workspace, session_data)
 
     click.echo(f"\nWorkspace {label!r} ready.")
     click.echo(f"  cd {workspace}")
@@ -918,7 +1136,9 @@ def _start_task_free(
     extra_mounts: list[str] | None = None,
     extra_env: list[str] | None = None,
     no_mount: bool = False,
-    force: bool = False,
+    delete_workspace: bool = False,
+    agent_env: list[str] | None = None,
+    environment_env: list[str] | None = None,
 ) -> None:
     """Start a task-free container from a base image.
 
@@ -926,6 +1146,11 @@ def _start_task_free(
     so we can reuse Harbor's standard environment machinery instead of
     maintaining a separate code path.
     """
+    ae_list = agent_env or []
+    ee_list = environment_env or []
+
+    if delete_workspace and _session_json_path(workspace).exists():
+        _force_teardown(workspace)
 
     # If workspace already has a session, handle like _start_existing
     if _session_json_path(workspace).exists():
@@ -934,7 +1159,13 @@ def _start_task_free(
             hsid = _get_hsid(existing_sess, workspace)
             if harbor_bridge.is_environment_running(hsid):
                 if agents:
-                    _install_agents_into_running(existing_sess, workspace, agents)
+                    _install_agents_into_running(
+                        existing_sess,
+                        workspace,
+                        agents,
+                        agent_env=tuple(ae_list),
+                        environment_env=tuple(ee_list),
+                    )
                 else:
                     click.echo("Container is already running.")
                 return
@@ -948,6 +1179,18 @@ def _start_task_free(
                 resolved_extra_mounts = _resolve_restart_mounts(
                     extra_mounts, existing_sess
                 )
+                merged_ae = (
+                    _merge_env_lists(existing_sess.get("agent_env"), tuple(ae_list))
+                    if ae_list
+                    else list(existing_sess.get("agent_env", []))
+                )
+                merged_ee = (
+                    _merge_env_lists(
+                        existing_sess.get("environment_env"), tuple(ee_list)
+                    )
+                    if ee_list
+                    else list(existing_sess.get("environment_env", []))
+                )
                 _start_container(
                     harbor_bridge.create_synthetic_task_dir(
                         image, _pier_dir(workspace)
@@ -958,17 +1201,16 @@ def _start_task_free(
                     extra_mounts=resolved_extra_mounts,
                     extra_env=extra_env or existing_sess.get("extra_env", []),
                     no_mount=existing_sess.get("no_mount", False),
+                    agent_env=merged_ae,
+                    environment_env=merged_ee,
                 )
                 sess = _load_session(workspace)
                 sess["image"] = image
                 _save_session(workspace, sess)
                 return
 
-    # Safety check for non-empty directory.
-    if not force and workspace.exists() and any(workspace.iterdir()):
-        raise click.ClickException(
-            f"Directory {workspace} is not empty. Use -f/--force to proceed anyway."
-        )
+    if workspace.exists() and any(workspace.iterdir()):
+        click.echo(f"Note: directory {workspace} is not empty.", err=True)
     workspace.mkdir(parents=True, exist_ok=True)
 
     # Create synthetic task so Harbor's environment machinery works
@@ -985,6 +1227,8 @@ def _start_task_free(
         extra_mounts=extra_mounts,
         extra_env=extra_env,
         no_mount=no_mount,
+        agent_env=ae_list,
+        environment_env=ee_list,
     )
 
     # Update session with task-free metadata (overwrite what _start_container wrote)
@@ -1043,10 +1287,17 @@ def _exec_container(
     task_dir = Path(sess["task_dir"])
     env: dict[str, str] = {}
     env.update(harbor_bridge.resolve_task_env(task_dir))
+    for var, val in os.environ.items():
+        if var.endswith("_API_KEY") and var not in env:
+            env[var] = val
     for kv in sess.get("extra_env", []):
         key, _, val = kv.partition("=")
         if key:
             env[key] = val
+    for entry in sess.get("agent_env", []):
+        k, _, v = entry.partition("=")
+        if k:
+            env[k] = v
 
     # Merge agent env vars and PATH prefixes.
     path_prefixes: list[str] = []
@@ -1297,16 +1548,46 @@ def _verify_host_in_container(
     type=click.Path(),
     help="Workspace directory.",
 )
-def stop(workspace_dir: str | None) -> None:
+@click.option(
+    "--all",
+    "stop_all",
+    is_flag=True,
+    default=False,
+    help="Stop all active container-mode workspaces.",
+)
+def stop(workspace_dir: str | None, stop_all: bool) -> None:
     """Stop the container for a workspace."""
+    if stop_all:
+        workspaces = _all_workspaces()
+        stopped = 0
+        for s, ws in workspaces:
+            if s.get("mode") != "container":
+                continue
+            try:
+                _stop_one_workspace(s, ws)
+                click.echo(f"Stopped {_workspace_label(ws)!r}.")
+                stopped += 1
+            except click.ClickException as e:
+                click.echo(
+                    f"Warning: could not stop {_workspace_label(ws)!r}: {e}",
+                    err=True,
+                )
+        if stopped == 0:
+            click.echo("No container-mode workspaces to stop.")
+        return
+
     sess, workspace = _resolve_workspace(workspace_dir)
 
     if sess.get("mode") != "container":
         raise click.ClickException("No container to stop (host-mode workspace).")
 
+    _stop_one_workspace(sess, workspace)
+    click.echo(f"Container for {_workspace_label(workspace)!r} stopped.")
+
+
+def _stop_one_workspace(sess: dict, workspace: Path) -> None:
+    """Stop container for one workspace (no success message)."""
     if sess.get("no_mount"):
-        # Copy workspace files from container to host before stopping,
-        # excluding .pier/ to avoid overwriting session data.
         hsid = _get_hsid(sess, workspace)
         container = harbor_bridge.get_container_name(hsid)
         workdir = harbor_bridge.get_container_workdir(Path(sess["task_dir"]))
@@ -1315,7 +1596,6 @@ def stop(workspace_dir: str | None) -> None:
             _tar_copy_from_container(container, workdir, workspace)
 
     _stop_container_env(sess, workspace)
-    click.echo(f"Container for {_workspace_label(workspace)!r} stopped.")
 
 
 def _stop_container_env(sess: dict, workspace: Path) -> None:
@@ -1330,8 +1610,8 @@ def _stop_container_env(sess: dict, workspace: Path) -> None:
             hsid,
             harbor_trial_dir,
         )
-    except Exception as e:
-        raise click.ClickException(f"Failed to stop container: {e}")
+    except Exception:
+        _force_remove_container(hsid, workspace)
 
 
 @cli.command("list")
@@ -1691,6 +1971,23 @@ def view(path: str | None, port: str, bind_host: str) -> None:
     """
     pier_dir = _resolve_pier_dir(path)
     harbor_bridge.run_view_command(folder=pier_dir, port=port, host=bind_host)
+
+
+@cli.command("patch-harbor")
+def patch_harbor() -> None:
+    """Apply pier's patches to the installed harbor package.
+
+    Re-run after upgrading harbor (uv tool upgrade harbor).
+    Patches are idempotent — safe to run multiple times.
+    """
+    from pier.patches.apply import apply_all
+
+    click.echo("Applying harbor patches...")
+    applied = apply_all(verbose=True)
+    if applied:
+        click.echo(f"Done — {applied} patch(es) applied.")
+    else:
+        click.echo("All patches already applied.")
 
 
 @cli.command()

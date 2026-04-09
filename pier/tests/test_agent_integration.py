@@ -77,7 +77,6 @@ def test_task_free_agent_install_and_exec(
             TEST_IMAGE,
             "--agent",
             agent_name,
-            "-f",
         ],
         cwd=REPO_ROOT,
     )

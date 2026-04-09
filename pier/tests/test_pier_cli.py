@@ -359,7 +359,7 @@ def test_start_with_agent_calls_setup(
         catch_exceptions=False,
     )
     assert result.exit_code == 0, result.output
-    assert "claude-code installed" in result.output
+    assert "claude-code ready" in result.output
     mock_setup.assert_called_once()
     args = mock_setup.call_args[0]
     assert args[0] == task_dir  # task_dir
@@ -447,7 +447,7 @@ def test_start_agent_into_existing_session(
         catch_exceptions=False,
     )
     assert result.exit_code == 0, result.output
-    assert "claude-code installed" in result.output
+    assert "claude-code ready" in result.output
     mock_setup.assert_called_once()
 
     session = json.loads((ws / ".pier" / "session.json").read_text())
@@ -506,7 +506,7 @@ def test_start_agent_from_cwd(
         catch_exceptions=False,
     )
     assert result.exit_code == 0, result.output
-    assert "claude-code installed" in result.output
+    assert "claude-code ready" in result.output
     mock_setup.assert_called_once()
     session = json.loads((ws / ".pier" / "session.json").read_text())
     assert session["agents"] == ["claude-code"]
@@ -668,41 +668,27 @@ def test_start_host_existing_session_is_noop(runner, index_path, task_dir, tmp_p
     assert "already exists" in result.output.lower()
 
 
-def test_start_nonempty_dir_blocked(runner, index_path, task_dir, tmp_path):
-    """Starting in a non-empty directory is blocked by default."""
-    ws = tmp_path / "ws"
-    ws.mkdir()
-    (ws / "existing-file.txt").write_text("important")
-    result = runner.invoke(cli, ["start", str(task_dir), "--host", "-d", str(ws)])
-    assert result.exit_code != 0
-    assert "not empty" in result.output
-
-
-def test_start_nonempty_dir_allowed_with_force(runner, index_path, task_dir, tmp_path):
-    """--force allows starting in a non-empty directory."""
+def test_start_nonempty_dir_warns(runner, index_path, task_dir, tmp_path):
+    """Starting in a non-empty directory succeeds with a warning."""
     ws = tmp_path / "ws"
     ws.mkdir()
     (ws / "existing-file.txt").write_text("important")
     result = runner.invoke(
         cli,
-        ["start", str(task_dir), "--host", "-d", str(ws), "--force"],
+        ["start", str(task_dir), "--host", "-d", str(ws)],
         catch_exceptions=False,
     )
     assert result.exit_code == 0
 
 
-def test_start_git_dir_needs_force(runner, index_path, task_dir, tmp_path):
-    """Directory with .git needs --force."""
+def test_start_git_dir_allowed(runner, index_path, task_dir, tmp_path):
+    """Directory with .git is allowed without any extra flag."""
     ws = tmp_path / "ws"
     ws.mkdir()
     (ws / ".git").mkdir()
-    result = runner.invoke(cli, ["start", str(task_dir), "--host", "-d", str(ws)])
-    assert result.exit_code != 0
-    assert "not empty" in result.output
-
     result = runner.invoke(
         cli,
-        ["start", str(task_dir), "--host", "-d", str(ws), "--force"],
+        ["start", str(task_dir), "--host", "-d", str(ws)],
         catch_exceptions=False,
     )
     assert result.exit_code == 0
@@ -1325,6 +1311,124 @@ def test_stop_host_errors(runner, index_path, tmp_path):
     result = runner.invoke(cli, ["stop"], catch_exceptions=False)
     assert result.exit_code != 0
     assert "host" in result.output.lower()
+
+
+@patch("pier.harbor_bridge.stop_environment")
+def test_stop_all(mock_stop, runner, index_path, tmp_path):
+    """pier stop --all stops all container-mode workspaces."""
+    ws1 = tmp_path / "ws1"
+    ws1.mkdir()
+    _write_session(ws1, _container_session(harbor_session_id="pier-1"), index_path)
+    ws2 = tmp_path / "ws2"
+    ws2.mkdir()
+    _write_session(ws2, _container_session(harbor_session_id="pier-2"), index_path)
+    ws3 = tmp_path / "ws3"
+    ws3.mkdir()
+    _write_session(ws3, _host_session(), index_path)
+
+    result = runner.invoke(cli, ["stop", "--all"], catch_exceptions=False)
+    assert result.exit_code == 0
+    assert mock_stop.call_count == 2
+    assert "Stopped" in result.output
+
+
+def test_stop_all_no_workspaces(runner, index_path):
+    result = runner.invoke(cli, ["stop", "--all"], catch_exceptions=False)
+    assert result.exit_code == 0
+    assert "No container-mode workspaces" in result.output
+
+
+@patch("subprocess.run", return_value=MagicMock(returncode=0))
+@patch("pier.harbor_bridge.stop_environment", side_effect=FileNotFoundError("gone"))
+@patch("pier.harbor_bridge.get_container_name", return_value="pier-ws-main-1")
+def test_stop_fallback_removes_container(
+    mock_name, mock_stop, mock_run, runner, index_path, tmp_path
+):
+    """When Harbor stop fails, fallback to docker rm -f and clean up session."""
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    _write_session(ws, _container_session(), index_path)
+    result = runner.invoke(cli, ["stop"], catch_exceptions=False)
+    assert result.exit_code == 0
+    assert not (ws / ".pier" / "session.json").exists()
+    docker_args = mock_run.call_args[0][0]
+    assert "docker" in docker_args
+    assert "rm" in docker_args
+
+
+# ---------------------------------------------------------------------------
+# pier start --delete
+# ---------------------------------------------------------------------------
+
+
+@patch("pier.harbor_bridge.stop_environment")
+@patch("pier.harbor_bridge.start_environment")
+def test_start_delete_tears_down_existing(
+    mock_start, mock_stop, runner, index_path, task_dir, tmp_path
+):
+    """pier start --delete removes existing workspace before starting."""
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    _write_session(ws, _container_session(), index_path)
+    (ws / "stale-file.txt").write_text("old")
+
+    result = runner.invoke(
+        cli,
+        ["start", str(task_dir), "-d", str(ws), "--delete"],
+        catch_exceptions=False,
+    )
+    assert result.exit_code == 0, result.output
+    assert "Removed existing workspace" in result.output
+    assert not (ws / "stale-file.txt").exists()
+    assert (ws / ".pier" / "session.json").exists()
+
+
+# ---------------------------------------------------------------------------
+# pier start --exec
+# ---------------------------------------------------------------------------
+
+
+@patch("pier.harbor_bridge.is_environment_running", return_value=True)
+@patch("pier.harbor_bridge.start_environment")
+def test_start_exec_runs_command(
+    mock_start, mock_running, runner, index_path, task_dir, tmp_path
+):
+    """pier start --exec runs a command in the container after start."""
+    ws = tmp_path / "ws"
+    with patch("subprocess.run", return_value=MagicMock(returncode=0)) as mock_run:
+        result = runner.invoke(
+            cli,
+            ["start", str(task_dir), "-d", str(ws), "--exec", "claude --help"],
+            catch_exceptions=False,
+        )
+    assert result.exit_code == 0, result.output
+    docker_args = mock_run.call_args[0][0]
+    assert "claude" in docker_args
+    assert "--help" in docker_args
+
+
+# ---------------------------------------------------------------------------
+# pier exec --ae dedup
+# ---------------------------------------------------------------------------
+
+
+@patch("pier.harbor_bridge.is_environment_running", return_value=True)
+def test_exec_agent_env_overrides_host_api_key(
+    mock_running, runner, index_path, tmp_path, monkeypatch
+):
+    """Session agent_env overrides host API key of the same name."""
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    sess = _container_session()
+    sess["agent_env"] = ["ANTHROPIC_API_KEY=from-session"]
+    _write_session(ws, sess, index_path)
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "from-host")
+    with patch("subprocess.run", return_value=MagicMock(returncode=0)) as mock_run:
+        runner.invoke(cli, ["exec", "bash"])
+    args = mock_run.call_args[0][0]
+    # Session value should win; host value should not appear
+    assert "ANTHROPIC_API_KEY=from-session" in args
+    assert "ANTHROPIC_API_KEY=from-host" not in args
 
 
 # ---------------------------------------------------------------------------
@@ -2297,7 +2401,7 @@ def test_start_task_free_with_agent(
         catch_exceptions=False,
     )
     assert result.exit_code == 0, result.output
-    assert "claude-code installed" in result.output
+    assert "claude-code ready" in result.output
     mock_setup.assert_called_once()
 
     session = json.loads((ws / ".pier" / "session.json").read_text())
@@ -2437,7 +2541,6 @@ def test_start_no_mount_copies_workspace_to_container(
                 "--image",
                 "ubuntu:24.04",
                 "--no-mount",
-                "--force",
             ],
             catch_exceptions=False,
         )
@@ -2468,7 +2571,6 @@ def test_start_no_mount_sets_git_safe_directory(
                 "--image",
                 "ubuntu:24.04",
                 "--no-mount",
-                "--force",
             ],
             catch_exceptions=False,
         )
@@ -2500,7 +2602,6 @@ def test_start_no_mount_no_git_safe_directory_without_git(
                 "--image",
                 "ubuntu:24.04",
                 "--no-mount",
-                "--force",
             ],
             catch_exceptions=False,
         )
@@ -2619,7 +2720,7 @@ def test_start_task_free_already_running_installs_agent(
         catch_exceptions=False,
     )
     assert result.exit_code == 0
-    assert "claude-code installed" in result.output
+    assert "claude-code ready" in result.output
     mock_setup.assert_called_once()
 
 
@@ -2828,7 +2929,6 @@ def test_start_no_mount_copy_failure_errors(
                 "--image",
                 "ubuntu:24.04",
                 "--no-mount",
-                "--force",
             ],
         )
 
