@@ -359,7 +359,7 @@ def test_start_with_agent_calls_setup(
         catch_exceptions=False,
     )
     assert result.exit_code == 0, result.output
-    assert "claude-code installed" in result.output
+    assert "claude-code ready" in result.output
     mock_setup.assert_called_once()
     args = mock_setup.call_args[0]
     assert args[0] == task_dir  # task_dir
@@ -447,7 +447,7 @@ def test_start_agent_into_existing_session(
         catch_exceptions=False,
     )
     assert result.exit_code == 0, result.output
-    assert "claude-code installed" in result.output
+    assert "claude-code ready" in result.output
     mock_setup.assert_called_once()
 
     session = json.loads((ws / ".pier" / "session.json").read_text())
@@ -506,7 +506,7 @@ def test_start_agent_from_cwd(
         catch_exceptions=False,
     )
     assert result.exit_code == 0, result.output
-    assert "claude-code installed" in result.output
+    assert "claude-code ready" in result.output
     mock_setup.assert_called_once()
     session = json.loads((ws / ".pier" / "session.json").read_text())
     assert session["agents"] == ["claude-code"]
@@ -2401,7 +2401,7 @@ def test_start_task_free_with_agent(
         catch_exceptions=False,
     )
     assert result.exit_code == 0, result.output
-    assert "claude-code installed" in result.output
+    assert "claude-code ready" in result.output
     mock_setup.assert_called_once()
 
     session = json.loads((ws / ".pier" / "session.json").read_text())
@@ -2720,7 +2720,7 @@ def test_start_task_free_already_running_installs_agent(
         catch_exceptions=False,
     )
     assert result.exit_code == 0
-    assert "claude-code installed" in result.output
+    assert "claude-code ready" in result.output
     mock_setup.assert_called_once()
 
 
