@@ -957,6 +957,32 @@ def _start_host(task_dir: Path, workspace: Path) -> None:
     click.echo("Task instruction is at .task/instruction.md.")
 
 
+_AGENT_BINARY: dict[str, str] = {
+    "claude-code": "claude",
+    "codex": "codex",
+    "goose": "goose",
+}
+
+
+def _is_agent_installed(harbor_session_id: str, agent: str) -> bool:
+    """Probe the container to check if the agent binary is already on PATH."""
+    binary = _AGENT_BINARY.get(agent)
+    if not binary:
+        return False
+    _, path_prefix = harbor_bridge.get_agent_exec_env(agent)
+    container = harbor_bridge.get_container_name(harbor_session_id)
+    if path_prefix:
+        cmd = ["docker", "exec", container, "sh", "-c",
+               f"export PATH={path_prefix}:$PATH && which {binary}"]
+    else:
+        cmd = ["docker", "exec", container, "which", binary]
+    try:
+        result = subprocess.run(cmd, capture_output=True, timeout=5)
+        return result.returncode == 0
+    except Exception:
+        return False
+
+
 def _install_agent(
     task_dir: Path,
     harbor_session_id: str,
@@ -966,10 +992,17 @@ def _install_agent(
     """Validate and install a Harbor agent into a running container."""
     if not harbor_bridge.is_valid_agent(agent):
         raise click.ClickException(f"Unknown agent {agent!r}.")
-    click.echo(f"Installing {agent} in the container...")
+    already = _is_agent_installed(harbor_session_id, agent)
+    if already:
+        click.echo(f"{agent} already installed, skipping install step...")
+    else:
+        click.echo(f"Installing {agent} in the container...")
     try:
-        harbor_bridge.setup_agent(task_dir, harbor_session_id, trial_dir, agent)
-        click.echo(f"{agent} installed.")
+        harbor_bridge.setup_agent(
+            task_dir, harbor_session_id, trial_dir, agent,
+            skip_install=already,
+        )
+        click.echo(f"{agent} ready.")
     except Exception as e:
         raise click.ClickException(f"Agent setup failed: {e}")
 
@@ -1938,6 +1971,23 @@ def view(path: str | None, port: str, bind_host: str) -> None:
     """
     pier_dir = _resolve_pier_dir(path)
     harbor_bridge.run_view_command(folder=pier_dir, port=port, host=bind_host)
+
+
+@cli.command("patch-harbor")
+def patch_harbor() -> None:
+    """Apply pier's patches to the installed harbor package.
+
+    Re-run after upgrading harbor (uv tool upgrade harbor).
+    Patches are idempotent — safe to run multiple times.
+    """
+    from pier.patches.apply import apply_all
+
+    click.echo("Applying harbor patches...")
+    applied = apply_all(verbose=True)
+    if applied:
+        click.echo(f"Done — {applied} patch(es) applied.")
+    else:
+        click.echo("All patches already applied.")
 
 
 @cli.command()

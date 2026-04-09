@@ -537,6 +537,8 @@ async def _async_setup_agent(
     harbor_session_id: str,
     trial_dir: Path,
     agent_name: str,
+    *,
+    skip_install: bool = False,
 ) -> None:
     from harbor.agents.factory import AgentFactory
     from harbor.models.agent.name import AgentName
@@ -554,7 +556,8 @@ async def _async_setup_agent(
     agent = AgentFactory.create_agent_from_name(
         AgentName(agent_name), logs_dir=trial_paths.agent_dir, **extra_kwargs
     )
-    await agent.setup(environment)
+    if not skip_install:
+        await agent.setup(environment)
     await _run_interactive_setup(agent, agent_name, environment)
 
 
@@ -563,16 +566,25 @@ def setup_agent(
     harbor_session_id: str,
     trial_dir: Path,
     agent_name: str,
+    *,
+    skip_install: bool = False,
 ) -> None:
     """Install a Harbor agent in a running environment.
 
     Calls the agent's setup() method which uploads and runs the install
     script (e.g. install-claude-code.sh).  Does NOT call run() — the user
     drives the agent interactively via ``pier exec``.
+
+    When *skip_install* is True, only the interactive setup (onboarding
+    marker, skills, MCP servers) is executed — useful when the binary is
+    already present in the container image.
     """
     with _placeholder_task_env_vars(task_dir):
         asyncio.run(
-            _async_setup_agent(task_dir, harbor_session_id, trial_dir, agent_name)
+            _async_setup_agent(
+                task_dir, harbor_session_id, trial_dir, agent_name,
+                skip_install=skip_install,
+            )
         )
 
 
