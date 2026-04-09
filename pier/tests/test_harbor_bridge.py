@@ -12,8 +12,6 @@ from pier.harbor_bridge import (
     _get_dockerfile_workdir,
     _write_mounts_compose,
     build_trial_result_json,
-    detect_agent_from_session_dir,
-    find_container_agent_session_dir,
     get_compose_project,
     get_agent_exec_env,
     get_container_name,
@@ -188,14 +186,15 @@ class TestBuildTrialResultJson:
         assert result.started_at == start
         assert result.finished_at == end
 
-    def test_defaults_agent_to_human(self, tmp_path: Path):
+    def test_defaults_agent_to_unknown(self, tmp_path: Path):
+        """When no agent is specified, agent_info.name defaults to 'unknown'."""
         task_dir = _make_task_dir(tmp_path)
         result_json = build_trial_result_json(task_dir, "my-task", "s", {"reward": 1.0})
 
         from harbor.models.trial.result import TrialResult
 
         result = TrialResult.model_validate_json(result_json)
-        assert result.agent_info.name == "human"
+        assert result.agent_info.name == "unknown"
 
     def test_scanner_discovers_pier_layout(self, tmp_path: Path):
         """Verify that Harbor's JobScanner finds trials in pier's .pier/ layout."""
@@ -248,120 +247,6 @@ class TestContainerNaming:
 
     def test_container_name_with_uppercase(self):
         assert get_container_name("Pier-WS") == "pier-ws-main-1"
-
-
-class TestDetectAgentFromSessionDir:
-    def test_detects_claude_code(self, tmp_path: Path):
-        session = tmp_path / "session"
-        session.mkdir()
-        (session / "log.jsonl").write_text("{}\n")
-        assert detect_agent_from_session_dir(session) == "claude-code"
-
-    def test_returns_none_for_empty_dir(self, tmp_path: Path):
-        session = tmp_path / "session"
-        session.mkdir()
-        assert detect_agent_from_session_dir(session) is None
-
-    def test_returns_none_for_nonexistent_dir(self, tmp_path: Path):
-        session = tmp_path / "nonexistent"
-        assert detect_agent_from_session_dir(session) is None
-
-
-class TestFindContainerAgentSessionDir:
-    def test_finds_single_claude_session(self, tmp_path: Path):
-        agent_dir = tmp_path / "agent"
-        project = agent_dir / "sessions" / "projects" / "abc123"
-        project.mkdir(parents=True)
-        (project / "session.jsonl").write_text("{}\n")
-
-        result = find_container_agent_session_dir("claude-code", agent_dir)
-        assert result == project
-
-    def test_returns_none_for_no_sessions(self, tmp_path: Path):
-        agent_dir = tmp_path / "agent"
-        agent_dir.mkdir()
-        assert find_container_agent_session_dir("claude-code", agent_dir) is None
-
-    def test_returns_none_for_empty_projects(self, tmp_path: Path):
-        agent_dir = tmp_path / "agent"
-        projects = agent_dir / "sessions" / "projects"
-        projects.mkdir(parents=True)
-        assert find_container_agent_session_dir("claude-code", agent_dir) is None
-
-    def test_returns_none_for_multiple_sessions(self, tmp_path: Path):
-        agent_dir = tmp_path / "agent"
-        projects = agent_dir / "sessions" / "projects"
-        for name in ("proj1", "proj2"):
-            d = projects / name
-            d.mkdir(parents=True)
-            (d / "session.jsonl").write_text("{}\n")
-
-        result = find_container_agent_session_dir("claude-code", agent_dir)
-        assert result is None
-
-    def test_returns_none_for_unknown_agent(self, tmp_path: Path):
-        agent_dir = tmp_path / "agent"
-        agent_dir.mkdir()
-        assert find_container_agent_session_dir("unknown-agent", agent_dir) is None
-
-    def test_ignores_dirs_without_jsonl(self, tmp_path: Path):
-        agent_dir = tmp_path / "agent"
-        projects = agent_dir / "sessions" / "projects"
-        # One dir with jsonl, one without
-        real = projects / "real"
-        real.mkdir(parents=True)
-        (real / "session.jsonl").write_text("{}\n")
-        empty = projects / "empty"
-        empty.mkdir()
-
-        result = find_container_agent_session_dir("claude-code", agent_dir)
-        assert result == real
-
-    def test_finds_single_codex_session(self, tmp_path: Path):
-        agent_dir = tmp_path / "agent"
-        session = agent_dir / "sessions" / "2026" / "04" / "codex-session"
-        session.mkdir(parents=True)
-
-        result = find_container_agent_session_dir("codex", agent_dir)
-        assert result == session
-
-    def test_codex_returns_none_for_multiple_sessions(self, tmp_path: Path):
-        agent_dir = tmp_path / "agent"
-        (agent_dir / "sessions" / "a" / "one").mkdir(parents=True)
-        (agent_dir / "sessions" / "b" / "two").mkdir(parents=True)
-
-        result = find_container_agent_session_dir("codex", agent_dir)
-        assert result is None
-
-    @pytest.mark.parametrize(
-        ("agent_name", "filename"),
-        [
-            ("cursor-cli", "cursor-cli.txt"),
-            ("gemini-cli", "gemini-cli.trajectory.json"),
-            ("kimi-cli", "kimi-cli.txt"),
-            ("opencode", "opencode.txt"),
-        ],
-    )
-    def test_finds_direct_log_agents(
-        self, tmp_path: Path, agent_name: str, filename: str
-    ):
-        agent_dir = tmp_path / "agent"
-        agent_dir.mkdir()
-        (agent_dir / filename).write_text("log\n")
-
-        result = find_container_agent_session_dir(agent_name, agent_dir)
-
-        assert result == agent_dir
-
-    def test_finds_qwen_coder_session_root(self, tmp_path: Path):
-        agent_dir = tmp_path / "agent"
-        session = agent_dir / "qwen-sessions" / "project-a"
-        session.mkdir(parents=True)
-        (session / "events.jsonl").write_text("{}\n")
-
-        result = find_container_agent_session_dir("qwen-coder", agent_dir)
-
-        assert result == agent_dir
 
 
 class TestBridgeClaudeCode:

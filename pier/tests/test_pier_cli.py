@@ -1553,6 +1553,7 @@ def test_verify_defaults_agent_from_session(
         catch_exceptions=False,
     )
     assert result.exit_code == 0
+    assert "using agent from session: claude-code" in result.output.lower()
     args = mock_assemble.call_args[0]
     assert args[6] == "claude-code"  # agent defaulted from session
 
@@ -1582,6 +1583,117 @@ def test_verify_agent_flag_overrides_session(
     assert result.exit_code == 0
     args = mock_assemble.call_args[0]
     assert args[6] == "codex"  # explicit flag wins
+
+
+@patch("pier.harbor_bridge.verify_environment", return_value={"reward": 1.0})
+@patch("pier.harbor_bridge.is_environment_running", return_value=True)
+def test_verify_multi_agent_session_errors(
+    mock_running,
+    mock_verify,
+    runner,
+    index_path,
+    task_dir,
+    tmp_path,
+):
+    """Multiple agents in session errors before running verifier."""
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    sess = _container_session(task_dir=str(task_dir), agents=["claude-code", "codex"])
+    _write_session(ws, sess, index_path)
+    result = runner.invoke(cli, ["verify"])
+    assert result.exit_code != 0
+    assert "multiple agents" in result.output.lower()
+    mock_verify.assert_not_called()
+
+
+def test_verify_host_no_agent_proceeds(runner, index_path, task_dir, tmp_path):
+    """Host verify without --agent saves reward with no trajectory."""
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    _write_session(
+        ws,
+        {
+            "mode": "host",
+            "task_dir": str(task_dir),
+            "task_ref": "my-task",
+            "started_at": "2026-02-24T12:00:00+00:00",
+        },
+        index_path,
+    )
+
+    def fake_verify(task_dir, workspace, trial_dir):
+        from datetime import datetime, timezone
+
+        vdir = trial_dir / "verifier"
+        vdir.mkdir(parents=True, exist_ok=True)
+        (vdir / "reward.json").write_text('{"reward": 1.0}')
+        now = datetime.now(timezone.utc)
+        return {"reward": 1.0}, now, now
+
+    with patch("pier.cli._verify_host_in_container", side_effect=fake_verify):
+        result = runner.invoke(cli, ["verify"], catch_exceptions=False)
+    assert result.exit_code == 0
+    assert "no agent specified" in result.output.lower()
+
+
+@patch("pier.harbor_bridge.verify_environment", return_value={"reward": 1.0})
+@patch("pier.harbor_bridge.is_environment_running", return_value=True)
+def test_verify_container_no_agent_saves_reward(
+    mock_running,
+    mock_verify,
+    runner,
+    index_path,
+    task_dir,
+    tmp_path,
+):
+    """Container verify with no agent saves reward but skips trajectory."""
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    _write_session(
+        ws, _container_session(task_dir=str(task_dir), agents=[]), index_path
+    )
+    result = runner.invoke(cli, ["verify"], catch_exceptions=False)
+    assert result.exit_code == 0
+    assert "no agent specified" in result.output.lower()
+    trials = list((ws / ".pier" / "trials").iterdir())
+    assert len(trials) == 1
+
+
+@patch("pier.harbor_bridge.extract_agent_logs", return_value={"cost_usd": 0.05})
+@patch("pier.cli._copy_session_from_container")
+@patch("pier.harbor_bridge.verify_environment", return_value={"reward": 1.0})
+@patch("pier.harbor_bridge.is_environment_running", return_value=True)
+def test_verify_container_session_dir_copies_from_container(
+    mock_running,
+    mock_verify,
+    mock_copy,
+    mock_extract,
+    runner,
+    index_path,
+    task_dir,
+    tmp_path,
+):
+    """--session-dir in container mode copies from container via docker cp."""
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    sess = _container_session(task_dir=str(task_dir), agents=[])
+    _write_session(ws, sess, index_path)
+
+    # Mock _copy_session_from_container to create the destination dir
+    def fake_copy(hsid, container_path, dest):
+        dest.mkdir(parents=True, exist_ok=True)
+
+    mock_copy.side_effect = fake_copy
+
+    result = runner.invoke(
+        cli,
+        ["verify", "--agent", "claude-code", "--session-dir", "/root/.claude"],
+        catch_exceptions=False,
+    )
+    assert result.exit_code == 0
+    mock_copy.assert_called_once()
+    # Verify the container path was passed through
+    assert mock_copy.call_args[0][1] == "/root/.claude"
 
 
 def test_verify_host_custom_trial_dir(runner, index_path, task_dir, tmp_path):
@@ -1906,11 +2018,10 @@ def test_summarize_all_flag(runner, index_path, tmp_path, monkeypatch):
 
 
 @patch("pier.harbor_bridge.extract_agent_logs", return_value={"cost_usd": 0.05})
-@patch("pier.harbor_bridge.detect_agent_from_session_dir", return_value="claude-code")
 def test_capture_explicit_session_dir(
-    mock_detect, mock_extract, runner, index_path, tmp_path, monkeypatch
+    mock_extract, runner, index_path, tmp_path, monkeypatch
 ):
-    """pier capture --session-dir skips auto-discovery."""
+    """pier capture --session-dir with -a extracts trajectory."""
     session_dir = tmp_path / "session"
     session_dir.mkdir()
     (session_dir / "main.jsonl").write_text("{}\n")
@@ -1922,10 +2033,30 @@ def test_capture_explicit_session_dir(
     monkeypatch.setenv("PWD", str(ws))
 
     result = runner.invoke(
-        cli, ["capture", "--session-dir", str(session_dir)], catch_exceptions=False
+        cli,
+        ["capture", "--session-dir", str(session_dir), "-a", "claude-code"],
+        catch_exceptions=False,
     )
     assert result.exit_code == 0
     assert "trajectory extracted" in result.output.lower()
+
+
+def test_capture_session_dir_without_agent_errors(
+    runner, index_path, tmp_path, monkeypatch
+):
+    """pier capture --session-dir without -a errors."""
+    session_dir = tmp_path / "session"
+    session_dir.mkdir()
+
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    _write_session(ws, _host_session(), index_path)
+    monkeypatch.chdir(ws)
+    monkeypatch.setenv("PWD", str(ws))
+
+    result = runner.invoke(cli, ["capture", "--session-dir", str(session_dir)])
+    assert result.exit_code != 0
+    assert "--agent" in result.output
 
 
 def test_capture_host_no_session_dir_fails(runner, index_path, tmp_path, monkeypatch):
@@ -1942,9 +2073,8 @@ def test_capture_host_no_session_dir_fails(runner, index_path, tmp_path, monkeyp
 
 
 @patch("pier.harbor_bridge.extract_agent_logs", return_value={"cost_usd": 0.05})
-@patch("pier.harbor_bridge.detect_agent_from_session_dir", return_value="claude-code")
 def test_capture_creates_trial_dir(
-    mock_detect, mock_extract, runner, index_path, tmp_path, monkeypatch
+    mock_extract, runner, index_path, tmp_path, monkeypatch
 ):
     """pier capture creates a timestamped trial directory under .pier/trials/."""
     session_dir = tmp_path / "session"
@@ -1958,7 +2088,9 @@ def test_capture_creates_trial_dir(
     monkeypatch.setenv("PWD", str(ws))
 
     runner.invoke(
-        cli, ["capture", "--session-dir", str(session_dir)], catch_exceptions=False
+        cli,
+        ["capture", "--session-dir", str(session_dir), "-a", "claude-code"],
+        catch_exceptions=False,
     )
 
     trials_dir = ws / ".pier" / "trials"
@@ -1969,9 +2101,8 @@ def test_capture_creates_trial_dir(
 
 
 @patch("pier.harbor_bridge.extract_agent_logs", return_value={"cost_usd": 0.05})
-@patch("pier.harbor_bridge.detect_agent_from_session_dir", return_value="claude-code")
 def test_capture_outside_workspace(
-    mock_detect, mock_extract, runner, index_path, tmp_path, monkeypatch
+    mock_extract, runner, index_path, tmp_path, monkeypatch
 ):
     """pier capture works outside a pier workspace (no session.json)."""
     session_dir = tmp_path / "session"
@@ -1984,16 +2115,17 @@ def test_capture_outside_workspace(
     monkeypatch.setenv("PWD", str(project))
 
     result = runner.invoke(
-        cli, ["capture", "--session-dir", str(session_dir)], catch_exceptions=False
+        cli,
+        ["capture", "--session-dir", str(session_dir), "-a", "claude-code"],
+        catch_exceptions=False,
     )
     assert result.exit_code == 0
     assert (project / ".pier" / "trials").is_dir()
 
 
 @patch("pier.harbor_bridge.extract_agent_logs", return_value={"cost_usd": 0.05})
-@patch("pier.harbor_bridge.detect_agent_from_session_dir", return_value="claude-code")
 def test_capture_outside_workspace_does_not_attach_to_unrelated_active_workspace(
-    mock_detect, mock_extract, runner, index_path, tmp_path, monkeypatch
+    mock_extract, runner, index_path, tmp_path, monkeypatch
 ):
     """capture from a non-workspace directory should write into cwd, not another active workspace."""
     session_dir = tmp_path / "session"
@@ -2010,7 +2142,9 @@ def test_capture_outside_workspace_does_not_attach_to_unrelated_active_workspace
     monkeypatch.setenv("PWD", str(project))
 
     result = runner.invoke(
-        cli, ["capture", "--session-dir", str(session_dir)], catch_exceptions=False
+        cli,
+        ["capture", "--session-dir", str(session_dir), "-a", "claude-code"],
+        catch_exceptions=False,
     )
 
     assert result.exit_code == 0
@@ -2018,22 +2152,15 @@ def test_capture_outside_workspace_does_not_attach_to_unrelated_active_workspace
     assert not (active_ws / ".pier" / "trials").exists()
 
 
-@patch("pier.harbor_bridge.extract_agent_logs", return_value={"cost_usd": 0.05})
-@patch(
-    "pier.harbor_bridge.find_container_agent_session_dir",
-    return_value=Path("/tmp/fake-session"),
-)
-@patch("pier.harbor_bridge.detect_agent_from_session_dir", return_value="claude-code")
+@patch("pier.harbor_bridge.extract_agent_context", return_value={"cost_usd": 0.05})
 def test_capture_container_auto_discover(
-    mock_detect,
-    mock_find,
     mock_extract,
     runner,
     index_path,
     tmp_path,
     monkeypatch,
 ):
-    """pier capture in container mode auto-discovers session from agent logs."""
+    """pier capture in container mode extracts via Harbor directly."""
     ws = tmp_path / "ws"
     ws.mkdir()
     sess = _container_session(agents=["claude-code"])
@@ -2044,17 +2171,14 @@ def test_capture_container_auto_discover(
     result = runner.invoke(cli, ["capture"], catch_exceptions=False)
     assert result.exit_code == 0
     assert "trajectory extracted" in result.output.lower()
-    mock_find.assert_called_once()
+    mock_extract.assert_called_once()
 
 
-@patch(
-    "pier.harbor_bridge.find_container_agent_session_dir",
-    return_value=None,
-)
+@patch("pier.harbor_bridge.extract_agent_context", return_value=None)
 def test_capture_container_no_session_found(
-    mock_find, runner, index_path, tmp_path, monkeypatch
+    mock_extract, runner, index_path, tmp_path, monkeypatch
 ):
-    """pier capture in container mode fails clearly when no session found."""
+    """pier capture in container mode fails clearly when extraction returns nothing."""
     ws = tmp_path / "ws"
     ws.mkdir()
     sess = _container_session(agents=["claude-code"])
@@ -2064,7 +2188,7 @@ def test_capture_container_no_session_found(
 
     result = runner.invoke(cli, ["capture"])
     assert result.exit_code != 0
-    assert "could not find" in result.output.lower()
+    assert "could not extract" in result.output.lower()
 
 
 def test_capture_container_multiple_agents_requires_flag(
