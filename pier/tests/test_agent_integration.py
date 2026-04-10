@@ -95,6 +95,25 @@ def test_task_free_agent_install_and_exec(
         )
         assert version.returncode == 0, version.stdout + version.stderr
         assert version.stdout.strip()
+
+        # Auto-detected agent command should have tee'd output to a
+        # per-session directory under .pier/_harbor/agent/.
+        exec_dir = workspace / ".pier" / "_harbor" / "agent" / "exec"
+        session_dirs = sorted(d for d in exec_dir.iterdir() if d.is_dir())
+        assert session_dirs, "at least one session dir should exist after pier exec"
+        tee_output = session_dirs[-1] / f"{agent_name}.txt"
+        assert tee_output.exists(), (
+            f"tee output for {agent_name} not found at {tee_output}"
+        )
+        assert tee_output.stat().st_size > 0
+
+        # Log-capture env vars should be set inside the container.
+        env_check = _run(
+            ["uv", "run", "pier", "exec", "sh", "-c", "echo $CLAUDE_CONFIG_DIR"],
+            cwd=workspace,
+        )
+        assert "/logs/agent/" in env_check.stdout
+        assert "/sessions" in env_check.stdout
     finally:
         if (workspace / ".pier" / "session.json").exists():
             _run(["uv", "run", "pier", "stop"], cwd=workspace)

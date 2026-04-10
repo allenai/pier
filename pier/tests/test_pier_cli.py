@@ -788,24 +788,28 @@ def test_exec_container_with_agent_prepends_path(
 
 
 @patch(
+    "pier.harbor_bridge.get_binary_agent_map",
+    return_value={},
+)
+@patch(
     "pier.harbor_bridge.get_agent_exec_env",
     return_value=({}, ""),
 )
 @patch("pier.harbor_bridge.is_environment_running", return_value=True)
 def test_exec_container_without_path_prefix_runs_directly(
-    mock_running, mock_env, runner, index_path, tmp_path
+    mock_running, mock_env, mock_map, runner, index_path, tmp_path
 ):
-    """When agent has no PATH prefix, command runs directly (no shell wrapper)."""
+    """When no agent is detected and no PATH prefix, command runs directly."""
     ws = tmp_path / "ws"
     ws.mkdir()
     sess = _container_session(agents=["codex"])
     _write_session(ws, sess, index_path)
     with patch("subprocess.run", return_value=MagicMock(returncode=0)) as mock_run:
-        runner.invoke(cli, ["exec", "codex", "run"])
+        runner.invoke(cli, ["exec", "my-tool", "run"])
     args = mock_run.call_args[0][0]
     # Should NOT wrap in sh -c
     assert "sh" not in args
-    assert "codex" in args
+    assert "my-tool" in args
     assert "run" in args
 
 
@@ -959,6 +963,214 @@ def test_exec_container_not_running(mock_running, runner, index_path, tmp_path):
     result = runner.invoke(cli, ["exec", "my-tool", "list"])
     assert result.exit_code != 0
     assert "not running" in result.output
+
+
+@patch("pier.harbor_bridge.is_environment_running", return_value=True)
+def test_exec_always_sets_log_capture_env(mock_running, runner, index_path, tmp_path):
+    """CLAUDE_CONFIG_DIR and CODEX_HOME are set even with no agents registered."""
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    sess = _container_session(agents=[])
+    _write_session(ws, sess, index_path)
+    with patch("subprocess.run", return_value=MagicMock(returncode=0)) as mock_run:
+        runner.invoke(cli, ["exec", "bash"])
+    args = mock_run.call_args[0][0]
+    env_str = " ".join(args)
+    assert "CLAUDE_CONFIG_DIR=" in env_str
+    assert "CODEX_HOME=" in env_str
+
+
+@patch("pier.harbor_bridge.is_environment_running", return_value=True)
+def test_exec_user_env_overrides_log_capture(
+    mock_running, runner, index_path, tmp_path
+):
+    """User -e env vars override default log capture env vars."""
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    sess = _container_session(agents=[])
+    sess["extra_env"] = ["CLAUDE_CONFIG_DIR=/custom/path"]
+    _write_session(ws, sess, index_path)
+    with patch("subprocess.run", return_value=MagicMock(returncode=0)) as mock_run:
+        runner.invoke(cli, ["exec", "bash"])
+    args = mock_run.call_args[0][0]
+    env_str = " ".join(args)
+    assert "CLAUDE_CONFIG_DIR=/custom/path" in env_str
+    assert "CLAUDE_CONFIG_DIR=/logs/agent/sessions" not in env_str
+
+
+@patch(
+    "pier.harbor_bridge.get_binary_agent_map",
+    return_value={"claude": "claude-code"},
+)
+@patch("pier.harbor_bridge.is_environment_running", return_value=True)
+def test_exec_auto_detects_agent(mock_running, mock_map, runner, index_path, tmp_path):
+    """pier exec claude auto-detects the agent, creates a run dir, and tees output."""
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    _write_session(ws, _container_session(agents=[]), index_path)
+    with patch("subprocess.run", return_value=MagicMock(returncode=0)) as mock_run:
+        runner.invoke(cli, ["exec", "claude", "--print", "hello"])
+    args = mock_run.call_args[0][0]
+    cmd_str = args[args.index("-c") + 1]
+    assert "script -q -c" in cmd_str
+    assert "/logs/agent/" in cmd_str
+    assert "claude-code.txt" in cmd_str
+    # Per-run dir should exist on host.
+    exec_dir = ws / ".pier" / "_harbor" / "agent" / "exec"
+    assert exec_dir.is_dir()
+    session_dirs = [d for d in exec_dir.iterdir() if d.is_dir()]
+    assert len(session_dirs) == 1
+
+
+@patch(
+    "pier.harbor_bridge.get_binary_agent_map",
+    return_value={"claude": "claude-code"},
+)
+@patch("pier.harbor_bridge.is_environment_running", return_value=True)
+def test_exec_multiple_runs_create_separate_dirs(
+    mock_running, mock_map, runner, index_path, tmp_path
+):
+    """Two pier exec claude calls create two separate run dirs."""
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    _write_session(ws, _container_session(agents=[]), index_path)
+
+    with patch("subprocess.run", return_value=MagicMock(returncode=0)):
+        runner.invoke(cli, ["exec", "claude", "--print", "first"])
+    with patch("subprocess.run", return_value=MagicMock(returncode=0)):
+        runner.invoke(cli, ["exec", "claude", "--print", "second"])
+
+    exec_dir = ws / ".pier" / "_harbor" / "agent" / "exec"
+    session_dirs = sorted(d for d in exec_dir.iterdir() if d.is_dir())
+    assert len(session_dirs) == 2
+
+
+@patch(
+    "pier.harbor_bridge.get_binary_agent_map",
+    return_value={"claude": "claude-code"},
+)
+@patch("pier.harbor_bridge.is_environment_running", return_value=True)
+def test_exec_no_tee_for_non_agent_cmd(
+    mock_running, mock_map, runner, index_path, tmp_path
+):
+    """pier exec bash does not tee even when agents exist in Harbor."""
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    _write_session(ws, _container_session(agents=[]), index_path)
+    with patch("subprocess.run", return_value=MagicMock(returncode=0)) as mock_run:
+        runner.invoke(cli, ["exec", "bash"])
+    args = mock_run.call_args[0][0]
+    cmd_str = " ".join(args)
+    assert "tee" not in cmd_str
+    # Session dir still created (for CLAUDE_CONFIG_DIR), but no tee.
+    exec_dir = ws / ".pier" / "_harbor" / "agent" / "exec"
+    assert exec_dir.is_dir()
+
+
+@patch(
+    "pier.harbor_bridge.get_binary_agent_map",
+    return_value={"goose": "goose"},
+)
+@patch(
+    "pier.harbor_bridge.get_agent_exec_env",
+    return_value=({"IS_SANDBOX": "1"}, "$HOME/.local/bin"),
+)
+@patch("pier.harbor_bridge.is_environment_running", return_value=True)
+def test_exec_auto_detect_applies_env(
+    mock_running, mock_env, mock_map, runner, index_path, tmp_path
+):
+    """Auto-detected agent gets env vars, PATH, and per-run tee."""
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    _write_session(ws, _container_session(agents=[]), index_path)
+    with patch("subprocess.run", return_value=MagicMock(returncode=0)) as mock_run:
+        runner.invoke(cli, ["exec", "goose", "session", "start"])
+    args = mock_run.call_args[0][0]
+    cmd_str = args[args.index("-c") + 1]
+    assert "script -q -c" in cmd_str
+    assert "goose.txt" in cmd_str
+
+
+# ---------------------------------------------------------------------------
+# pier verify/capture --session
+# ---------------------------------------------------------------------------
+
+
+@patch("pier.harbor_bridge.extract_agent_context", return_value={"cost_usd": 0.05})
+@patch("pier.harbor_bridge.verify_environment", return_value={"reward": 1.0})
+@patch("pier.harbor_bridge.is_environment_running", return_value=True)
+def test_verify_session_flag(
+    mock_running, mock_verify, mock_extract, runner, index_path, task_dir, tmp_path
+):
+    """--session selects a specific session directory."""
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    sess = _container_session(task_dir=str(task_dir), agents=["claude-code"])
+    _write_session(ws, sess, index_path)
+
+    # Create two session dirs
+    exec_dir = ws / ".pier" / "_harbor" / "agent" / "exec"
+    old = exec_dir / "2026-01-01_00-00-00-000000"
+    old.mkdir(parents=True)
+    (old / "claude-code.txt").write_text("old session\n")
+    new = exec_dir / "2026-01-01_00-05-00-000000"
+    new.mkdir(parents=True)
+    (new / "claude-code.txt").write_text("new session\n")
+
+    result = runner.invoke(
+        cli,
+        ["verify", "--session", "2026-01-01_00-00-00-000000"],
+        catch_exceptions=False,
+    )
+    assert result.exit_code == 0
+    # Should use the specified session, not latest
+    assert "2026-01-01_00-00-00-000000" in result.output
+
+
+@patch("pier.harbor_bridge.verify_environment", return_value={"reward": 1.0})
+@patch("pier.harbor_bridge.is_environment_running", return_value=True)
+def test_verify_session_invalid_errors(
+    mock_running, mock_verify, runner, index_path, task_dir, tmp_path
+):
+    """--session with nonexistent timestamp errors."""
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    _write_session(
+        ws,
+        _container_session(task_dir=str(task_dir), agents=["claude-code"]),
+        index_path,
+    )
+    result = runner.invoke(cli, ["verify", "--session", "nonexistent"])
+    assert result.exit_code != 0
+    assert "not found" in result.output.lower()
+
+
+def test_verify_session_host_mode_errors(runner, index_path, tmp_path):
+    """--session in host mode errors."""
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    _write_session(ws, _host_session(), index_path)
+    result = runner.invoke(cli, ["verify", "--session", "2026-01-01_00-00-00-000000"])
+    assert result.exit_code != 0
+    assert "container mode" in result.output.lower()
+
+
+def test_verify_session_and_session_dir_exclusive(
+    runner, index_path, task_dir, tmp_path
+):
+    """--session and --session-dir are mutually exclusive."""
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    _write_session(
+        ws,
+        _container_session(task_dir=str(task_dir), agents=["claude-code"]),
+        index_path,
+    )
+    result = runner.invoke(
+        cli, ["verify", "--session", "ts", "--session-dir", "/tmp", "-a", "claude-code"]
+    )
+    assert result.exit_code != 0
+    assert "mutually exclusive" in result.output.lower()
 
 
 # ---------------------------------------------------------------------------

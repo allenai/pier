@@ -750,31 +750,178 @@ _AGENT_BRIDGE: dict[str, Callable[[Path, Path], None]] = {
 }
 
 
+_CONFIG_DIR_AGENTS = {"claude-code", "codex"}
+
+
+def get_agent_session_dirs(harbor_agent_dir: Path, agent_name: str) -> list[Path]:
+    """Return session directories containing files for *agent_name*, newest first.
+
+    Scans ``harbor_agent_dir/exec/`` for timestamped directories that
+    contain the agent's output (``<agent_name>.txt``).  For config-dir
+    agents (claude-code, codex), a ``sessions/`` subdirectory also
+    counts as a match.
+    """
+    exec_dir = harbor_agent_dir / "exec"
+    if not exec_dir.is_dir():
+        return []
+
+    def _matches(d: Path) -> bool:
+        if (d / f"{agent_name}.txt").exists():
+            return True
+        if agent_name in _CONFIG_DIR_AGENTS and (d / "sessions").is_dir():
+            return True
+        return False
+
+    return [
+        d
+        for d in sorted(exec_dir.iterdir(), key=lambda d: d.name, reverse=True)
+        if d.is_dir() and _matches(d)
+    ]
+
+
+def _latest_session_dir(harbor_agent_dir: Path, agent_name: str) -> Path | None:
+    """Return the most recent session directory for *agent_name*, or None."""
+    dirs = get_agent_session_dirs(harbor_agent_dir, agent_name)
+    return dirs[0] if dirs else None
+
+
+# ---------------------------------------------------------------------------
+# Agent log capture — pier-side knowledge of Harbor agent internals
+#
+# Harbor's run() handles env vars, output tee, and post-run artifact
+# collection.  Pier doesn't call run() — agents are driven interactively
+# — so these functions replicate the parts needed for log persistence.
+#
+# TODO: Replace when Harbor exposes APIs for get_log_env_vars(),
+# get_post_run_commands(), and get_cli_binary().
+# ---------------------------------------------------------------------------
+
+
+def get_log_capture_env(base_dir: str | None = None) -> dict[str, str]:
+    """Env vars that direct agent session logs to the mounted volume.
+
+    Only claude-code and codex use config-dir env vars for log routing;
+    all other agents are covered by tee wrapping.  When *base_dir* is
+    provided (e.g. ``/logs/agent/<ts>``), the default agent_dir
+    prefix is replaced so logs land in the per-run directory.
+    """
+    from harbor.models.trial.paths import EnvironmentPaths
+
+    agent_dir = str(EnvironmentPaths.agent_dir)
+    env = {
+        "CLAUDE_CONFIG_DIR": _claude_config_dir(),
+        "CODEX_HOME": _codex_home_dir(),
+    }
+    if base_dir:
+        env = {k: v.replace(agent_dir, base_dir) for k, v in env.items()}
+    return env
+
+
+def get_post_run_commands(agent_name: str, log_dir: str) -> list[str]:
+    """Shell commands to collect agent artifacts after an interactive run.
+
+    Replicates the post-run steps from Harbor's ``run()`` methods that
+    copy or export structured session data to the log directory.
+    """
+    import shlex
+
+    safe_dir = shlex.quote(log_dir)
+    if agent_name == "gemini-cli":
+        return [
+            "find ~/.gemini/tmp -type f -name 'session-*.json' 2>/dev/null | "
+            f"head -n 1 | xargs -r -I{{}} cp {{}} {safe_dir}/gemini-cli.trajectory.json"
+        ]
+    if agent_name == "hermes":
+        return [
+            'export PATH="$HOME/.local/bin:$PATH" && '
+            f"hermes sessions export {safe_dir}/hermes-session.jsonl "
+            "--source cli 2>/dev/null || true"
+        ]
+    return []
+
+
 def get_agent_exec_env(agent_name: str) -> tuple[dict[str, str], str]:
     """Return env vars and PATH prefix needed to run an agent interactively.
 
     Returns ``(env_dict, path_prefix)`` where *path_prefix* is a string like
     ``"$HOME/.local/bin"`` or empty.
 
-    TODO: Harbor should expose an API for this so pier doesn't hardcode
-    agent-specific env vars.
+    Log-dir env vars (CLAUDE_CONFIG_DIR, CODEX_HOME) are set unconditionally
+    by :func:`get_log_capture_env` — this function only adds agent-specific
+    behavior flags and PATH prefixes.
     """
     env: dict[str, str] = {}
     path_prefix = ""
 
     if agent_name == "claude-code":
-        env["CLAUDE_CONFIG_DIR"] = _claude_config_dir()
         env["IS_SANDBOX"] = "1"
         env["CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"] = "1"
         path_prefix = _local_bin_path_prefix()
     elif agent_name == "codex":
-        env["CODEX_HOME"] = _codex_home_dir()
         path_prefix = _codex_path_prefix()
     elif agent_name in {"cursor-cli", "kimi-cli", "goose", "hermes"}:
         path_prefix = _local_bin_path_prefix()
     elif agent_name in {"gemini-cli", "qwen-coder", "opencode"}:
         path_prefix = _codex_path_prefix()
     return env, path_prefix
+
+
+def get_agent_binary(agent_name: str) -> str | None:
+    """Extract the CLI binary name for an agent from Harbor's version command.
+
+    Instantiates the agent via Harbor's factory and parses the binary
+    from ``get_version_command()``.  Returns None if the binary can't
+    be determined (e.g. agents that use ``python -m ...``).
+    """
+    from harbor.agents.factory import AgentFactory
+    from harbor.models.agent.name import AgentName
+
+    _NON_AGENT_BINARIES = {"python", "pip", "uv"}
+
+    try:
+        agent = AgentFactory.create_agent_from_name(
+            AgentName(agent_name), logs_dir=Path("/tmp/pier-probe")
+        )
+        cmd = agent.get_version_command()
+        if not cmd:
+            return None
+        # Take the last semicolon-separated part and extract the first token.
+        last_part = cmd.split(";")[-1].strip()
+        binary = last_part.split()[0] if last_part else None
+        if binary and Path(binary).name in _NON_AGENT_BINARIES:
+            return None
+        return Path(binary).name if binary else None
+    except Exception:
+        return None
+
+
+# Cached binary→agent map, built once per process from Harbor's agent registry.
+_binary_agent_map: dict[str, str] | None = None
+
+
+def get_binary_agent_map() -> dict[str, str]:
+    """Return a mapping of CLI binary names to Harbor agent names.
+
+    Built from Harbor's agent registry by inspecting each agent's
+    ``get_version_command()``.  Cached after first call.
+    """
+    global _binary_agent_map
+    if _binary_agent_map is not None:
+        return _binary_agent_map
+
+    from harbor.agents.factory import AgentFactory
+
+    result: dict[str, str] = {}
+    for agent_cls in AgentFactory._AGENTS:
+        try:
+            name = agent_cls.name()
+            binary = get_agent_binary(name)
+            if binary:
+                result[binary] = name
+        except Exception:
+            continue
+    _binary_agent_map = result
+    return result
 
 
 def resolve_task_env(task_dir: Path) -> dict[str, str]:
@@ -808,11 +955,16 @@ def exec_in_container(
     env: dict[str, str] | None = None,
     path_prefix: str = "",
     detach: bool = False,
+    log_path: str | None = None,
 ) -> int:
     """Run a command in a running container via docker exec.
 
     Returns the process exit code. Handles TTY allocation, env vars,
-    PATH prefix, and detached mode.
+    PATH prefix, detached mode, and optional session recording.
+
+    When *log_path* is set (an absolute container path), the command is
+    wrapped with ``script -q`` to record terminal output while preserving
+    full TTY behavior (colors, cursor, interactive prompts).
     """
     import shlex
 
@@ -823,10 +975,22 @@ def exec_in_container(
     for var, val in (env or {}).items():
         env_flags.extend(["-e", f"{var}={val}"])
 
-    if path_prefix:
-        shell_cmd = f"export PATH={path_prefix}:$PATH && exec " + " ".join(
-            shlex.quote(c) for c in command
-        )
+    # Build the shell command.  When path_prefix or log_path is set we
+    # must wrap in sh -c; otherwise run the command directly.
+    needs_shell = bool(path_prefix) or bool(log_path)
+
+    if needs_shell:
+        parts = []
+        if path_prefix:
+            parts.append(f"export PATH={path_prefix}:$PATH")
+        cmd_str = " ".join(shlex.quote(c) for c in command)
+        if log_path:
+            # Use script(1) to record output while preserving TTY.
+            cmd_str = f"script -q -c {shlex.quote(cmd_str)} {shlex.quote(log_path)}"
+        else:
+            cmd_str = f"exec {cmd_str}"
+        parts.append(cmd_str)
+        shell_cmd = " && ".join(parts)
         run_command = [container, "sh", "-c", shell_cmd]
     else:
         run_command = [container, *command]
@@ -894,11 +1058,14 @@ def extract_agent_logs(
 def extract_agent_context(agent_name: str, logs_dir: Path) -> dict | None:
     """Extract trajectory and usage from an agent's logs directory.
 
-    Expects ``logs_dir`` to already be in the layout Harbor's agent reader
-    expects (e.g. container mode where CLAUDE_CONFIG_DIR points into the
-    trial's agent dir).  :func:`extract_agent_logs` calls this after first
-    bridging an external session directory into the right layout.
+    When *logs_dir* contains per-session timestamped directories (created
+    by ``pier exec``), the latest session for *agent_name* is used
+    automatically.  Otherwise expects the standard Harbor layout directly
+    under *logs_dir*.
     """
+    session = _latest_session_dir(logs_dir, agent_name)
+    if session:
+        logs_dir = session
     from harbor.agents.factory import AgentFactory
     from harbor.models.agent.context import AgentContext
     from harbor.models.agent.name import AgentName

@@ -416,6 +416,49 @@ class TestExecIntegration:
         finally:
             _cleanup_container(workspace)
 
+    def test_exec_sets_log_capture_env(self, runner, index_path, task_dir, workspace):
+        """pier exec always sets CLAUDE_CONFIG_DIR and CODEX_HOME."""
+        try:
+            _start_workspace(runner, task_dir, workspace)
+
+            r = self._run_pier_exec(workspace, "sh", "-c", "echo $CLAUDE_CONFIG_DIR")
+            assert r.returncode == 0, r.stderr
+            assert "/logs/agent/" in r.stdout
+            assert "/sessions" in r.stdout
+
+            r = self._run_pier_exec(workspace, "sh", "-c", "echo $CODEX_HOME")
+            assert r.returncode == 0, r.stderr
+            assert "/logs/agent/" in r.stdout
+
+        finally:
+            _cleanup_container(workspace)
+
+    def test_exec_log_capture_env_writable(
+        self, runner, index_path, task_dir, workspace
+    ):
+        """CLAUDE_CONFIG_DIR inside the container is writable (bind-mounted)."""
+        try:
+            _start_workspace(runner, task_dir, workspace)
+
+            r = self._run_pier_exec(
+                workspace,
+                "sh",
+                "-c",
+                'mkdir -p "$CLAUDE_CONFIG_DIR/projects/test" && '
+                'echo "session" > "$CLAUDE_CONFIG_DIR/projects/test/log.jsonl" && '
+                'cat "$CLAUDE_CONFIG_DIR/projects/test/log.jsonl"',
+            )
+            assert r.returncode == 0, r.stderr
+            assert "session" in r.stdout
+
+            # Verify the file persists on the host via the bind mount
+            agent_dir = workspace / ".pier" / "_harbor" / "agent"
+            session_files = list(agent_dir.rglob("*.jsonl"))
+            assert session_files, "session file should be on host via bind mount"
+
+        finally:
+            _cleanup_container(workspace)
+
 
 # ---------------------------------------------------------------------------
 # pier verify

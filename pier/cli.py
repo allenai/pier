@@ -18,13 +18,14 @@ from __future__ import annotations
 
 import hashlib
 import json
-import tempfile
 import logging
 import os
 import re
 import shutil
 import subprocess
+import tempfile
 import tomllib
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -1058,6 +1059,9 @@ def exec_cmd(detach: bool, command: tuple[str, ...]) -> None:
     Container mode uses docker exec (streaming output). Host mode runs
     the command directly with workspace env vars set.
 
+    Agent commands (claude, codex, goose, etc.) are auto-detected and
+    their output is captured to /logs/agent/ for trajectory extraction.
+
     \b
     Examples:
         pier exec bash
@@ -1075,8 +1079,41 @@ def exec_cmd(detach: bool, command: tuple[str, ...]) -> None:
         _exec_container(sess, ws, list(command), detach=detach)
 
 
+def _validate_session_flags(
+    sess: dict | None, session: str | None, session_dir: str | None
+) -> None:
+    """Validate --session and --session-dir flags."""
+    if session and session_dir:
+        raise click.ClickException(
+            "--session and --session-dir are mutually exclusive."
+        )
+    if session and (not sess or sess.get("mode") != "container"):
+        raise click.ClickException("--session is for container mode only.")
+    if session and ("/" in session or "\\" in session or ".." in session):
+        raise click.ClickException(f"Invalid session timestamp: {session!r}")
+
+
+def _detect_agent_from_command(command: list[str]) -> str | None:
+    """Match a command against all known Harbor agent binaries.
+
+    Uses Harbor's agent registry to build a binary→agent map (cached
+    after first call).  Returns the agent name or None.
+    """
+    if not command:
+        return None
+    try:
+        cmd_basename = Path(command[0]).name
+        return harbor_bridge.get_binary_agent_map().get(cmd_basename)
+    except Exception:
+        return None
+
+
 def _exec_container(
-    sess: dict, workspace: Path, command: list[str], *, detach: bool = False
+    sess: dict,
+    workspace: Path,
+    command: list[str],
+    *,
+    detach: bool = False,
 ) -> None:
     hsid = _get_hsid(sess, workspace)
     if not harbor_bridge.is_environment_running(hsid):
@@ -1095,13 +1132,34 @@ def _exec_container(
         if key:
             env[key] = val
 
-    # Merge agent env vars and PATH prefixes.
+    # Apply agent env vars and PATH prefixes for registered agents
+    # and the auto-detected agent (if not already registered).
+    active_agent = _detect_agent_from_command(command)
+    agent_names = list(sess.get("agents", []))
+    if active_agent and active_agent not in agent_names:
+        agent_names.append(active_agent)
+
     path_prefixes: list[str] = []
-    for agent_name in sess.get("agents", []):
+    for agent_name in agent_names:
         agent_env, pfx = harbor_bridge.get_agent_exec_env(agent_name)
         env.update(agent_env)
-        if pfx:
+        if pfx and pfx not in path_prefixes:
             path_prefixes.append(pfx)
+
+    # Per-session log isolation: each pier exec gets a timestamped directory
+    # under the agent log dir so sessions don't overwrite each other.
+    session_name = (
+        datetime.now(timezone.utc).strftime("%Y-%m-%d_%H-%M-%S")
+        + f"-{uuid.uuid4().hex[:6]}"
+    )
+    host_session_dir = _harbor_trial_dir(workspace) / "agent" / "exec" / session_name
+    host_session_dir.mkdir(parents=True, exist_ok=True)
+
+    container_session_dir = f"/logs/agent/exec/{session_name}"
+    log_path = f"{container_session_dir}/{active_agent}.txt" if active_agent else None
+
+    for k, v in harbor_bridge.get_log_capture_env(container_session_dir).items():
+        env.setdefault(k, v)
 
     rc = harbor_bridge.exec_in_container(
         hsid,
@@ -1110,7 +1168,17 @@ def _exec_container(
         env=env,
         path_prefix=":".join(path_prefixes),
         detach=detach,
+        log_path=log_path,
     )
+
+    # Run post-run artifact collection (e.g. gemini trajectory copy,
+    # hermes session export) while the container is still running.
+    if active_agent and not detach and rc == 0:
+        for post_cmd in harbor_bridge.get_post_run_commands(
+            active_agent, container_session_dir
+        ):
+            harbor_bridge.exec_in_container(hsid, task_dir, ["sh", "-c", post_cmd])
+
     raise SystemExit(rc)
 
 
@@ -1141,10 +1209,16 @@ def _exec_host(sess: dict, workspace: Path, command: list[str]) -> None:
     default=None,
     help="Agent session/log directory (container path in container mode, host path otherwise).",
 )
+@click.option(
+    "--session",
+    default=None,
+    help="Session timestamp to use (from pier exec). Defaults to latest.",
+)
 def verify(
     trial_dir: str | None,
     agent: str | None,
     session_dir: str | None,
+    session: str | None,
 ) -> None:
     """Run the verifier for the current workspace.
 
@@ -1163,6 +1237,8 @@ def verify(
                 f"\n  Or omit --session-dir to use {agents[0]}'s session automatically."
             )
         raise click.ClickException(msg)
+
+    _validate_session_flags(sess, session, session_dir)
 
     # Default agent from session if not explicitly provided
     if not agent:
@@ -1201,6 +1277,7 @@ def verify(
             trial_dir=trial_dir,
             agent=agent,
             session_dir=session_dir,
+            session=session,
         )
 
 
@@ -1225,6 +1302,7 @@ def _verify_container(
     trial_dir: str | None = None,
     agent: str | None = None,
     session_dir: str | None = None,
+    session: str | None = None,
 ) -> None:
 
     hsid = _get_hsid(sess, workspace)
@@ -1265,10 +1343,30 @@ def _verify_container(
     # reimplementing its detection logic in pier.
     container_agent_context = None
     if agent and not session_dir:
-        click.echo(f"Extracting {agent} trajectory from container logs.")
-        container_agent_context = harbor_bridge.extract_agent_context(
-            agent, harbor_td / "agent"
-        )
+        agent_dir = harbor_td / "agent"
+        if session:
+            # Explicit --session: use that specific timestamp dir.
+            session_path = agent_dir / "exec" / session
+            if not session_path.is_dir():
+                raise click.ClickException(
+                    f"Session {session!r} not found in {agent_dir}."
+                )
+            click.echo(f"Extracting {agent} trajectory ({session}).")
+            container_agent_context = harbor_bridge.extract_agent_context(
+                agent, session_path
+            )
+        else:
+            sessions = harbor_bridge.get_agent_session_dirs(agent_dir, agent)
+            ts = f" ({sessions[0].name})" if sessions else ""
+            click.echo(f"Extracting {agent} trajectory{ts}.")
+            if len(sessions) > 1:
+                click.echo(
+                    f"  (using latest of {len(sessions)} sessions"
+                    " — pass --session <timestamp> to select)"
+                )
+            container_agent_context = harbor_bridge.extract_agent_context(
+                agent, agent_dir
+            )
         if not container_agent_context:
             click.echo(
                 "Warning: trajectory extraction returned no data. "
@@ -1547,7 +1645,12 @@ def _install_skills_from_dir(skills_dir: Path, workspace: Path) -> None:
     default=None,
     help="Agent session/log directory (container path in container mode, host path otherwise).",
 )
-def capture(agent: str | None, session_dir: str | None) -> None:
+@click.option(
+    "--session",
+    default=None,
+    help="Session timestamp to use (from pier exec). Defaults to latest.",
+)
+def capture(agent: str | None, session_dir: str | None, session: str | None) -> None:
     """Capture the agent's trajectory for the current workspace.
 
     In container mode, the session directory is detected automatically.
@@ -1566,6 +1669,8 @@ def capture(agent: str | None, session_dir: str | None) -> None:
     except click.ClickException:
         sess = None
         ws = Path.cwd().resolve()
+
+    _validate_session_flags(sess, session, session_dir)
 
     # Discover session directory
     resolved_session_dir: Path | None = None
@@ -1604,10 +1709,29 @@ def capture(agent: str | None, session_dir: str | None) -> None:
                 )
         if agent:
             harbor_td = _harbor_trial_dir(ws)
-            click.echo(f"Extracting {agent} trajectory from container logs.")
-            container_agent_context = harbor_bridge.extract_agent_context(
-                agent, harbor_td / "agent"
-            )
+            agent_dir = harbor_td / "agent"
+            if session:
+                session_path = agent_dir / "exec" / session
+                if not session_path.is_dir():
+                    raise click.ClickException(
+                        f"Session {session!r} not found in {agent_dir}."
+                    )
+                click.echo(f"Extracting {agent} trajectory ({session}).")
+                container_agent_context = harbor_bridge.extract_agent_context(
+                    agent, session_path
+                )
+            else:
+                sessions = harbor_bridge.get_agent_session_dirs(agent_dir, agent)
+                ts = f" ({sessions[0].name})" if sessions else ""
+                click.echo(f"Extracting {agent} trajectory{ts}.")
+                if len(sessions) > 1:
+                    click.echo(
+                        f"  (using latest of {len(sessions)} sessions"
+                        " — pass --session <timestamp> to select)"
+                    )
+                container_agent_context = harbor_bridge.extract_agent_context(
+                    agent, agent_dir
+                )
             if not container_agent_context:
                 raise click.ClickException(
                     "Could not extract agent session from container.\n"
