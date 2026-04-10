@@ -221,17 +221,30 @@ def _tar_copy_from_container(container: str, workdir: str, workspace: Path) -> N
             ".",
         ],
         stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
     ) as tar_create:
         extract = subprocess.run(
             ["tar", "-xf", "-", "--no-same-owner", "-C", str(workspace)],
             stdin=tar_create.stdout,
             env={**os.environ, "COPYFILE_DISABLE": "1"},
+            capture_output=True,
         )
+        if tar_create.stdout is not None:
+            tar_create.stdout.close()
         tar_create.wait()
-    if tar_create.returncode != 0 or extract.returncode != 0:
+        tar_create_stderr = b""
+        if tar_create.stderr is not None:
+            tar_create_stderr = tar_create.stderr.read()
+    if extract.returncode != 0:
+        stderr = extract.stderr.decode(errors="replace").strip()
         raise click.ClickException(
-            f"tar copy from container failed (create={tar_create.returncode}, "
-            f"extract={extract.returncode})"
+            f"Failed to extract container files to workspace: "
+            f"{stderr or 'tar extraction failed'}"
+        )
+    if tar_create.returncode != 0:
+        stderr = tar_create_stderr.decode(errors="replace").strip()
+        raise click.ClickException(
+            f"Failed to archive container files: {stderr or 'tar create failed'}"
         )
 
 
