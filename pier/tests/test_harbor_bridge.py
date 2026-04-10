@@ -3,18 +3,23 @@
 import json
 from datetime import datetime, timezone
 from pathlib import Path
+from unittest.mock import MagicMock, patch
 
 import pytest
 
 from pier.harbor_bridge import (
     _bridge_claude_code,
+    _latest_session_dir,
     create_synthetic_task_dir,
     _get_dockerfile_workdir,
     _write_mounts_compose,
     build_trial_result_json,
+    get_agent_binary,
     get_compose_project,
     get_agent_exec_env,
+    get_post_run_commands,
     get_container_name,
+    get_log_capture_env,
     is_valid_agent,
 )
 
@@ -278,7 +283,8 @@ class TestBridgeClaudeCode:
 class TestGetAgentExecEnv:
     def test_claude_code_env(self):
         env, path_prefix = get_agent_exec_env("claude-code")
-        assert env["CLAUDE_CONFIG_DIR"] == "/logs/agent/sessions"
+        # CLAUDE_CONFIG_DIR is now in get_log_capture_env(), not here.
+        assert "CLAUDE_CONFIG_DIR" not in env
         assert env["IS_SANDBOX"] == "1"
         assert path_prefix == "$HOME/.local/bin"
 
@@ -295,10 +301,8 @@ class TestGetAgentExecEnv:
     )
     def test_nvm_agent_path_prefix(self, agent_name: str):
         env, path_prefix = get_agent_exec_env(agent_name)
-        if agent_name == "codex":
-            assert env["CODEX_HOME"] == "/logs/agent"
-        else:
-            assert env == {}
+        # CODEX_HOME is now in get_log_capture_env(), not here.
+        assert env == {}
         assert (
             path_prefix
             == '$(find "$HOME/.nvm/versions/node" -mindepth 1 -maxdepth 1 -type d '
@@ -425,3 +429,187 @@ class TestExecInContainer:
         cmd_str = " ".join(args)
         assert "$HOME/.local/bin" in cmd_str
         assert "claude" in cmd_str
+
+
+class TestGetLogCaptureEnv:
+    def test_returns_config_dir_env_vars(self):
+        env = get_log_capture_env()
+        assert env["CLAUDE_CONFIG_DIR"] == "/logs/agent/sessions"
+        assert env["CODEX_HOME"] == "/logs/agent"
+
+    def test_values_derived_from_harbor(self):
+        """Env var values match what Harbor's EnvironmentPaths says."""
+        from harbor.models.trial.paths import EnvironmentPaths
+
+        env = get_log_capture_env()
+        assert (
+            env["CLAUDE_CONFIG_DIR"]
+            == (EnvironmentPaths.agent_dir / "sessions").as_posix()
+        )
+        assert env["CODEX_HOME"] == EnvironmentPaths.agent_dir.as_posix()
+
+
+class TestGetAgentBinary:
+    def test_claude_code(self):
+        assert get_agent_binary("claude-code") == "claude"
+
+    def test_codex(self):
+        assert get_agent_binary("codex") == "codex"
+
+    def test_cursor_cli(self):
+        assert get_agent_binary("cursor-cli") == "cursor-agent"
+
+    def test_goose(self):
+        assert get_agent_binary("goose") == "goose"
+
+    def test_unknown_agent_returns_none(self):
+        assert get_agent_binary("nonexistent-agent") is None
+
+
+class TestExecInContainerTee:
+    def test_script_wraps_command(self, tmp_path: Path):
+        from pier.harbor_bridge import exec_in_container
+
+        with (
+            patch("subprocess.run", return_value=MagicMock(returncode=0)) as mock_run,
+            patch("sys.stdin") as mock_stdin,
+        ):
+            mock_stdin.isatty.return_value = True
+            exec_in_container(
+                "pier-ws",
+                tmp_path,
+                ["claude", "--print", "hello"],
+                log_path="/logs/agent/exec/2026-01-01_00-00-00/claude-code.txt",
+            )
+        args = mock_run.call_args[0][0]
+        assert "sh" in args
+        assert "-c" in args
+        cmd_str = args[args.index("-c") + 1]
+        assert "script -q -c" in cmd_str
+        assert "/logs/agent/exec/2026-01-01_00-00-00/claude-code.txt" in cmd_str
+        # script preserves TTY — -it should still be present
+        assert "-it" in args
+
+    def test_no_tee_without_flag(self, tmp_path: Path):
+        from pier.harbor_bridge import exec_in_container
+
+        with patch("subprocess.run", return_value=MagicMock(returncode=0)) as mock_run:
+            exec_in_container("pier-ws", tmp_path, ["bash"])
+        args = mock_run.call_args[0][0]
+        cmd_str = " ".join(args)
+        assert "tee" not in cmd_str
+
+
+class TestLogCapturePipeline:
+    """End-to-end: raw agent output → trajectory → trial result."""
+
+    def test_script_output_produces_valid_trial(self, tmp_path: Path):
+        """script(1) output with ANSI codes → extract → assemble → valid
+        TrialResult that pier view/summarize can read.
+        """
+        from pier.harbor_bridge import extract_agent_logs
+        from pier.trajectory import assemble_trial
+
+        # Simulate script(1) output with ANSI codes.
+        session_dir = tmp_path / "session"
+        session_dir.mkdir()
+        (session_dir / "goose.txt").write_text(
+            "Script started on 2026-04-10 00:00:00+00:00\n"
+            "\x1b[1m> goose\x1b[0m starting session...\n"
+            "--- \x1b[32mtool_call\x1b[0m: bash ---\n"
+            "echo hello\n"
+            "--- \x1b[32mresult\x1b[0m ---\n"
+            "hello\n"
+            "Script done on 2026-04-10 00:01:00+00:00\n"
+        )
+
+        # Step 1: extract_agent_logs (same as verify/capture).
+        trial_dir = tmp_path / "trial"
+        trial_dir.mkdir()
+        agent_context = extract_agent_logs("goose", session_dir, trial_dir / "agent")
+        assert (trial_dir / "agent" / "trajectory.json").exists()
+
+        # Step 2: assemble_trial (same as verify/capture).
+        task_dir = tmp_path / "task"
+        task_dir.mkdir()
+        (task_dir / "task.toml").write_text(
+            '[metadata]\nauthor_name = "test"\n[environment]\n[verifier]\n[agent]\n'
+        )
+        (task_dir / "instruction.md").write_text("")
+        assemble_trial(
+            trial_dir,
+            task_dir,
+            "test-task",
+            "test-session",
+            {"reward": 1.0},
+            agent_name="goose",
+            agent_context=agent_context,
+        )
+
+        # Step 3: result.json must be valid for Harbor's viewer/summarizer.
+        result_json = trial_dir / "result.json"
+        assert result_json.exists()
+        from harbor.models.trial.result import TrialResult
+
+        result = TrialResult.model_validate_json(result_json.read_text())
+        assert result.agent_info.name == "goose"
+
+
+class TestLatestRunDir:
+    def test_returns_none_when_no_runs(self, tmp_path: Path):
+        agent_dir = tmp_path / "agent"
+        agent_dir.mkdir()
+        assert _latest_session_dir(agent_dir, "claude-code") is None
+
+    def test_returns_none_when_empty(self, tmp_path: Path):
+        agent_dir = tmp_path / "agent"
+        (agent_dir / "exec").mkdir(parents=True)
+        assert _latest_session_dir(agent_dir, "claude-code") is None
+
+    def test_finds_run_with_tee_file(self, tmp_path: Path):
+        agent_dir = tmp_path / "agent"
+        run = agent_dir / "exec" / "2026-01-01_00-00-00"
+        run.mkdir(parents=True)
+        (run / "claude-code.txt").write_text("output\n")
+        assert _latest_session_dir(agent_dir, "claude-code") == run
+
+    def test_finds_run_with_sessions(self, tmp_path: Path):
+        agent_dir = tmp_path / "agent"
+        run = agent_dir / "exec" / "2026-01-01_00-00-00"
+        (run / "sessions").mkdir(parents=True)
+        assert _latest_session_dir(agent_dir, "claude-code") == run
+
+    def test_picks_most_recent(self, tmp_path: Path):
+        agent_dir = tmp_path / "agent"
+        old = agent_dir / "exec" / "2026-01-01_00-00-00"
+        old.mkdir(parents=True)
+        (old / "claude-code.txt").write_text("old\n")
+        new = agent_dir / "exec" / "2026-01-01_00-05-00"
+        new.mkdir(parents=True)
+        (new / "claude-code.txt").write_text("new\n")
+        assert _latest_session_dir(agent_dir, "claude-code") == new
+
+    def test_skips_runs_for_other_agents(self, tmp_path: Path):
+        agent_dir = tmp_path / "agent"
+        goose_run = agent_dir / "exec" / "2026-01-01_00-05-00"
+        goose_run.mkdir(parents=True)
+        (goose_run / "goose.txt").write_text("output\n")
+        assert _latest_session_dir(agent_dir, "claude-code") is None
+
+
+class TestGetPostRunCommands:
+    def test_gemini_copies_trajectory(self):
+        cmds = get_post_run_commands("gemini-cli", "/logs/agent/ts")
+        assert len(cmds) == 1
+        assert "gemini-cli.trajectory.json" in cmds[0]
+        assert "/logs/agent/ts" in cmds[0]
+
+    def test_hermes_exports_session(self):
+        cmds = get_post_run_commands("hermes", "/logs/agent/ts")
+        assert len(cmds) == 1
+        assert "hermes-session.jsonl" in cmds[0]
+        assert "/logs/agent/ts" in cmds[0]
+
+    def test_unknown_agent_returns_empty(self):
+        assert get_post_run_commands("claude-code", "/logs/agent/ts") == []
+        assert get_post_run_commands("goose", "/logs/agent/ts") == []

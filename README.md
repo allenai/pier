@@ -160,11 +160,11 @@ Run a command in the workspace context. Sets workspace env vars so task CLIs fin
 
 ```bash
 pier exec bash
-pier exec claude
+pier exec claude                    # agent auto-detected → full output captured
 pier exec -d -- quarto preview --port 8888 --host 0.0.0.0 --no-browse
 ```
 
-- **Container mode**: delegates to `docker exec` in the container's working directory
+- **Container mode**: delegates to `docker exec` in the container's working directory. Agent commands are auto-detected and their output is recorded via `script`. Each exec gets its own timestamped directory so sessions don't overwrite each other. `CLAUDE_CONFIG_DIR` and `CODEX_HOME` are always set so structured session logs land in the mounted volume.
 - **Host mode**: runs the command directly with `TASK_WORKSPACE` set
 - `-d` / `--detach`: runs in the background (useful for servers like quarto preview)
 
@@ -223,34 +223,4 @@ Install task skills for your coding agent (host mode only). Reads `skills_dir` f
 
 ## Development
 
-### Architecture
-
-Pier stays **agent-agnostic** — it should not need changes when Harbor adds a new agent. Agent-specific details (session layouts, env vars, detection heuristics) belong in Harbor, not pier. `pier/harbor_bridge.py` is the thin boundary between the two; when it must contain agent-specific code, it should be treated as temporary scaffolding until Harbor exposes the right API. `pier/cli.py` should never reference individual agent names.
-
-```bash
-git clone https://github.com/allenai/pier && cd pier
-make check                      # run tests, lint, and typecheck
-uv run pre-commit install       # optional: auto-lint and format on commit
-uv tool install -e .                # editable install — use `pier` from any directory
-```
-
-### Testing
-
-Default test runs stay fast and skip Docker-backed agent install smoke tests:
-
-```bash
-uv run --extra dev pytest -rs
-```
-
-Run the Docker-backed agent integration suite explicitly:
-
-```bash
-PIER_RUN_DOCKER_INTEGRATION=1 uv run --extra dev pytest -rs pier/tests/test_agent_integration.py
-```
-
-Optional selectors for the integration suite:
-
-```bash
-PIER_RUN_DOCKER_INTEGRATION=1 PIER_TEST_AGENTS=codex uv run --extra dev pytest -rs pier/tests/test_agent_integration.py
-PIER_RUN_DOCKER_INTEGRATION=1 PIER_TEST_IMAGE=ubuntu:24.04 uv run --extra dev pytest -rs pier/tests/test_agent_integration.py
-```
+See [DEVELOPER.md](DEVELOPER.md) for setup, testing, and architecture.
