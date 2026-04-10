@@ -33,7 +33,7 @@ pier skills             # install task skills for your agent
 
 - `--agent` installs a [supported coding agent](https://github.com/laude-institute/harbor) and registers skills from `skills_dir` in task.toml. Optional — without it you get a plain workspace. To install multiple agents, run `pier start --agent <name>` again from the workspace.
 - `--image` accepts any Docker image — a stock OS, a project image with tools pre-installed, etc.
-- `--no-mount` keeps files inside the container only (no bind-mount to host). `pier stop` copies files back.
+- `--no-mount` keeps workspace files inside the container only (no bind-mount to host). `pier stop` copies files back. Note: Harbor's internal mounts (agent logs, verifier output) still write to the host under `.pier/`.
 - `-f` / `--force` allows starting in a non-empty directory.
 
 ### Work in the workspace
@@ -67,8 +67,8 @@ pier verify             # run tests/test.sh, print reward, save results and traj
 Without a Harbor task (e.g. `--image` mode), save the trajectory with `pier capture`:
 
 ```bash
-pier capture                        # save trajectory to .pier/trials/
-pier capture --session-dir <path>   # from any agent session outside pier
+pier capture                                       # save trajectory to .pier/trials/
+pier capture --session-dir <path> -a claude-code   # from any agent session outside pier
 ```
 
 Browse, export, and review:
@@ -104,14 +104,14 @@ cp -r harbor/examples/tasks/hello-world ./tasks/my-task
 
 ### `pier capture`
 
-Extract the agent's trajectory for the current workspace. No Harbor task required.
+Extract the agent's trajectory (conversation, tool use, and cost data) for the current workspace. No Harbor task required.
 
 ```bash
-pier capture --session-dir <path-to-agent-session-logs>
-pier capture --session-dir PATH -a claude-code   # specify agent explicitly
+pier capture                                       # container mode with registered agent
+pier capture --session-dir <path> -a claude-code   # host mode or external session
 ```
 
-In container mode (with `--agent` installed), the session directory is detected automatically — no `--session-dir` needed. Outside a container, `--session-dir` is required. The agent type is auto-detected from the session contents; use `-a` to override.
+In container mode with a registered agent (`pier start --agent`), the trajectory is extracted automatically. Otherwise, pass `--session-dir` and `-a` to specify the session location and agent. In container mode, `--session-dir` refers to a path inside the container.
 
 ### `pier traces`
 
@@ -149,7 +149,7 @@ pier start                                  # restart a stopped container
 - `--mounts-json` adds volume mounts as a JSON array (e.g., `--mounts-json '["./skills:/opt/skills:ro"]'`).
 - `-e` passes container-mode environment variables in `KEY=VALUE` format (repeatable). Stored in the session and forwarded on every `pier exec`.
 - `--env-file` loads container-mode environment variables from a `.env` file. Same behavior as `-e` for each line.
-- `--no-mount` keeps files inside the container only (no bind-mount to host). `pier stop` copies files back.
+- `--no-mount` keeps workspace files inside the container only (no bind-mount to host). `pier stop` copies files back. Note: Harbor's internal mounts (agent logs, verifier output) still write to the host under `.pier/`.
 - `-f` / `--force` allows starting in a non-empty directory.
 - `--host` skips the container (workspace only).
 - `--agent` installs a coding agent. To install additional agents, run `pier start --agent <name>` again from the workspace. When `task_path` is omitted, it operates on the current workspace.
@@ -173,11 +173,13 @@ pier exec -d -- quarto preview --port 8888 --host 0.0.0.0 --no-browse
 Run the verifier and report the reward (requires a Harbor task). Each run creates a timestamped directory under `<workspace>/.pier/trials/` in Harbor's trial format.
 
 ```bash
-pier verify
+pier verify                          # uses agent from pier start --agent
 ```
 
-- **Container mode**: uses Harbor's `Verifier` (same verifier as `harbor run`). The agent's trajectory is extracted automatically when an agent is installed.
-- **Host mode**: spins up a temporary container to run the verifier, then tears it down. Pass `--session-dir` to capture the trajectory.
+The agent is inferred from the session (set by `pier start --agent`). If no agent is registered, the verifier still runs and saves the reward but the trajectory (conversation, tool use, and cost data) is skipped.
+
+- **Container mode**: uses Harbor's `Verifier` (same verifier as `harbor run`). The trajectory is captured automatically when an agent is registered. For unregistered agents (e.g. baked into the image), pass `--session-dir` (container path) and `-a`.
+- **Host mode**: spins up a temporary container to run the verifier, then tears it down. Pass `--session-dir` and `-a` to capture the trajectory.
 
 ### `pier stop`
 
@@ -220,6 +222,10 @@ Install task skills for your coding agent (host mode only). Reads `skills_dir` f
 
 
 ## Development
+
+### Architecture
+
+Pier stays **agent-agnostic** — it should not need changes when Harbor adds a new agent. Agent-specific details (session layouts, env vars, detection heuristics) belong in Harbor, not pier. `pier/harbor_bridge.py` is the thin boundary between the two; when it must contain agent-specific code, it should be treated as temporary scaffolding until Harbor exposes the right API. `pier/cli.py` should never reference individual agent names.
 
 ```bash
 git clone https://github.com/allenai/pier && cd pier

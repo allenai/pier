@@ -643,7 +643,7 @@ def build_trial_result_json(
     agent_cfg = AgentConfig(name=agent_name) if agent_name else AgentConfig()
     config = TrialConfig(task=task_config, trial_name=session_name, agent=agent_cfg)
 
-    agent_info = AgentInfo(name=agent_name or "human", version="unknown")
+    agent_info = AgentInfo(name=agent_name or "unknown", version="unknown")
 
     verifier_result = VerifierResult(rewards=reward) if reward else None
 
@@ -748,84 +748,6 @@ def _bridge_claude_code(session_dir: Path, logs_dir: Path) -> None:
 _AGENT_BRIDGE: dict[str, Callable[[Path, Path], None]] = {
     "claude-code": _bridge_claude_code,
 }
-
-# Heuristics to detect which agent produced a session directory.
-# Each entry maps an agent name to a predicate on the session_dir.
-_AGENT_DETECT: dict[str, Callable[[Path], bool]] = {
-    "claude-code": lambda d: any(d.glob("*.jsonl")),
-}
-
-
-def detect_agent_from_session_dir(session_dir: Path) -> str | None:
-    """Guess the agent name from the contents of a session directory.
-
-    Returns the agent name (e.g. ``"claude-code"``) or None if no known
-    pattern matches.
-    """
-    for agent_name, check in _AGENT_DETECT.items():
-        try:
-            if check(session_dir):
-                return agent_name
-        except OSError:
-            continue
-    return None
-
-
-def find_container_agent_session_dir(
-    agent_name: str, harbor_agent_dir: Path
-) -> Path | None:
-    """Find an agent's session directory within the container's mounted agent dir.
-
-    When CLAUDE_CONFIG_DIR is set during ``pier exec``, Claude writes session
-    JSONL to ``harbor_agent_dir/sessions/projects/<hash>/``.  This function
-    finds that project directory so it can be passed to ``extract_agent_logs``.
-
-    Returns None if the agent isn't supported or no unambiguous session is found.
-    """
-    detect = _AGENT_DETECT.get(agent_name)
-    direct_log_agents = {
-        "cursor-cli": "cursor-cli.txt",
-        "gemini-cli": "gemini-cli.trajectory.json",
-        "kimi-cli": "kimi-cli.txt",
-        "opencode": "opencode.txt",
-    }
-    if agent_name == "claude-code" and detect:
-        projects_dir = harbor_agent_dir / "sessions" / "projects"
-        if projects_dir.is_dir():
-            project_dirs = [
-                d for d in projects_dir.iterdir() if d.is_dir() and detect(d)
-            ]
-            if len(project_dirs) == 1:
-                return project_dirs[0]
-            if len(project_dirs) > 1:
-                logger.warning(
-                    "Multiple Claude session dirs found in %s; "
-                    "pass --session-dir explicitly",
-                    projects_dir,
-                )
-    elif agent_name == "codex":
-        sessions_dir = harbor_agent_dir / "sessions"
-        if sessions_dir.is_dir():
-            session_dirs = [d for d in sessions_dir.rglob("*") if d.is_dir()]
-            if session_dirs:
-                max_depth = max(len(d.parts) for d in session_dirs)
-                session_dirs = [d for d in session_dirs if len(d.parts) == max_depth]
-                if len(session_dirs) == 1:
-                    return session_dirs[0]
-                if len(session_dirs) > 1:
-                    logger.warning(
-                        "Multiple Codex session dirs found in %s; "
-                        "pass --session-dir explicitly",
-                        sessions_dir,
-                    )
-    elif agent_name == "qwen-coder":
-        sessions_dir = harbor_agent_dir / "qwen-sessions"
-        if sessions_dir.is_dir() and any(sessions_dir.rglob("*.jsonl")):
-            return harbor_agent_dir
-    elif agent_name in direct_log_agents:
-        if (harbor_agent_dir / direct_log_agents[agent_name]).exists():
-            return harbor_agent_dir
-    return None
 
 
 def get_agent_exec_env(agent_name: str) -> tuple[dict[str, str], str]:
@@ -954,10 +876,6 @@ def extract_agent_logs(
         Dict with cost_usd, n_input_tokens, etc. — or None if extraction
         failed.
     """
-    from harbor.agents.factory import AgentFactory
-    from harbor.models.agent.context import AgentContext
-    from harbor.models.agent.name import AgentName
-
     bridge = _AGENT_BRIDGE.get(agent_name)
     if bridge is not None:
         bridge(session_dir, logs_dir)
@@ -970,6 +888,21 @@ def extract_agent_logs(
             if not link.exists():
                 link.symlink_to(item.resolve())
 
+    return extract_agent_context(agent_name, logs_dir)
+
+
+def extract_agent_context(agent_name: str, logs_dir: Path) -> dict | None:
+    """Extract trajectory and usage from an agent's logs directory.
+
+    Expects ``logs_dir`` to already be in the layout Harbor's agent reader
+    expects (e.g. container mode where CLAUDE_CONFIG_DIR points into the
+    trial's agent dir).  :func:`extract_agent_logs` calls this after first
+    bridging an external session directory into the right layout.
+    """
+    from harbor.agents.factory import AgentFactory
+    from harbor.models.agent.context import AgentContext
+    from harbor.models.agent.name import AgentName
+
     agent = AgentFactory.create_agent_from_name(
         AgentName(agent_name), logs_dir=logs_dir
     )
@@ -981,7 +914,7 @@ def extract_agent_logs(
         logger.warning(
             "Failed to extract logs for %r from %s",
             agent_name,
-            session_dir,
+            logs_dir,
             exc_info=True,
         )
         return None

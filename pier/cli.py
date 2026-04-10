@@ -221,17 +221,30 @@ def _tar_copy_from_container(container: str, workdir: str, workspace: Path) -> N
             ".",
         ],
         stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
     ) as tar_create:
         extract = subprocess.run(
             ["tar", "-xf", "-", "--no-same-owner", "-C", str(workspace)],
             stdin=tar_create.stdout,
             env={**os.environ, "COPYFILE_DISABLE": "1"},
+            capture_output=True,
         )
+        if tar_create.stdout is not None:
+            tar_create.stdout.close()
         tar_create.wait()
-    if tar_create.returncode != 0 or extract.returncode != 0:
+        tar_create_stderr = b""
+        if tar_create.stderr is not None:
+            tar_create_stderr = tar_create.stderr.read()
+    if extract.returncode != 0:
+        stderr = extract.stderr.decode(errors="replace").strip()
         raise click.ClickException(
-            f"tar copy from container failed (create={tar_create.returncode}, "
-            f"extract={extract.returncode})"
+            f"Failed to extract container files to workspace: "
+            f"{stderr or 'tar extraction failed'}"
+        )
+    if tar_create.returncode != 0:
+        stderr = tar_create_stderr.decode(errors="replace").strip()
+        raise click.ClickException(
+            f"Failed to archive container files: {stderr or 'tar create failed'}"
         )
 
 
@@ -424,6 +437,23 @@ def _print_reward(reward: dict) -> None:
             click.echo(f"  {k}: {v}")
 
 
+def _copy_session_from_container(
+    harbor_session_id: str, container_path: str, dest: Path
+) -> None:
+    """Copy an agent session directory from a running container to the host."""
+    container = harbor_bridge.get_container_name(harbor_session_id)
+    result = subprocess.run(
+        ["docker", "cp", f"{container}:{container_path}", str(dest)],
+        capture_output=True,
+    )
+    if result.returncode != 0:
+        raise click.ClickException(
+            f"Failed to copy {container_path} from container.\n"
+            f"  {result.stderr.decode().strip()}"
+        )
+    click.echo("Copied agent session from container.")
+
+
 def _assemble_trial_output(
     trial_dir: Path,
     sess: dict,
@@ -433,31 +463,39 @@ def _assemble_trial_output(
     workspace: Path,
     agent: str | None,
     session_dir: str | None,
+    *,
+    agent_context: dict | None = None,
 ) -> None:
     """Assemble trial directory with trajectory and optional agent logs."""
     from pier.trajectory import assemble_trial
 
-    agent_context = None
-
-    if session_dir:
-        # Auto-detect agent from session_dir if not specified
+    if agent_context:
+        click.echo("Agent trajectory extracted.")
+    elif session_dir:
         if not agent:
-            agent = harbor_bridge.detect_agent_from_session_dir(Path(session_dir))
-            if agent:
-                click.echo(f"Detected agent: {agent}")
-
-        if agent:
-            agent_context = harbor_bridge.extract_agent_logs(
-                agent,
-                Path(session_dir),
-                trial_dir / "agent",
+            raise click.ClickException(
+                "Pass -a/--agent with --session-dir to specify the agent."
             )
-            if agent_context:
-                click.echo("Agent trajectory extracted.")
-            else:
-                click.echo("Warning: trajectory extraction returned no data.", err=True)
+        agent_context = harbor_bridge.extract_agent_logs(
+            agent,
+            Path(session_dir),
+            trial_dir / "agent",
+        )
+        if agent_context:
+            click.echo("Agent trajectory extracted.")
+        else:
+            click.echo("Warning: trajectory extraction returned no data.", err=True)
     elif agent:
-        click.echo(f"Tip: pass --session-dir to extract {agent} trajectory.")
+        click.echo(f"Tip: pass --session-dir to capture {agent} trajectory.")
+    else:
+        msg = (
+            "No agent specified — reward saved, but trajectory "
+            "(conversation, tool use, cost) was not captured.\n"
+            "  To include it: pier verify --agent <name> --session-dir <path>"
+        )
+        if sess.get("mode") == "container":
+            msg += "\n  To auto-detect next time: pier start --agent <name>"
+        click.echo(msg)
 
     label = _workspace_label(workspace)
     assemble_trial(
@@ -703,7 +741,11 @@ def start(
 
     if host:
         if agent:
-            click.echo("Hint: --agent is for container mode.")
+            raise click.ClickException(
+                "--agent is for container mode (installs the agent and configures "
+                "session capture). In host mode, agents run directly on your machine.\n"
+                "  To capture conversation data: pass --session-dir and -a on verify/capture"
+            )
         _start_host(task_dir, workspace)
     else:
         _start_container(
@@ -714,6 +756,11 @@ def start(
             extra_mounts=extra_mounts,
             extra_env=extra_env_list,
             no_mount=no_mount,
+        )
+
+    if not host and not agent:
+        click.echo(
+            "\nTip: pier start --agent <name> to install an agent and enable trajectory capture."
         )
 
 
@@ -1092,8 +1139,7 @@ def _exec_host(sess: dict, workspace: Path, command: list[str]) -> None:
 @click.option(
     "--session-dir",
     default=None,
-    type=click.Path(exists=True, file_okay=False),
-    help="Agent session/log directory for trajectory extraction.",
+    help="Agent session/log directory (container path in container mode, host path otherwise).",
 )
 def verify(
     trial_dir: str | None,
@@ -1102,24 +1148,59 @@ def verify(
 ) -> None:
     """Run the verifier for the current workspace.
 
-    Executes the verifier and reports the reward. Optionally assembles
-    a trial directory with trajectory data.
+    Executes the verifier and reports the reward. When an agent is known
+    (from the session or ``--agent``), trajectory and cost data are captured.
     """
     sess, ws = _resolve_workspace()
+
+    # When --session-dir is explicit, require -a (don't infer — the session
+    # files might be from a different agent than the one registered).
+    if session_dir and not agent:
+        agents = sess.get("agents", [])
+        msg = "Pass -a/--agent with --session-dir to specify the agent."
+        if len(agents) == 1:
+            msg += (
+                f"\n  Or omit --session-dir to use {agents[0]}'s session automatically."
+            )
+        raise click.ClickException(msg)
 
     # Default agent from session if not explicitly provided
     if not agent:
         agents = sess.get("agents", [])
         if len(agents) == 1:
             agent = agents[0]
+            click.echo(f"Using agent from session: {agent}")
+        elif agents:
+            names = ", ".join(agents)
+            raise click.ClickException(
+                f"Multiple agents registered ({names}). "
+                f"Pass -a/--agent to select one.\n"
+                f"  e.g. pier verify --agent {agents[0]}"
+            )
+
+    # Validate --session-dir in non-container mode (host path must exist)
+    if session_dir and sess.get("mode") != "container":
+        p = Path(session_dir)
+        if not p.is_dir():
+            raise click.ClickException(
+                f"--session-dir {session_dir!r} is not a directory."
+            )
 
     if sess.get("mode") == "host":
         _verify_host(
-            sess, ws, trial_dir=trial_dir, agent=agent, session_dir=session_dir
+            sess,
+            ws,
+            trial_dir=trial_dir,
+            agent=agent,
+            session_dir=session_dir,
         )
     else:
         _verify_container(
-            sess, ws, trial_dir=trial_dir, agent=agent, session_dir=session_dir
+            sess,
+            ws,
+            trial_dir=trial_dir,
+            agent=agent,
+            session_dir=session_dir,
         )
 
 
@@ -1179,15 +1260,26 @@ def _verify_container(
 
     _print_reward(reward)
 
-    # Container mode: auto-detect agent session dir from the mounted logs
+    # In container mode, agent logs are already in Harbor's expected layout
+    # under harbor_td/agent/ — let Harbor find sessions directly rather than
+    # reimplementing its detection logic in pier.
+    container_agent_context = None
     if agent and not session_dir:
-        container_session = harbor_bridge.find_container_agent_session_dir(
+        click.echo(f"Extracting {agent} trajectory from container logs.")
+        container_agent_context = harbor_bridge.extract_agent_context(
             agent, harbor_td / "agent"
         )
-        if container_session:
-            session_dir = str(container_session)
-            click.echo(f"Extracting {agent} trajectory from container logs.")
-            click.echo("  (override with --session-dir to use a different session)")
+        if not container_agent_context:
+            click.echo(
+                "Warning: trajectory extraction returned no data. "
+                "Try --session-dir to specify the session location.",
+                err=True,
+            )
+    elif agent and session_dir:
+        # --session-dir in container mode is a path inside the container.
+        host_session = verify_trial_dir / "agent_session"
+        _copy_session_from_container(hsid, session_dir, host_session)
+        session_dir = str(host_session)
 
     _assemble_trial_output(
         verify_trial_dir,
@@ -1198,6 +1290,7 @@ def _verify_container(
         workspace,
         agent,
         session_dir,
+        agent_context=container_agent_context,
     )
 
 
@@ -1447,13 +1540,12 @@ def _install_skills_from_dir(skills_dir: Path, workspace: Path) -> None:
     "-a",
     "--agent",
     default=None,
-    help="Agent name (e.g. claude-code). Auto-detected if omitted.",
+    help="Agent name (e.g. claude-code). Inferred from session if omitted; required with --session-dir.",
 )
 @click.option(
     "--session-dir",
     default=None,
-    type=click.Path(exists=True, file_okay=False),
-    help="Agent session/log directory. Auto-discovered if omitted.",
+    help="Agent session/log directory (container path in container mode, host path otherwise).",
 )
 def capture(agent: str | None, session_dir: str | None) -> None:
     """Capture the agent's trajectory for the current workspace.
@@ -1477,11 +1569,30 @@ def capture(agent: str | None, session_dir: str | None) -> None:
 
     # Discover session directory
     resolved_session_dir: Path | None = None
+    container_agent_context = None
+    _container_session_tmpdir: tempfile.TemporaryDirectory | None = None
 
-    if session_dir:
-        resolved_session_dir = Path(session_dir).resolve()
+    if session_dir and sess and sess.get("mode") == "container":
+        # --session-dir in container mode is a path inside the container.
+        if not agent:
+            raise click.ClickException(
+                "Pass -a/--agent with --session-dir to specify the agent."
+            )
+        hsid = _get_hsid(sess, ws)
+        _container_session_tmpdir = tempfile.TemporaryDirectory()
+        host_session = Path(_container_session_tmpdir.name) / "session"
+        _copy_session_from_container(hsid, session_dir, host_session)
+        resolved_session_dir = host_session
+    elif session_dir:
+        p = Path(session_dir)
+        if not p.is_dir():
+            raise click.ClickException(
+                f"--session-dir {session_dir!r} is not a directory."
+            )
+        resolved_session_dir = p.resolve()
     elif sess and sess.get("mode") == "container":
-        # Container mode: look inside the container's agent log directory
+        # Container mode: agent logs are already in Harbor's expected layout.
+        # Let Harbor find sessions directly via extract_agent_context.
         if not agent:
             agents = sess.get("agents", [])
             if len(agents) == 1:
@@ -1493,13 +1604,18 @@ def capture(agent: str | None, session_dir: str | None) -> None:
                 )
         if agent:
             harbor_td = _harbor_trial_dir(ws)
-            resolved_session_dir = harbor_bridge.find_container_agent_session_dir(
+            click.echo(f"Extracting {agent} trajectory from container logs.")
+            container_agent_context = harbor_bridge.extract_agent_context(
                 agent, harbor_td / "agent"
             )
-        if resolved_session_dir is None:
+            if not container_agent_context:
+                raise click.ClickException(
+                    "Could not extract agent session from container.\n"
+                    "Pass --session-dir to specify explicitly."
+                )
+        else:
             raise click.ClickException(
-                "Could not find agent session files in container.\n"
-                "Pass --session-dir to specify explicitly."
+                "No agent registered. Pass -a/--agent to specify one."
             )
     else:
         raise click.ClickException(
@@ -1507,16 +1623,12 @@ def capture(agent: str | None, session_dir: str | None) -> None:
             "  pier capture --session-dir ~/.claude/projects/<project-name>"
         )
 
-    # Auto-detect agent if not specified
-    if not agent:
-        agent = harbor_bridge.detect_agent_from_session_dir(resolved_session_dir)
-        if not agent:
-            raise click.ClickException(
-                f"Could not detect agent from {resolved_session_dir}. Specify with -a."
-            )
-        click.echo(f"Detected agent: {agent}")
+    if not agent and resolved_session_dir:
+        raise click.ClickException(
+            "Pass -a/--agent with --session-dir to specify the agent."
+        )
 
-    # Create trial directory and assemble (no reward — capture only)
+    # Create trial directory only after all validation passes.
     trial_dir = _new_trial_dir(ws)
     now = datetime.now(timezone.utc)
     fake_sess = sess or {"task_dir": str(ws), "task_ref": ws.name}
@@ -1528,7 +1640,8 @@ def capture(agent: str | None, session_dir: str | None) -> None:
         now,
         ws,
         agent,
-        str(resolved_session_dir),
+        str(resolved_session_dir) if resolved_session_dir else None,
+        agent_context=container_agent_context,
     )
 
 
