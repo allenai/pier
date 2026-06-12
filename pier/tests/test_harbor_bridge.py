@@ -154,13 +154,24 @@ class TestWriteMountsCompose:
 
 
 def _make_task_dir(tmp_path: Path) -> Path:
-    """Create a minimal task directory that Harbor's Task() can load."""
+    """Create a minimal task directory that Harbor's Task() can load.
+
+    Harbor >=0.7's ``Task._validate_tests`` requires the verifier script
+    (``tests/test.sh`` on Linux) to exist whenever no ``verifier.env`` is
+    declared, so this helper now creates a no-op script alongside the
+    task.toml + instruction.md.
+    """
     task = tmp_path / "my-task"
     task.mkdir()
     (task / "task.toml").write_text(
         "[metadata]\nauthor_name = 'test'\n[environment]\n[verifier]\n[agent]\n"
     )
     (task / "instruction.md").write_text("Do the thing.\n")
+    tests = task / "tests"
+    tests.mkdir()
+    test_sh = tests / "test.sh"
+    test_sh.write_text("#!/usr/bin/env bash\necho 1.0\n")
+    test_sh.chmod(0o755)
     return task
 
 
@@ -536,6 +547,11 @@ class TestLogCapturePipeline:
             '[metadata]\nauthor_name = "test"\n[environment]\n[verifier]\n[agent]\n'
         )
         (task_dir / "instruction.md").write_text("")
+        # Harbor >=0.7 ``Task._validate_tests`` requires the verifier
+        # script when ``verifier.env`` isn't declared.
+        (task_dir / "tests").mkdir()
+        (task_dir / "tests" / "test.sh").write_text("#!/usr/bin/env bash\necho 1.0\n")
+        (task_dir / "tests" / "test.sh").chmod(0o755)
         assemble_trial(
             trial_dir,
             task_dir,

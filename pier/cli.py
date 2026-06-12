@@ -12,6 +12,8 @@ Commands:
     pier stop                      — stop the container
     pier list                      — show active workspaces
     pier skills                    — install task skills (host mode)
+    pier skills compose -o <dir> <bundles>...  — merge skill bundles
+    pier start ... --skill <path>  — inject skill bundles into the agent
 """
 
 from __future__ import annotations
@@ -580,6 +582,19 @@ def cli():
     help="Don't bind-mount the workspace into the container. Files stay inside the container only.",
 )
 @click.option(
+    "--skill",
+    "skill_paths",
+    multiple=True,
+    type=click.Path(exists=False),
+    help=(
+        "Path to a skill directory (containing SKILL.md) or a root of skill "
+        "directories. Resolved via Harbor's resolve_skills (same shape as "
+        "``harbor run --skill``); composed under <ws>/.pier/skills/ and "
+        "bind-mounted at the task's [environment].skills_dir "
+        "(or /harbor/skills by default). Container mode only. Repeatable."
+    ),
+)
+@click.option(
     "-f",
     "--force",
     is_flag=True,
@@ -597,6 +612,7 @@ def start(
     extra_env_cli: tuple[str, ...],
     env_file: str | None,
     no_mount: bool,
+    skill_paths: tuple[str, ...],
     force: bool,
 ) -> None:
     """Launch a workspace, or install an agent into an existing one.
@@ -626,6 +642,12 @@ def start(
         raise click.ClickException("-e cannot be used with --host.")
     if host and env_file:
         raise click.ClickException("--env-file cannot be used with --host.")
+    if host and skill_paths:
+        raise click.ClickException(
+            "--skill is for container mode (bind-mounts a composed skills "
+            "dir into the container). In host mode, install skills directly "
+            "on the host with ``pier skills``."
+        )
 
     # Collect and validate extra env vars from -e and --env-file.
     # Stored in the session and forwarded on every pier exec.
@@ -640,6 +662,11 @@ def start(
         key, _, val = kv.partition("=")
         if key and _:
             os.environ[key] = val
+
+    # Sanitize before persisting — values for sensitive keys (KEY/SECRET/
+    # TOKEN/...) get rewritten to ``${KEY}`` if they match the host env,
+    # or redacted otherwise. Keeps cleartext secrets out of session.json.
+    extra_env_list = [harbor_bridge.sanitize_env_kv(kv) for kv in extra_env_list]
 
     # Task-free mode: --image without task_path
     if task_path is None and image:
@@ -749,6 +776,11 @@ def start(
             )
         _start_host(task_dir, workspace)
     else:
+        injected = _inject_skills([Path(p) for p in skill_paths], workspace, task_dir)
+        skills_dir_override: str | None = None
+        if injected:
+            mount, skills_dir_override = injected
+            extra_mounts = [*(extra_mounts or []), mount]
         _start_container(
             task_dir,
             workspace,
@@ -757,6 +789,7 @@ def start(
             extra_mounts=extra_mounts,
             extra_env=extra_env_list,
             no_mount=no_mount,
+            skills_dir_override=skills_dir_override,
         )
 
     if not host and not agent:
@@ -816,7 +849,68 @@ def _start_existing(agent: str | None) -> None:
         click.echo("Container is already running.")
 
 
+_HARBOR_DEFAULT_SKILLS_DIR = "/harbor/skills"
+
+
+def _inject_skills(
+    skill_paths: list[Path], workspace: Path, task_dir: Path
+) -> tuple[str, str] | None:
+    """Compose skill bundles into <workspace>/.pier/skills/ and return a
+    docker mount string targeting the task's [environment].skills_dir.
+
+    Reuses Harbor's resolve_skills primitive for path-shape detection
+    (single skill dir vs root-of-skills), dotfile skipping, and
+    last-wins-on-duplicate semantics — same behavior as
+    ``harbor run --skill``. Returns None if no bundles passed.
+
+    Pier diverges from Harbor's docker-cp upload (Trial mode) here:
+    pier bind-mounts the composed dir read-only. Better for the
+    interactive flow — edit a SKILL.md on the host and the change shows
+    up in the container without restart.
+    """
+    import shutil
+
+    if not skill_paths:
+        return None
+
+    try:
+        resolved = harbor_bridge.resolve_skill_paths(skill_paths)
+    except FileNotFoundError as e:
+        raise click.ClickException(str(e))
+    except ValueError as e:
+        raise click.ClickException(str(e))
+
+    if not resolved:
+        return None
+
+    # Determine the in-container target dir from task.toml, mirroring
+    # Harbor's _resolve_effective_skills_dir: explicit task setting wins
+    # (must be absolute when injecting); else default to /harbor/skills.
+    task_toml = _read_task_toml(task_dir)
+    container_skills_dir = (task_toml.get("environment") or {}).get(
+        "skills_dir", _HARBOR_DEFAULT_SKILLS_DIR
+    )
+    if not container_skills_dir.startswith("/"):
+        raise click.ClickException(
+            f"Injected skills require [environment].skills_dir to be "
+            f"absolute; got {container_skills_dir!r}. Use an absolute path "
+            f"or omit the setting to use the default ({_HARBOR_DEFAULT_SKILLS_DIR})."
+        )
+
+    host_skills_dir = _pier_dir(workspace) / "skills"
+    if host_skills_dir.exists():
+        shutil.rmtree(host_skills_dir)
+    host_skills_dir.mkdir(parents=True, exist_ok=True)
+    for name, src in resolved:
+        shutil.copytree(src, host_skills_dir / name)
+
+    mount = f"{host_skills_dir.resolve()}:{container_skills_dir}:ro"
+    return mount, container_skills_dir
+
+
 def _start_host(task_dir: Path, workspace: Path) -> None:
+    session_id = f"host-{uuid.uuid4().hex[:8]}"
+
     _save_session(
         workspace,
         {
@@ -824,6 +918,7 @@ def _start_host(task_dir: Path, workspace: Path) -> None:
             "task_dir": str(task_dir),
             "task_ref": task_dir.name,
             "started_at": datetime.now(timezone.utc).isoformat(),
+            "host_session_id": session_id,
         },
     )
 
@@ -839,13 +934,20 @@ def _install_agent(
     harbor_session_id: str,
     trial_dir: Path,
     agent: str,
+    skills_dir_override: str | None = None,
 ) -> None:
     """Validate and install a Harbor agent into a running container."""
     if not harbor_bridge.is_valid_agent(agent):
         raise click.ClickException(f"Unknown agent {agent!r}.")
     click.echo(f"Installing {agent} in the container...")
     try:
-        harbor_bridge.setup_agent(task_dir, harbor_session_id, trial_dir, agent)
+        harbor_bridge.setup_agent(
+            task_dir,
+            harbor_session_id,
+            trial_dir,
+            agent,
+            skills_dir_override=skills_dir_override,
+        )
         click.echo(f"{agent} installed.")
     except Exception as e:
         raise click.ClickException(f"Agent setup failed: {e}")
@@ -877,6 +979,7 @@ def _start_container(
     extra_mounts: list[str] | None = None,
     extra_env: list[str] | None = None,
     no_mount: bool = False,
+    skills_dir_override: str | None = None,
 ) -> None:
 
     hsid = _harbor_session_id(workspace)
@@ -925,7 +1028,13 @@ def _start_container(
             _tar_copy_to_container(workspace, container, workdir)
 
     for agent in agents or []:
-        _install_agent(task_dir, hsid, harbor_trial_dir, agent)
+        _install_agent(
+            task_dir,
+            hsid,
+            harbor_trial_dir,
+            agent,
+            skills_dir_override=skills_dir_override,
+        )
 
     _save_session(
         workspace,
@@ -1128,6 +1237,13 @@ def _exec_container(
     env: dict[str, str] = {}
     env.update(harbor_bridge.resolve_task_env(task_dir))
     for kv in sess.get("extra_env", []):
+        try:
+            kv = harbor_bridge.resolve_env_kv(kv)
+        except KeyError as e:
+            raise click.ClickException(
+                f"env var {e.args[0]} (referenced in session extra_env) is not "
+                f"set in the current shell — re-export it before running pier exec."
+            )
         key, _, val = kv.partition("=")
         if key:
             env[key] = val
@@ -1493,7 +1609,9 @@ def stop(workspace_dir: str | None) -> None:
     sess, workspace = _resolve_workspace(workspace_dir)
 
     if sess.get("mode") != "container":
-        raise click.ClickException("No container to stop (host-mode workspace).")
+        raise click.ClickException(
+            f"Nothing to stop — workspace {_workspace_label(workspace)!r} has no container."
+        )
 
     if sess.get("no_mount"):
         # Copy workspace files from container to host before stopping,
@@ -1557,16 +1675,21 @@ def list_workspaces() -> None:
 # ---------------------------------------------------------------------------
 
 
-@cli.command()
-def skills() -> None:
-    """Install task skills for your coding agent (host mode).
+@cli.group("skills", invoke_without_command=True)
+@click.pass_context
+def skills(ctx: click.Context) -> None:
+    """Skill loadout commands.
 
-    Reads skills_dir from task.toml, extracts skills from the task's
-    container image, and registers them via npx skills add.
-    In container mode with --agent, skills are installed automatically.
+    With no subcommand: install task skills for your coding agent
+    (host mode) — reads skills_dir from task.toml, extracts skills
+    from the task's container image, and registers them via npx skills add.
     """
-    sess, ws = _resolve_workspace()
+    if ctx.invoked_subcommand is None:
+        _skills_install_from_task()
 
+
+def _skills_install_from_task() -> None:
+    sess, ws = _resolve_workspace()
     if sess.get("mode") == "container":
         raise click.ClickException(
             "In container mode, skills are installed automatically with --agent."
@@ -1607,6 +1730,56 @@ def skills() -> None:
                 )
             except Exception:
                 pass
+
+
+@skills.command("compose")
+@click.option(
+    "-o",
+    "--output",
+    required=True,
+    type=click.Path(),
+    help="Output directory for the merged skill bundle.",
+)
+@click.argument("bundles", nargs=-1, type=click.Path(exists=False))
+def skills_compose(output: str, bundles: tuple[str, ...]) -> None:
+    """Merge skill bundles (host paths) into one directory.
+
+    Each BUNDLES arg is either a single skill directory (containing
+    SKILL.md) or a root containing skill subdirectories. Resolution uses
+    Harbor's ``resolve_skills``: same path-shape detection, dotfile
+    skipping, and last-wins-on-duplicate semantics as
+    ``harbor run --skill`` so the composed output matches what Harbor
+    would inject.
+
+    Use to assemble per-run skill loadouts then bind-mount the result at
+    the task's ``[environment].skills_dir`` (e.g. via pier's
+    ``--mounts-json``) — composing training-skills + asta-plugins for
+    +/- ablations.
+    """
+    try:
+        resolved = harbor_bridge.resolve_skill_paths([Path(b) for b in bundles])
+    except FileNotFoundError as e:
+        raise click.ClickException(str(e))
+    except ValueError as e:
+        raise click.ClickException(str(e))
+
+    if not resolved:
+        click.echo("No skills found in any bundle.", err=True)
+        return
+
+    out_path = Path(output)
+    out_path.mkdir(parents=True, exist_ok=True)
+    import shutil
+
+    for name, src in resolved:
+        dest = out_path / name
+        if dest.exists():
+            shutil.rmtree(dest)
+        shutil.copytree(src, dest)
+
+    click.echo(f"Composed {len(resolved)} skill(s) into {out_path}:")
+    for name, _ in resolved:
+        click.echo(f"  {name}")
 
 
 def _install_skills_from_dir(skills_dir: Path, workspace: Path) -> None:

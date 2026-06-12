@@ -862,7 +862,11 @@ def test_start_with_env_file(mock_start, runner, index_path, task_dir, tmp_path)
     import json
 
     sess = json.loads((ws / ".pier" / "session.json").read_text())
-    assert "ASTA_TOKEN=from-file" in sess["extra_env"]
+    # ASTA_TOKEN matches the sensitive-key regex (TOKEN); the literal is
+    # rewritten to a ${...} template so the secret doesn't land on disk.
+    # OTHER_VAR is non-sensitive and stays literal.
+    assert any(e.startswith("ASTA_TOKEN=") for e in sess["extra_env"])
+    assert "from-file" not in " ".join(sess["extra_env"])
     assert "OTHER_VAR=value" in sess["extra_env"]
 
 
@@ -887,7 +891,10 @@ def test_start_with_e_flag(mock_start, runner, index_path, task_dir, tmp_path):
     import json
 
     sess = json.loads((ws / ".pier" / "session.json").read_text())
-    assert "MY_KEY=val1" in sess["extra_env"]
+    # MY_KEY matches the sensitive-key regex; value redacted/templated.
+    assert any(e.startswith("MY_KEY=") for e in sess["extra_env"])
+    assert "val1" not in " ".join(sess["extra_env"])
+    # OTHER is non-sensitive, literal.
     assert "OTHER=val2" in sess["extra_env"]
 
 
@@ -1536,7 +1543,7 @@ def test_stop_host_errors(runner, index_path, tmp_path):
     _write_session(ws, _host_session(), index_path)
     result = runner.invoke(cli, ["stop"], catch_exceptions=False)
     assert result.exit_code != 0
-    assert "host" in result.output.lower()
+    assert "nothing to stop" in result.output.lower()
 
 
 # ---------------------------------------------------------------------------
@@ -3170,3 +3177,324 @@ def test_start_no_mount_copy_failure_errors(
 
     assert result.exit_code != 0
     assert "copy failed" in result.output
+
+
+# ---------------------------------------------------------------------------
+# Sensitive env sanitization on save + resolution on exec
+# ---------------------------------------------------------------------------
+
+
+@patch("pier.harbor_bridge.start_environment")
+def test_start_templatizes_sensitive_env_in_session(
+    mock_start, runner, index_path, task_dir, tmp_path, monkeypatch
+):
+    """pier start -e ANTHROPIC_API_KEY=<real> persists ${ANTHROPIC_API_KEY},
+    not the literal value, when the value matches the host env."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-real-12345")
+    ws = tmp_path / "ws"
+    runner.invoke(
+        cli,
+        [
+            "start",
+            str(task_dir),
+            "-d",
+            str(ws),
+            "-e",
+            "ANTHROPIC_API_KEY=sk-ant-real-12345",
+        ],
+        catch_exceptions=False,
+    )
+    sess = json.loads((ws / ".pier" / "session.json").read_text())
+    # Value is templated, not the literal.
+    assert "ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}" in sess["extra_env"]
+    for entry in sess["extra_env"]:
+        assert "sk-ant-real-12345" not in entry, f"raw secret in session: {entry}"
+
+
+@patch("pier.harbor_bridge.start_environment")
+def test_start_redacts_sensitive_env_when_host_value_differs(
+    mock_start, runner, index_path, task_dir, tmp_path, monkeypatch
+):
+    """If the sensitive value doesn't match the host env, redact it (still
+    don't write the cleartext to session.json)."""
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    ws = tmp_path / "ws"
+    runner.invoke(
+        cli,
+        [
+            "start",
+            str(task_dir),
+            "-d",
+            str(ws),
+            "-e",
+            "OPENAI_API_KEY=sk-different-from-host",
+        ],
+        catch_exceptions=False,
+    )
+    sess = json.loads((ws / ".pier" / "session.json").read_text())
+    stored = next(e for e in sess["extra_env"] if e.startswith("OPENAI_API_KEY="))
+    assert "sk-different-from-host" not in stored, f"raw secret in session: {stored}"
+    # Some form of redaction marker present.
+    assert "****" in stored or "${OPENAI_API_KEY}" in stored
+
+
+@patch("pier.harbor_bridge.start_environment")
+def test_start_leaves_non_sensitive_env_literal(
+    mock_start, runner, index_path, task_dir, tmp_path
+):
+    """Non-sensitive keys (FOO, MY_VAR, etc.) are stored verbatim."""
+    ws = tmp_path / "ws"
+    runner.invoke(
+        cli,
+        ["start", str(task_dir), "-d", str(ws), "-e", "DEBUG_LEVEL=verbose"],
+        catch_exceptions=False,
+    )
+    sess = json.loads((ws / ".pier" / "session.json").read_text())
+    assert "DEBUG_LEVEL=verbose" in sess["extra_env"]
+
+
+@patch("pier.harbor_bridge.is_environment_running", return_value=True)
+def test_exec_resolves_templated_env_from_host_shell(
+    mock_running, runner, index_path, tmp_path, monkeypatch
+):
+    """pier exec resolves ${KEY} templates in stored extra_env against
+    the current shell's os.environ before forwarding to docker exec."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-from-current-shell")
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    sess = _container_session()
+    sess["extra_env"] = ["ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}"]
+    _write_session(ws, sess, index_path)
+    with patch("subprocess.run", return_value=MagicMock(returncode=0)) as mock_run:
+        runner.invoke(cli, ["exec", "bash"])
+    args = mock_run.call_args[0][0]
+    assert "ANTHROPIC_API_KEY=sk-from-current-shell" in args
+
+
+@patch("pier.harbor_bridge.is_environment_running", return_value=True)
+def test_exec_errors_when_templated_env_missing_in_shell(
+    mock_running, runner, index_path, tmp_path, monkeypatch
+):
+    """If a stored template's var isn't in the current shell, error clearly
+    rather than silently forwarding an unresolved template to the container."""
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    sess = _container_session()
+    sess["extra_env"] = ["ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}"]
+    _write_session(ws, sess, index_path)
+    result = runner.invoke(cli, ["exec", "bash"])
+    assert result.exit_code != 0
+    assert "ANTHROPIC_API_KEY" in result.output
+
+
+# ---------------------------------------------------------------------------
+# pier skills compose — merge multiple skill-bundle dirs into one
+# ---------------------------------------------------------------------------
+
+
+def _make_bundle(root, *names):
+    """Create a host bundle dir with N skills, each having a SKILL.md."""
+    root.mkdir(parents=True, exist_ok=True)
+    for n in names:
+        d = root / n
+        d.mkdir()
+        (d / "SKILL.md").write_text(f"# {n}\n")
+    return root
+
+
+def test_skills_compose_merges_bundles(runner, tmp_path):
+    """pier skills compose --output <dir> <b1> <b2> merges skills into one dir."""
+    b1 = _make_bundle(tmp_path / "bundle-a", "skill-1", "skill-2")
+    b2 = _make_bundle(tmp_path / "bundle-b", "skill-3")
+    out = tmp_path / "composed"
+
+    result = runner.invoke(
+        cli, ["skills", "compose", "--output", str(out), str(b1), str(b2)]
+    )
+    assert result.exit_code == 0, result.output
+    assert (out / "skill-1" / "SKILL.md").is_file()
+    assert (out / "skill-2" / "SKILL.md").is_file()
+    assert (out / "skill-3" / "SKILL.md").is_file()
+
+
+def test_skills_compose_last_bundle_wins_on_collision(runner, tmp_path):
+    """Two bundles with the same-named skill: last wins, matching Harbor's
+    resolve_skills semantics so pier compose and ``harbor run --skill``
+    give the same loadout from the same args."""
+    b1 = tmp_path / "bundle-a"
+    (b1 / "dspy").mkdir(parents=True)
+    (b1 / "dspy" / "SKILL.md").write_text("# v1 from bundle-a\n")
+    b2 = tmp_path / "bundle-b"
+    (b2 / "dspy").mkdir(parents=True)
+    (b2 / "dspy" / "SKILL.md").write_text("# v2 from bundle-b\n")
+    out = tmp_path / "composed"
+    result = runner.invoke(
+        cli, ["skills", "compose", "--output", str(out), str(b1), str(b2)]
+    )
+    assert result.exit_code == 0, result.output
+    # Harbor: later bundle wins
+    assert (out / "dspy" / "SKILL.md").read_text() == "# v2 from bundle-b\n"
+
+
+def test_skills_compose_rejects_root_with_invalid_children(runner, tmp_path):
+    """A root bundle dir containing a subdir without SKILL.md is an error
+    (Harbor's resolve_skills surfaces this as ValueError — match)."""
+    b = tmp_path / "bundle"
+    b.mkdir()
+    (b / "real-skill").mkdir()
+    (b / "real-skill" / "SKILL.md").write_text("# real\n")
+    (b / "not-a-skill").mkdir()
+    (b / "not-a-skill" / "README.md").write_text("# readme\n")
+    out = tmp_path / "composed"
+    result = runner.invoke(cli, ["skills", "compose", "--output", str(out), str(b)])
+    assert result.exit_code != 0
+    assert "not-a-skill" in result.output or "SKILL.md" in result.output
+
+
+def test_skills_compose_errors_on_missing_bundle(runner, tmp_path):
+    """A non-existent bundle path is a clean CLI error, not a traceback."""
+    out = tmp_path / "composed"
+    result = runner.invoke(
+        cli, ["skills", "compose", "--output", str(out), "/nonexistent/path"]
+    )
+    assert result.exit_code != 0
+    assert "/nonexistent/path" in result.output
+
+
+# ---------------------------------------------------------------------------
+# pier start --skill — inject skill bundles into the agent's loadout
+# ---------------------------------------------------------------------------
+
+
+def _task_with_skills_dir(tmp_path, *, skills_dir="/opt/skills"):
+    td = tmp_path / "skill-task"
+    td.mkdir()
+    (td / "task.toml").write_text(
+        '[metadata]\nauthor_name = "test"\n'
+        f'[environment]\nskills_dir = "{skills_dir}"\n'
+        "[verifier]\n[agent]\n"
+    )
+    (td / "instruction.md").write_text("# do the thing\n")
+    (td / "environment").mkdir()
+    (td / "tests").mkdir()
+    (td / "tests" / "test.sh").write_text(
+        "#!/bin/bash\necho 0 > /logs/verifier/reward.txt\n"
+    )
+    return td
+
+
+@patch("pier.harbor_bridge.start_environment")
+def test_start_skill_resolves_and_mounts(mock_start, runner, index_path, tmp_path):
+    """pier start --skill <bundle> resolves via Harbor, copies the skill
+    into <ws>/.pier/skills/, and adds a bind mount at task.toml's
+    [environment].skills_dir."""
+    bundle = tmp_path / "bundle"
+    (bundle / "demo").mkdir(parents=True)
+    (bundle / "demo" / "SKILL.md").write_text("# demo\n")
+    task_dir = _task_with_skills_dir(tmp_path, skills_dir="/opt/skills")
+    ws = tmp_path / "ws"
+
+    result = runner.invoke(
+        cli,
+        ["start", str(task_dir), "-d", str(ws), "--skill", str(bundle)],
+        catch_exceptions=False,
+    )
+    assert result.exit_code == 0, result.output
+    assert (ws / ".pier" / "skills" / "demo" / "SKILL.md").read_text() == "# demo\n"
+
+    sess = json.loads((ws / ".pier" / "session.json").read_text())
+    mount = next((m for m in sess["extra_mounts"] if "/opt/skills" in m), None)
+    assert mount is not None, sess["extra_mounts"]
+    assert str(ws.resolve()) in mount
+    assert mount.endswith(":ro")
+
+
+@patch("pier.harbor_bridge.start_environment")
+def test_start_skill_last_wins_across_multiple_bundles(
+    mock_start, runner, index_path, tmp_path
+):
+    """Two --skill flags with the same skill name: last wins (Harbor's
+    resolve_skills semantics)."""
+    b1 = tmp_path / "b1"
+    (b1 / "dspy").mkdir(parents=True)
+    (b1 / "dspy" / "SKILL.md").write_text("v1\n")
+    b2 = tmp_path / "b2"
+    (b2 / "dspy").mkdir(parents=True)
+    (b2 / "dspy" / "SKILL.md").write_text("v2\n")
+    task_dir = _task_with_skills_dir(tmp_path)
+    ws = tmp_path / "ws"
+
+    runner.invoke(
+        cli,
+        ["start", str(task_dir), "-d", str(ws), "--skill", str(b1), "--skill", str(b2)],
+        catch_exceptions=False,
+    )
+    assert (ws / ".pier" / "skills" / "dspy" / "SKILL.md").read_text() == "v2\n"
+
+
+@patch("pier.harbor_bridge.start_environment")
+def test_start_skill_defaults_to_harbor_skills_dir(
+    mock_start, runner, index_path, tmp_path
+):
+    """Task with no [environment].skills_dir set falls back to Harbor's
+    /harbor/skills default."""
+    bundle = tmp_path / "bundle"
+    (bundle / "x").mkdir(parents=True)
+    (bundle / "x" / "SKILL.md").write_text("# x\n")
+    # task_dir fixture has no skills_dir set
+    td = tmp_path / "plain-task"
+    td.mkdir()
+    (td / "task.toml").write_text(
+        '[metadata]\nauthor_name = "t"\n[environment]\n[verifier]\n[agent]\n'
+    )
+    (td / "instruction.md").write_text("# go\n")
+    (td / "environment").mkdir()
+    (td / "tests").mkdir()
+    (td / "tests" / "test.sh").write_text("#!/bin/bash\necho 0\n")
+    ws = tmp_path / "ws"
+
+    runner.invoke(
+        cli,
+        ["start", str(td), "-d", str(ws), "--skill", str(bundle)],
+        catch_exceptions=False,
+    )
+    sess = json.loads((ws / ".pier" / "session.json").read_text())
+    assert any("/harbor/skills" in m for m in sess["extra_mounts"]), sess[
+        "extra_mounts"
+    ]
+
+
+@patch("pier.harbor_bridge.start_environment")
+def test_start_skill_errors_on_relative_skills_dir(
+    mock_start, runner, index_path, tmp_path
+):
+    """If task.toml has a relative skills_dir, injection is ambiguous —
+    match Harbor's error."""
+    bundle = tmp_path / "bundle"
+    (bundle / "x").mkdir(parents=True)
+    (bundle / "x" / "SKILL.md").write_text("# x\n")
+    task_dir = _task_with_skills_dir(tmp_path, skills_dir="relative/skills")
+    ws = tmp_path / "ws"
+    result = runner.invoke(
+        cli,
+        ["start", str(task_dir), "-d", str(ws), "--skill", str(bundle)],
+    )
+    assert result.exit_code != 0
+    assert "absolute" in result.output.lower()
+
+
+def test_start_skill_rejected_in_host_mode(runner, index_path, tmp_path):
+    """Host mode doesn't have a container to bind-mount into; --skill is
+    container-mode only."""
+    bundle = tmp_path / "bundle"
+    (bundle / "x").mkdir(parents=True)
+    (bundle / "x" / "SKILL.md").write_text("# x\n")
+    task_dir = _task_with_skills_dir(tmp_path)
+    ws = tmp_path / "ws"
+    result = runner.invoke(
+        cli,
+        ["start", str(task_dir), "-d", str(ws), "--host", "--skill", str(bundle)],
+    )
+    assert result.exit_code != 0
+    assert "host" in result.output.lower() and "--skill" in result.output

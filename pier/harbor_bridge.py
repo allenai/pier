@@ -244,20 +244,59 @@ def _make_environment(
     trial_paths.mkdir()
 
     container_workdir = _get_dockerfile_workdir(task.paths.environment_dir)
-    mount_spec = (
-        f"{workspace_dir.resolve()}:{container_workdir}:rw"
-        if workspace_dir is not None
-        else None
-    )
 
-    mounts = []
-    if mount_spec:
-        mounts.append(mount_spec)
-    if extra_mounts:
-        mounts.extend(extra_mounts)
+    # Harbor 0.6+ expects ``mounts`` (list[ServiceVolumeConfig dict]) on the
+    # env constructor — caller's responsibility — and silently drops the
+    # legacy string-based ``mounts_json`` kwarg pier used to pass. We build
+    # ServiceVolumeConfig dicts directly.
+    from harbor.models.task.config import TaskOS
+    from harbor.models.trial.paths import EnvironmentPaths
+
+    env_os = getattr(task.config.environment, "os", TaskOS.LINUX)
+    env_paths = EnvironmentPaths.for_os(env_os)
+
+    mounts: list[dict] = []
+    if workspace_dir is not None:
+        mounts.append(
+            {
+                "type": "bind",
+                "source": str(workspace_dir.resolve()),
+                "target": container_workdir,
+            }
+        )
+    # Always bind Harbor's trial log directories. Without these binds,
+    # test.sh writes to /logs/verifier inside the container — invisible
+    # to the host-side Verifier.verify() and raises RewardFileNotFoundError.
+    for host_dir, container_dir in (
+        (trial_paths.verifier_dir, env_paths.verifier_dir),
+        (trial_paths.agent_dir, env_paths.agent_dir),
+        (trial_paths.artifacts_dir, env_paths.artifacts_dir),
+    ):
+        mounts.append(
+            {
+                "type": "bind",
+                "source": str(Path(host_dir).resolve()),
+                "target": str(container_dir),
+            }
+        )
+    # ``extra_mounts`` arrives as docker-style strings
+    # (``host:container[:ro|rw]``) from the user's ``--mounts-json``.
+    for raw in extra_mounts or []:
+        parts = raw.split(":")
+        if len(parts) < 2:
+            continue
+        host, container, *rest = parts
+        spec: dict = {
+            "type": "bind",
+            "source": str(Path(host).expanduser().resolve()),
+            "target": container,
+        }
+        if rest and rest[0] == "ro":
+            spec["read_only"] = True
+        mounts.append(spec)
     kwargs: dict = {}
     if mounts:
-        kwargs["mounts_json"] = mounts
+        kwargs["mounts"] = mounts
 
     environment = EnvironmentFactory.create_environment(
         type="docker",
@@ -272,30 +311,36 @@ def _make_environment(
     # Always write a compose override for the tmpfs mount that hides .pier/
     # from the container. On older Harbor (no mounts_json), this file also
     # carries the workspace bind mount.
+    override_paths: list[Path] = []
     if workspace_dir is not None:
-        mounts_path = _write_mounts_compose(
-            trial_dir,
-            workspace_dir,
-            container_workdir,
-            include_bind_mount=False,
-            task_dir=task_dir,
-            ports=ports,
+        override_paths.append(
+            _write_mounts_compose(
+                trial_dir,
+                workspace_dir,
+                container_workdir,
+                include_bind_mount=False,
+                task_dir=task_dir,
+                ports=ports,
+            )
         )
-        _patch_compose_paths(environment, mounts_path)
     elif ports:
         # No workspace mount, but still need ports exposed.
-        mounts_path = _write_mounts_compose(
-            trial_dir,
-            workspace_dir or Path("/unused"),
-            container_workdir,
-            include_bind_mount=False,
-            ports=ports,
+        override_paths.append(
+            _write_mounts_compose(
+                trial_dir,
+                workspace_dir or Path("/unused"),
+                container_workdir,
+                include_bind_mount=False,
+                ports=ports,
+            )
         )
-        _patch_compose_paths(environment, mounts_path)
     else:
         mounts_path = trial_dir / "docker-compose-pier.json"
         if mounts_path.exists():
-            _patch_compose_paths(environment, mounts_path)
+            override_paths.append(mounts_path)
+
+    for p in override_paths:
+        _patch_compose_paths(environment, p)
 
     return environment, task, trial_paths
 
@@ -521,6 +566,8 @@ async def _async_setup_agent(
     harbor_session_id: str,
     trial_dir: Path,
     agent_name: str,
+    *,
+    skills_dir_override: str | None = None,
 ) -> None:
     from harbor.agents.factory import AgentFactory
     from harbor.models.agent.name import AgentName
@@ -530,8 +577,13 @@ async def _async_setup_agent(
     )
 
     extra_kwargs: dict = {}
-    if task.config.environment.skills_dir:
-        extra_kwargs["skills_dir"] = task.config.environment.skills_dir
+    # pier's --skill flag may inject skills into the container; in that
+    # case the caller passes skills_dir_override pointing at the in-
+    # container path the bind mount targets. Otherwise fall back to
+    # task.toml's [environment].skills_dir.
+    effective_skills_dir = skills_dir_override or task.config.environment.skills_dir
+    if effective_skills_dir:
+        extra_kwargs["skills_dir"] = effective_skills_dir
     if task.config.environment.mcp_servers:
         extra_kwargs["mcp_servers"] = task.config.environment.mcp_servers
 
@@ -547,16 +599,29 @@ def setup_agent(
     harbor_session_id: str,
     trial_dir: Path,
     agent_name: str,
+    *,
+    skills_dir_override: str | None = None,
 ) -> None:
     """Install a Harbor agent in a running environment.
 
     Calls the agent's setup() method which uploads and runs the install
     script (e.g. install-claude-code.sh).  Does NOT call run() — the user
     drives the agent interactively via ``pier exec``.
+
+    skills_dir_override: in-container path where pier has already
+    bind-mounted composed skill bundles (via ``--skill``). When set,
+    overrides task.toml's [environment].skills_dir for this agent
+    install so the agent's cp step picks up the injected bundle.
     """
     with _placeholder_task_env_vars(task_dir):
         asyncio.run(
-            _async_setup_agent(task_dir, harbor_session_id, trial_dir, agent_name)
+            _async_setup_agent(
+                task_dir,
+                harbor_session_id,
+                trial_dir,
+                agent_name,
+                skills_dir_override=skills_dir_override,
+            )
         )
 
 
@@ -945,6 +1010,78 @@ def resolve_task_env(task_dir: Path) -> dict[str, str]:
             return resolve_env_vars(env_config)
     except Exception:
         return {}
+
+
+# --- Skill resolution (re-exported from harbor.skills) -------------------
+#
+# Same fragile-internal pattern as the env helpers below: pier centralizes
+# the harbor import in this adapter layer.
+
+
+def resolve_skill_paths(paths: list[Path]) -> list[tuple[str, Path]]:
+    """Resolve skill input paths to (name, source_dir) pairs.
+
+    Wraps ``harbor.skills.resolve_skills`` so callers get Harbor's exact
+    semantics:
+    - Each input may be a single skill directory (containing SKILL.md)
+      OR a root containing skill subdirectories.
+    - Dotfile dirs at root level are skipped.
+    - Duplicate skill names use last-wins (later inputs override earlier).
+    - Names sorted alphabetically.
+
+    Raises FileNotFoundError / ValueError on malformed inputs (Harbor's
+    own exceptions surfacing).
+    """
+    from harbor.skills import resolve_skills
+
+    return [(s.name, s.source) for s in resolve_skills(paths)]
+
+
+# --- Sensitive-env helpers (re-exported from harbor.utils.env) ------------
+#
+# harbor.utils.env is internal-fragile per the API stability notes at the
+# top of this file. Re-exporting here centralizes the import so callers
+# (pier/cli.py) don't import from harbor.* directly.
+
+
+def sanitize_env_kv(kv: str) -> str:
+    """Sanitize a KEY=VALUE string for persistence into session.json.
+
+    Sensitive keys (matching Harbor's regex KEY|SECRET|TOKEN|PASSWORD|
+    CREDENTIAL|AUTH) get templated to ``KEY=${KEY}`` if the value matches
+    the current host env, or redacted (``KEY=ab****cd``) otherwise.
+    Non-sensitive keys pass through verbatim.
+    """
+    from harbor.utils.env import sanitize_env_assignment
+
+    return sanitize_env_assignment(kv)
+
+
+def resolve_env_kv(kv: str) -> str:
+    """Resolve a KEY=${KEY} (or ${KEY:-default}) entry from the current
+    shell at pier-exec time.
+
+    Raises ``KeyError`` if a referenced env var isn't in os.environ —
+    caller should surface a clear message rather than forwarding the
+    unresolved template to the container.
+    """
+    import re
+
+    from harbor.utils.env import is_env_template
+
+    key, _, value = kv.partition("=")
+    if not is_env_template(value):
+        return kv
+    # is_env_template matched, so this is "${NAME}" or "${NAME:-default}".
+    m = re.fullmatch(r"\$\{([^}:]+)(?::-(.*))?\}", value)
+    if m is None:
+        return kv  # defensive; shouldn't happen given is_env_template
+    var_name, default = m.group(1), m.group(2)
+    if var_name in os.environ:
+        return f"{key}={os.environ[var_name]}"
+    if default is not None:
+        return f"{key}={default}"
+    raise KeyError(var_name)
 
 
 def exec_in_container(
