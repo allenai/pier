@@ -3498,3 +3498,37 @@ def test_start_skill_rejected_in_host_mode(runner, index_path, tmp_path):
     )
     assert result.exit_code != 0
     assert "host" in result.output.lower() and "--skill" in result.output
+
+
+class TestDetectClaudeCodeSessionDir:
+    def test_detects_slugged_project_dir(self, tmp_path, monkeypatch):
+        from pier.harbor_bridge import (
+            _claude_code_host_session_dir as _detect_claude_code_session_dir,
+        )
+
+        ws = tmp_path / "some" / "work.space"
+        ws.mkdir(parents=True)
+        home = tmp_path / "home"
+        slug = str(ws.resolve()).replace("/", "-").replace(".", "-")
+        sess = home / ".claude" / "projects" / slug
+        sess.mkdir(parents=True)
+        (sess / "abc123.jsonl").write_text("{}")
+        monkeypatch.setattr(Path, "home", staticmethod(lambda: home))
+
+        assert _detect_claude_code_session_dir(ws) == sess
+
+    def test_none_when_missing_or_empty(self, tmp_path, monkeypatch):
+        from pier.harbor_bridge import (
+            _claude_code_host_session_dir as _detect_claude_code_session_dir,
+        )
+
+        ws = tmp_path / "ws"
+        ws.mkdir()
+        home = tmp_path / "home"
+        monkeypatch.setattr(Path, "home", staticmethod(lambda: home))
+        assert _detect_claude_code_session_dir(ws) is None
+
+        slug = str(ws.resolve()).replace("/", "-").replace(".", "-")
+        empty = home / ".claude" / "projects" / slug
+        empty.mkdir(parents=True)
+        assert _detect_claude_code_session_dir(ws) is None

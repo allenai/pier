@@ -818,6 +818,39 @@ _AGENT_BRIDGE: dict[str, Callable[[Path, Path], None]] = {
 _CONFIG_DIR_AGENTS = {"claude-code", "codex"}
 
 
+def _claude_code_host_session_dir(workspace: Path) -> Path | None:
+    """claude-code keys host session logs by cwd: ~/.claude/projects/<slug>,
+    <slug> = absolute path with ``/`` and ``.`` replaced by ``-``."""
+    slug = str(workspace.resolve()).replace("/", "-").replace(".", "-")
+    p = Path.home() / ".claude" / "projects" / slug
+    if p.is_dir() and any(p.glob("*.jsonl")):
+        return p
+    return None
+
+
+# Host-mode session locators, per agent — the host-side analogue of
+# _AGENT_BRIDGES: where a locally-run agent CLI keeps the workspace's
+# session logs. Harbor can't own this knowledge (it only manages
+# containerized agents), so it is quarantined here with the rest of the
+# per-agent residue.
+_HOST_SESSION_LOCATORS = {
+    "claude-code": _claude_code_host_session_dir,
+}
+
+
+def detect_host_session(
+    workspace: Path, agent: str | None = None
+) -> tuple[str, Path] | None:
+    """Find a host-mode agent session for `workspace`. Checks the given
+    agent's locator, or every registered locator when agent is None."""
+    names = [agent] if agent else list(_HOST_SESSION_LOCATORS)
+    for name in names:
+        locator = _HOST_SESSION_LOCATORS.get(name)
+        if locator and (found := locator(workspace)):
+            return name, found
+    return None
+
+
 def get_agent_session_dirs(harbor_agent_dir: Path, agent_name: str) -> list[Path]:
     """Return session directories containing files for *agent_name*, newest first.
 

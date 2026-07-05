@@ -1370,6 +1370,15 @@ def verify(
                 f"  e.g. pier verify --agent {agents[0]}"
             )
 
+    # Host-mode convenience: no agent registered and no --session-dir,
+    # but a claude-code session exists for this workspace (pier exec claude).
+    if not agent and not session_dir and sess.get("mode") == "host":
+        found = harbor_bridge.detect_host_session(ws)
+        if found:
+            agent, detected = found
+            session_dir = str(detected)
+            click.echo(f"Detected {agent} session dir: {detected}")
+
     # Validate --session-dir in non-container mode (host path must exist)
     if session_dir and sess.get("mode") != "container":
         p = Path(session_dir)
@@ -1915,10 +1924,15 @@ def capture(agent: str | None, session_dir: str | None, session: str | None) -> 
                 "No agent registered. Pass -a/--agent to specify one."
             )
     else:
-        raise click.ClickException(
-            "Pass --session-dir pointing to the agent's log directory, e.g.:\n"
-            "  pier capture --session-dir ~/.claude/projects/<project-name>"
-        )
+        found = harbor_bridge.detect_host_session(ws, agent=agent)
+        if found:
+            agent, resolved_session_dir = found
+            click.echo(f"Detected {agent} session dir: {resolved_session_dir}")
+        else:
+            raise click.ClickException(
+                "Pass --session-dir pointing to the agent's log directory, e.g.:\n"
+                "  pier capture --session-dir ~/.claude/projects/<project-name>"
+            )
 
     if not agent and resolved_session_dir:
         raise click.ClickException(

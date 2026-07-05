@@ -111,7 +111,7 @@ pier capture                                       # container mode with registe
 pier capture --session-dir <path> -a claude-code   # host mode or external session
 ```
 
-In container mode with a registered agent (`pier start --agent`), the trajectory is extracted automatically. Otherwise, pass `--session-dir` and `-a` to specify the session location and agent. In container mode, `--session-dir` refers to a path inside the container.
+In container mode with a registered agent (`pier start --agent`), the trajectory is extracted automatically. In host mode, a claude-code session for the workspace (from `pier exec claude`) is auto-detected — bare `pier capture` / `pier verify` extract it. Otherwise, pass `--session-dir` and `-a` to specify the session location and agent. In container mode, `--session-dir` refers to a path inside the container.
 
 ### `pier traces`
 
