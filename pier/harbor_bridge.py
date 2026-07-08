@@ -487,6 +487,15 @@ def create_synthetic_task_dir(image: str, temp_root: Path) -> Path:
     if not instruction.exists():
         instruction.write_text("")
 
+    # harbor >=0.13 validates the task shape: a linux task must ship
+    # tests/test.sh. Task-free mode never runs a verifier, so a stub.
+    tests_dir = task_dir / "tests"
+    tests_dir.mkdir(exist_ok=True)
+    test_sh = tests_dir / "test.sh"
+    if not test_sh.exists():
+        test_sh.write_text("#!/bin/bash\nexit 0\n")
+        test_sh.chmod(0o755)
+
     return task_dir
 
 
