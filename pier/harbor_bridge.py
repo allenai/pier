@@ -830,6 +830,8 @@ _CONFIG_DIR_AGENTS = {"claude-code", "codex"}
 def _claude_code_host_session_dir(workspace: Path) -> Path | None:
     """claude-code keys host session logs by cwd: ~/.claude/projects/<slug>,
     <slug> = absolute path with ``/`` and ``.`` replaced by ``-``."""
+    if os.name == "nt":  # slug convention below is POSIX; unverified on Windows
+        return None
     slug = str(workspace.resolve()).replace("/", "-").replace(".", "-")
     p = Path.home() / ".claude" / "projects" / slug
     if p.is_dir() and any(p.glob("*.jsonl")):

@@ -6,6 +6,8 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import click
+import os
+
 import pytest
 from click.testing import CliRunner
 
@@ -3359,7 +3361,7 @@ def test_skills_compose_errors_on_missing_bundle(runner, tmp_path):
         cli, ["skills", "compose", "--output", str(out), "/nonexistent/path"]
     )
     assert result.exit_code != 0
-    assert "/nonexistent/path" in result.output
+    assert "nonexistent" in result.output  # windows prints backslashes
 
 
 # ---------------------------------------------------------------------------
@@ -3500,6 +3502,7 @@ def test_start_skill_rejected_in_host_mode(runner, index_path, tmp_path):
     assert "host" in result.output.lower() and "--skill" in result.output
 
 
+@pytest.mark.skipif(os.name == "nt", reason="host-mode session slugs are POSIX-keyed")
 class TestDetectClaudeCodeSessionDir:
     def test_detects_slugged_project_dir(self, tmp_path, monkeypatch):
         from pier.harbor_bridge import (
