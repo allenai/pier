@@ -1230,16 +1230,23 @@ def _validate_session_flags(
         raise click.ClickException(f"Invalid session timestamp: {session!r}")
 
 
-def _detect_agent_from_command(command: list[str]) -> str | None:
+def _detect_agent_from_command(
+    command: list[str], registered: list[str] | None = None
+) -> str | None:
     """Match a command against all known Harbor agent binaries.
 
     Uses Harbor's agent registry to build a binary→agent map (cached
-    after first call).  Returns the agent name or None.
+    after first call).  Returns the agent name or None.  An agent the
+    session set up wins over another that runs the same binary (harbor's
+    kimi-cli and kimi-code both run ``kimi``).
     """
     if not command:
         return None
     cmd_basename = Path(command[0]).name
     try:
+        for name in registered or []:
+            if harbor_bridge.get_agent_binary(name) == cmd_basename:
+                return name
         return harbor_bridge.get_binary_agent_map().get(cmd_basename)
     except Exception as e:
         # Not silently: without detection an agent runs with no log capture
@@ -1285,8 +1292,8 @@ def _exec_container(
 
     # Apply agent env vars and PATH prefixes for registered agents
     # and the auto-detected agent (if not already registered).
-    active_agent = _detect_agent_from_command(command)
     agent_names = list(sess.get("agents", []))
+    active_agent = _detect_agent_from_command(command, agent_names)
     if active_agent and active_agent not in agent_names:
         agent_names.append(active_agent)
 

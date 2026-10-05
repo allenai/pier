@@ -3688,3 +3688,23 @@ def test_verify_scores_in_the_workspace_when_the_task_does_not_say_otherwise(
     mock_verify.assert_called_once()
     mock_regrade.assert_not_called()
     mock_stop.assert_not_called()
+
+
+@patch(
+    "pier.harbor_bridge.get_binary_agent_map",
+    return_value={"kimi": "kimi-code"},
+)
+@patch("pier.harbor_bridge.get_agent_binary", return_value="kimi")
+@patch("pier.harbor_bridge.is_environment_running", return_value=True)
+def test_exec_detects_the_session_s_agent_when_two_share_a_binary(
+    mock_running, mock_binary, mock_map, runner, index_path, tmp_path
+):
+    """harbor's kimi-cli and kimi-code both run `kimi`; the one set up wins."""
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    _write_session(ws, _container_session(agents=["kimi-cli"]), index_path)
+    with patch("subprocess.run", return_value=MagicMock(returncode=0)) as mock_run:
+        runner.invoke(cli, ["exec", "kimi", "--version"])
+    args = mock_run.call_args[0][0]
+    cmd_str = args[args.index("-c") + 1]
+    assert "kimi-cli.txt" in cmd_str
