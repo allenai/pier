@@ -3535,3 +3535,156 @@ class TestDetectClaudeCodeSessionDir:
         empty = home / ".claude" / "projects" / slug
         empty.mkdir(parents=True)
         assert _detect_claude_code_session_dir(ws) is None
+
+
+@patch("pier.harbor_bridge.start_environment")
+def test_start_passes_and_keeps_extra_compose(
+    mock_start, runner, index_path, task_dir, tmp_path
+):
+    """--extra-docker-compose reaches the environment and is kept in the session."""
+    overlay = tmp_path / "gateway.yaml"
+    overlay.write_text("services: {}\n")
+    ws = tmp_path / "ws"
+    result = runner.invoke(
+        cli,
+        ["start", str(task_dir), "-d", str(ws), "--extra-docker-compose", str(overlay)],
+        catch_exceptions=False,
+    )
+    assert result.exit_code == 0
+    assert mock_start.call_args[1]["extra_compose"] == [str(overlay.resolve())]
+    sess = json.loads((ws / ".pier" / "session.json").read_text())
+    assert sess["extra_compose"] == [str(overlay.resolve())]
+
+
+@patch("pier.harbor_bridge.is_environment_running", return_value=False)
+@patch("pier.harbor_bridge.start_environment")
+def test_restart_keeps_extra_compose(
+    mock_start, mock_running, runner, index_path, task_dir, tmp_path
+):
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    sess = _container_session(task_dir=str(task_dir))
+    sess["extra_compose"] = ["/overlays/gateway.yaml"]
+    _write_session(ws, sess, index_path)
+    result = runner.invoke(
+        cli, ["start", str(task_dir), "-d", str(ws)], catch_exceptions=False
+    )
+    assert result.exit_code == 0
+    assert mock_start.call_args[1]["extra_compose"] == ["/overlays/gateway.yaml"]
+
+
+@patch("pier.cli._assemble_trial_output")
+@patch("pier.harbor_bridge.verify_environment", return_value={"reward": 1.0})
+@patch("pier.harbor_bridge.is_environment_running", return_value=True)
+def test_verify_uses_the_session_extra_compose(
+    mock_running, mock_verify, mock_assemble, runner, index_path, task_dir, tmp_path
+):
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    sess = _container_session(task_dir=str(task_dir))
+    sess["extra_compose"] = ["/overlays/gateway.yaml"]
+    _write_session(ws, sess, index_path)
+    result = runner.invoke(cli, ["verify"], catch_exceptions=False)
+    assert result.exit_code == 0
+    assert mock_verify.call_args[1]["extra_compose"] == ["/overlays/gateway.yaml"]
+
+
+@patch("pier.harbor_bridge.stop_environment")
+def test_stop_brings_down_the_extra_compose_services(
+    mock_stop, runner, index_path, tmp_path
+):
+    """A stop without the overlay's services would leave their containers running."""
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    sess = _container_session()
+    sess["extra_compose"] = ["/overlays/gateway.yaml"]
+    _write_session(ws, sess, index_path)
+    result = runner.invoke(cli, ["stop"], catch_exceptions=False)
+    assert result.exit_code == 0
+    assert mock_stop.call_args[1]["extra_compose"] == ["/overlays/gateway.yaml"]
+
+
+def test_start_host_rejects_extra_compose(runner, index_path, task_dir, tmp_path):
+    overlay = tmp_path / "gateway.yaml"
+    overlay.write_text("services: {}\n")
+    result = runner.invoke(
+        cli,
+        [
+            "start",
+            str(task_dir),
+            "--host",
+            "-d",
+            str(tmp_path / "ws"),
+            "--extra-docker-compose",
+            str(overlay),
+        ],
+    )
+    assert result.exit_code != 0
+    assert "--extra-docker-compose" in result.output
+
+
+# ---------------------------------------------------------------------------
+# pier verify, a task scored apart ([verifier] environment_mode = "separate")
+# ---------------------------------------------------------------------------
+
+
+def _scored_apart(task_dir: Path) -> None:
+    (task_dir / "task.toml").write_text(
+        'artifacts = ["/workspace"]\n[metadata]\nauthor_name = "test"\n'
+        '[environment]\n[verifier]\nenvironment_mode = "separate"\n[agent]\n'
+    )
+
+
+@patch("pier.cli._assemble_trial_output")
+@patch("pier.harbor_bridge.verify_environment")
+@patch("pier.harbor_bridge.is_environment_running", return_value=True)
+def test_verify_scores_apart_when_the_task_declares_it(
+    mock_running, mock_verify, mock_assemble, runner, index_path, task_dir, tmp_path
+):
+    """The work is recorded, the workspace's container stopped, then the record
+    regraded; the workspace's own verifier never runs."""
+    _scored_apart(task_dir)
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    _write_session(
+        ws,
+        _container_session(task_dir=str(task_dir), agents=["claude-code"]),
+        index_path,
+    )
+    calls = MagicMock()
+    calls.regrade.return_value = {"reward": 1.0}
+    with (
+        patch("pier.harbor_bridge.record_workspace", calls.record_workspace),
+        patch("pier.harbor_bridge.stop_workspace_container", calls.stop),
+        patch("pier.harbor_bridge.regrade", calls.regrade),
+    ):
+        result = runner.invoke(cli, ["verify"], catch_exceptions=False)
+    assert result.exit_code == 0, result.output
+    assert "Scoring apart" in result.output
+    mock_verify.assert_not_called()
+    assert [c[0] for c in calls.mock_calls] == ["record_workspace", "stop", "regrade"]
+    record_args = calls.record_workspace.call_args[0]
+    assert record_args[3] == "pier:claude-code"
+    record, task, trials_dir, name = calls.regrade.call_args[0]
+    assert task == task_dir and name == "scored"
+    assert record == trials_dir / "record"
+
+
+@patch("pier.cli._assemble_trial_output")
+@patch("pier.harbor_bridge.verify_environment", return_value={"reward": 1.0})
+@patch("pier.harbor_bridge.is_environment_running", return_value=True)
+def test_verify_scores_in_the_workspace_when_the_task_does_not_say_otherwise(
+    mock_running, mock_verify, mock_assemble, runner, index_path, task_dir, tmp_path
+):
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    _write_session(ws, _container_session(task_dir=str(task_dir)), index_path)
+    with (
+        patch("pier.harbor_bridge.regrade") as mock_regrade,
+        patch("pier.harbor_bridge.stop_workspace_container") as mock_stop,
+    ):
+        result = runner.invoke(cli, ["verify"], catch_exceptions=False)
+    assert result.exit_code == 0
+    mock_verify.assert_called_once()
+    mock_regrade.assert_not_called()
+    mock_stop.assert_not_called()

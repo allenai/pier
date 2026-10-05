@@ -659,3 +659,153 @@ class TestDownloadTask:
             return [tmp_path / "t"]
 
         assert self._run(download_tasks) == tmp_path / "t"
+
+
+class TestExtraCompose:
+    """Overlays and pier's own override reach Harbor through its public
+    ``extra_docker_compose``, in that order, after the task's compose."""
+
+    def _task(self, tmp_path: Path) -> Path:
+        td = tmp_path / "task"
+        (td / "environment").mkdir(parents=True)
+        (td / "environment" / "Dockerfile").write_text("FROM ubuntu:24.04\n")
+        (td / "task.toml").write_text("[environment]\n[verifier]\n[agent]\n")
+        (td / "instruction.md").write_text("do it\n")
+        (td / "tests").mkdir()
+        (td / "tests" / "test.sh").write_text("#!/bin/bash\n")
+        return td
+
+    def test_overlays_then_pier_override(self, tmp_path: Path):
+        from pier.harbor_bridge import _make_environment
+
+        overlay = tmp_path / "gateway.yaml"
+        overlay.write_text("services: {}\n")
+        ws = tmp_path / "ws"
+        ws.mkdir()
+        environment, _, _ = _make_environment(
+            self._task(tmp_path),
+            "hsid",
+            tmp_path / "trial",
+            workspace_dir=ws,
+            extra_compose=[str(overlay)],
+        )
+        extra = [Path(p).name for p in environment.extra_docker_compose_paths]
+        assert extra == ["gateway.yaml", "docker-compose-pier.json"]
+        names = [Path(p).name for p in environment._docker_compose_paths]
+        assert "gateway.yaml" in names and "docker-compose-pier.json" in names
+
+    def test_no_overlays_still_merges_pier_override(self, tmp_path: Path):
+        from pier.harbor_bridge import _make_environment
+
+        ws = tmp_path / "ws"
+        ws.mkdir()
+        environment, _, _ = _make_environment(
+            self._task(tmp_path), "hsid", tmp_path / "trial", workspace_dir=ws
+        )
+        names = [Path(p).name for p in environment._docker_compose_paths]
+        assert "docker-compose-pier.json" in names
+
+
+# ---------------------------------------------------------------------------
+# Scoring apart ([verifier] environment_mode = "separate")
+# ---------------------------------------------------------------------------
+
+from pier import harbor_bridge  # noqa: E402
+
+SEPARATE = (
+    'artifacts = ["/workspace"]\n[verifier]\nenvironment_mode = "separate"\n'
+    '[[verifier.collect]]\ncommand = "collect-it"\n'
+)
+
+
+def _task(tmp_path: Path, toml: str) -> Path:
+    task = tmp_path / "my-task"
+    task.mkdir()
+    (task / "task.toml").write_text(toml)
+    return task
+
+
+@pytest.mark.parametrize(
+    "toml,apart",
+    [
+        (SEPARATE, True),
+        ('[verifier]\nenvironment_mode = "shared"\n', False),
+        ("[verifier]\n", False),
+    ],
+)
+def test_scores_apart_reads_the_tasks_declaration(tmp_path: Path, toml, apart):
+    assert harbor_bridge.scores_apart(_task(tmp_path, toml)) is apart
+
+
+def _fake_docker(calls: list, files: dict[str, str], exec_rc: int = 0):
+    """`docker exec` runs nothing; `docker cp` writes `files` for a source."""
+
+    def docker(*args, timeout=None):
+        calls.append(args)
+        if args[0] == "cp":
+            source = args[1].split(":", 1)[1].removesuffix("/.")
+            dest = Path(args[2])
+            if source in files:
+                (dest / files[source]).write_text("x")
+        rc = exec_rc if args[0] == "exec" else 0
+        return MagicMock(returncode=rc, stdout="", stderr="it failed")
+
+    return docker
+
+
+def test_record_workspace_writes_what_regrade_reads(tmp_path: Path):
+    task = _task(tmp_path, SEPARATE)
+    record = tmp_path / "record"
+    record.mkdir()
+    calls: list = []
+    docker = _fake_docker(calls, {"/workspace": "submission.json"})
+    with patch("pier.harbor_bridge._docker", docker):
+        harbor_bridge.record_workspace("pier-ws", task, record, "pier:claude-code")
+    container = harbor_bridge.get_container_name("pier-ws")
+    assert calls[0] == ("exec", container, "sh", "-c", "collect-it"), "hook first"
+    manifest = json.loads((record / "artifacts" / "manifest.json").read_text())
+    assert [(e["source"], e["status"]) for e in manifest] == [
+        ("/logs/artifacts", "empty"),
+        ("/workspace", "ok"),
+    ]
+    assert (record / "artifacts" / "workspace" / "submission.json").exists()
+    result = json.loads((record / "result.json").read_text())
+    assert result["task_name"] == "my-task"
+    assert result["agent_info"]["name"] == "pier:claude-code"
+
+
+def test_a_failing_collect_hook_stops_the_scoring(tmp_path: Path):
+    task = _task(tmp_path, SEPARATE)
+    record = tmp_path / "record"
+    record.mkdir()
+    calls: list = []
+    with (
+        patch("pier.harbor_bridge._docker", _fake_docker(calls, {}, exec_rc=3)),
+        pytest.raises(RuntimeError, match="collect hook 'collect-it' failed"),
+    ):
+        harbor_bridge.record_workspace("pier-ws", task, record, "pier")
+    assert not (record / "result.json").exists()
+
+
+def test_an_artifact_harbor_would_collect_differently_is_refused(tmp_path: Path):
+    toml = (
+        'artifacts = [{source = "/workspace", exclude = ["*.log"]}]\n'
+        '[verifier]\nenvironment_mode = "separate"\n'
+    )
+    task = _task(tmp_path, toml)
+    record = tmp_path / "record"
+    record.mkdir()
+    with (
+        patch("pier.harbor_bridge._docker", _fake_docker([], {})),
+        pytest.raises(RuntimeError, match="excludes"),
+    ):
+        harbor_bridge.record_workspace("pier-ws", task, record, "pier")
+
+
+def test_a_container_that_will_not_stop_is_not_scored():
+    failed = MagicMock(returncode=1, stdout="", stderr="no such container")
+    with (
+        patch("pier.harbor_bridge._docker", return_value=failed),
+        pytest.raises(RuntimeError, match="not scored"),
+    ):
+        harbor_bridge.stop_workspace_container("pier-ws")
