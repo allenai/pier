@@ -1238,10 +1238,17 @@ def _detect_agent_from_command(command: list[str]) -> str | None:
     """
     if not command:
         return None
+    cmd_basename = Path(command[0]).name
     try:
-        cmd_basename = Path(command[0]).name
         return harbor_bridge.get_binary_agent_map().get(cmd_basename)
-    except Exception:
+    except Exception as e:
+        # Not silently: without detection an agent runs with no log capture
+        # and none of its env.
+        click.echo(
+            f"pier: cannot read harbor's agent registry ({type(e).__name__}: {e}); "
+            f"running {cmd_basename!r} without agent setup",
+            err=True,
+        )
         return None
 
 

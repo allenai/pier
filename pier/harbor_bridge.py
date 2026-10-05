@@ -1203,10 +1203,17 @@ def get_binary_agent_map() -> dict[str, str]:
 
     from harbor.agents.factory import AgentFactory
 
+    # harbor's public list where it has one (0.23+), else the keys of its
+    # private map (0.21, 0.22). harbor dropped the private list pier read
+    # before, and every agent became undetectable.
+    if hasattr(AgentFactory, "registered_names"):
+        names = [str(n) for n in AgentFactory.registered_names()]
+    else:
+        names = [str(getattr(n, "value", n)) for n in AgentFactory._AGENT_MAP]
+
     result: dict[str, str] = {}
-    for agent_cls in AgentFactory._AGENTS:
+    for name in names:
         try:
-            name = agent_cls.name()
             binary = get_agent_binary(name)
             if binary:
                 result[binary] = name

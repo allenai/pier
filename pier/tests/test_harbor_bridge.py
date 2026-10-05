@@ -809,3 +809,48 @@ def test_a_container_that_will_not_stop_is_not_scored():
         pytest.raises(RuntimeError, match="not scored"),
     ):
         harbor_bridge.stop_workspace_container("pier-ws")
+
+
+def test_binary_agent_map_reads_the_public_registry(monkeypatch):
+    """harbor 0.23+ lists its agents with registered_names()."""
+    from harbor.agents import factory
+
+    from pier import harbor_bridge as hb
+
+    class Factory:
+        @staticmethod
+        def registered_names():
+            return ["claude-code"]
+
+    monkeypatch.setattr(factory, "AgentFactory", Factory)
+    monkeypatch.setattr(hb, "_binary_agent_map", None)
+    monkeypatch.setattr(hb, "get_agent_binary", lambda name: "claude")
+    assert hb.get_binary_agent_map() == {"claude": "claude-code"}
+
+
+def test_binary_agent_map_reads_the_private_map_before_it(monkeypatch):
+    """harbor 0.21 and 0.22 have no registered_names(), only _AGENT_MAP."""
+    import enum
+
+    from harbor.agents import factory
+
+    from pier import harbor_bridge as hb
+
+    class Name(enum.Enum):
+        CLAUDE_CODE = "claude-code"
+
+    class Factory:
+        _AGENT_MAP = {Name.CLAUDE_CODE: object}
+
+    monkeypatch.setattr(factory, "AgentFactory", Factory)
+    monkeypatch.setattr(hb, "_binary_agent_map", None)
+    monkeypatch.setattr(hb, "get_agent_binary", lambda name: "claude")
+    assert hb.get_binary_agent_map() == {"claude": "claude-code"}
+
+
+def test_binary_agent_map_finds_claude_in_the_installed_harbor(monkeypatch):
+    """Against the harbor actually installed, not a stand-in."""
+    from pier import harbor_bridge as hb
+
+    monkeypatch.setattr(hb, "_binary_agent_map", None)
+    assert hb.get_binary_agent_map().get("claude") == "claude-code"
