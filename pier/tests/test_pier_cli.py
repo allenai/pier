@@ -3867,6 +3867,8 @@ def test_separate_verify_assembles_output_from_recorded_agent_logs(
     assert data["verifier_result"]["rewards"] == {"reward": 1.0}
     assert data["agent_result"]["cost_usd"] == 0.05
     assert (trial / "agent" / "exec" / timestamp / "trajectory.json").exists()
+    assert (trial / "agent" / "trajectory.json").exists()
+    assert (trial / "agent" / "claude-code.txt").read_text() == "recorded logs"
     assert (live / "claude-code.txt").read_text() == "stale live logs"
 
 

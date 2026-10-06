@@ -1537,6 +1537,7 @@ def _verify_container(
             container_agent_context = harbor_bridge.extract_agent_context(
                 agent, session_path
             )
+            selected_logs = session_path
         else:
             sessions = harbor_bridge.get_agent_session_dirs(agent_dir, agent)
             ts = f" ({sessions[0].name})" if sessions else ""
@@ -1549,6 +1550,9 @@ def _verify_container(
             container_agent_context = harbor_bridge.extract_agent_context(
                 agent, agent_dir
             )
+            selected_logs = sessions[0] if sessions else agent_dir
+        if apart and selected_logs != agent_dir:
+            shutil.copytree(selected_logs, agent_dir, dirs_exist_ok=True)
         if not container_agent_context:
             click.echo(
                 "Warning: trajectory extraction returned no data. "
