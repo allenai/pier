@@ -764,6 +764,11 @@ def record_workspace(
 
     container = get_container_name(harbor_session_id)
     config = TaskConfig.model_validate_toml((task_dir / "task.toml").read_text())
+    if config.steps:
+        raise RuntimeError(
+            "a task with steps is not scored apart by pier verify yet: its record "
+            "would need each step's results"
+        )
     for hook in config.verifier.collect:
         if (hook.service or "main") != "main":
             raise RuntimeError(
@@ -794,7 +799,10 @@ def record_workspace(
             logger.warning("collect hook %r failed (%s)", hook.command, failed)
 
     artifacts_dir = record / "artifacts"
-    collected = []
+    inside = record.resolve()
+    collected: list[tuple[str, str, Path, bool]] = []
+    skipped: list[tuple[str, str]] = []
+    dropped: list[Path] = []
     for artifact in _declared_artifacts(task_dir):
         source = artifact.source
         target = artifact_host_path(artifacts_dir, artifact)
@@ -803,6 +811,21 @@ def record_workspace(
             if target == artifacts_dir
             else f"artifacts/{target.relative_to(artifacts_dir).as_posix()}"
         )
+        # As Harbor collects: an artifact overlapping one collected before it
+        # is left out, so nothing one copy left can lie on another's path.
+        earlier = [t for _, _, t, _ in collected]
+        if any(
+            target == t or t in target.parents or target in t.parents for t in earlier
+        ):
+            logger.warning(
+                "artifact %s overlaps one collected before it; left out, as Harbor "
+                "leaves it",
+                source,
+            )
+            skipped.append((source, destination))
+            continue
+        if not target.resolve().is_relative_to(inside):
+            raise RuntimeError(f"artifact {source} would be written outside the record")
         is_dir = _docker("exec", "-u", "root", container, "test", "-d", source)
         if is_dir.returncode == 0:
             target.mkdir(parents=True, exist_ok=True)
@@ -816,9 +839,11 @@ def record_workspace(
                 + copied.stderr.strip()[-300:]
             )
         collected.append((source, destination, target, is_dir.returncode == 0))
+        dropped += _drop_symlinks(record)
     (record / "agent").mkdir(exist_ok=True)
     _docker("cp", f"{container}:{AGENT_LOGS}/.", str(record / "agent"))
-    for link in _drop_symlinks(record):
+    dropped += _drop_symlinks(record)
+    for link in dropped:
         logger.warning(
             "left %s out of the scored record: it is a symlink, which would "
             "resolve on this host",
@@ -834,6 +859,15 @@ def record_workspace(
         manifest.append(
             ArtifactManifestEntry(
                 source=source, destination=destination, type=kind, status=status
+            ).model_dump(mode="json")
+        )
+    for source, destination in skipped:
+        manifest.append(
+            ArtifactManifestEntry(
+                source=source,
+                destination=destination,
+                type="file" if Path(source).suffix else "directory",
+                status="skipped",
             ).model_dump(mode="json")
         )
     (artifacts_dir / "manifest.json").write_text(json.dumps(manifest, indent=2))
@@ -859,9 +893,22 @@ def record_workspace(
 
 
 def stop_workspace_container(harbor_session_id: str) -> None:
-    """Stop the workspace's container, keeping it for `pier start` to restart:
-    nothing the agent left running there runs while it is scored."""
-    stopped = _docker("stop", get_container_name(harbor_session_id))
+    """Stop the workspace's containers — main, and any service an overlay
+    added — keeping them for `pier start` to restart: nothing the agent left
+    running runs while it is scored. Main is named as well as listed, so a
+    project that lists nothing cannot leave it running."""
+    project = get_compose_project(harbor_session_id)
+    listed = _docker(
+        "ps", "-q", "--filter", f"label=com.docker.compose.project={project}"
+    )
+    if listed.returncode:
+        raise RuntimeError(
+            "could not list the workspace's containers, so it was not scored: "
+            + listed.stderr.strip()
+        )
+    stopped = _docker(
+        "stop", get_container_name(harbor_session_id), *listed.stdout.split()
+    )
     if stopped.returncode:
         raise RuntimeError(
             "could not stop the workspace's container, so it was not scored: "

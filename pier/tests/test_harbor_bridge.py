@@ -742,12 +742,12 @@ def _fake_docker(
     files: dict[str, str],
     exec_rc: int = 0,
     file_sources: tuple[str, ...] = (),
-    links: dict[str, Path] | None = None,
+    links: dict[str, tuple[str, Path]] | None = None,
 ):
     """`docker exec` runs a hook (exit *exec_rc*) or answers `test -d`: every
     source is a directory but *file_sources*. `docker cp` writes `files` for a
-    directory source, a file for a file source, and plants *links*: a symlink
-    named for each source, pointing at a host path."""
+    directory source, a file for a file source, and plants *links*: for a
+    source, a symlink of that name pointing at a host path."""
 
     def docker(*args, timeout=None):
         calls.append(args)
@@ -762,7 +762,8 @@ def _fake_docker(
                 if source in files:
                     (dest / files[source]).write_text("x")
                 if source in (links or {}):
-                    (dest / "leak").symlink_to(links[source])
+                    name, host_path = (links or {})[source]
+                    (dest / name).symlink_to(host_path)
             elif source in file_sources:
                 dest.write_text("x")
         rc = exec_rc if args[0] == "exec" else 0
@@ -860,7 +861,7 @@ def test_a_symlink_the_agent_left_is_not_in_the_record(tmp_path: Path, caplog):
     task = _task(tmp_path, SEPARATE)
     record = tmp_path / "record"
     record.mkdir()
-    docker = _fake_docker([], {}, links={"/workspace": secret})
+    docker = _fake_docker([], {}, links={"/workspace": ("leak", secret)})
     with patch("pier.harbor_bridge._docker", docker):
         harbor_bridge.record_workspace("pier-ws", task, record, "pier")
     leak = record / "artifacts" / "workspace" / "leak"
@@ -938,3 +939,67 @@ def test_binary_agent_map_finds_claude_in_the_installed_harbor(monkeypatch):
 
     monkeypatch.setattr(hb, "_binary_agent_map", None)
     assert hb.get_binary_agent_map().get("claude") == "claude-code"
+
+
+def test_a_symlink_one_artifact_leaves_cannot_redirect_the_next(tmp_path: Path):
+    """The first artifact plants a symlink where the second would land: it
+    must not write through it, onto this host."""
+    host_dir = tmp_path / "host-dir"
+    host_dir.mkdir()
+    toml = (
+        'artifacts = ["/workspace", {source = "/data", destination = "workspace/sub"}]\n'
+        '[verifier]\nenvironment_mode = "separate"\n'
+    )
+    task = _task(tmp_path, toml)
+    record = tmp_path / "record"
+    record.mkdir()
+    docker = _fake_docker(
+        [], {"/data": "planted.txt"}, links={"/workspace": ("sub", host_dir)}
+    )
+    with patch("pier.harbor_bridge._docker", docker):
+        harbor_bridge.record_workspace("pier-ws", task, record, "pier")
+    assert list(host_dir.iterdir()) == []
+    manifest = json.loads((record / "artifacts" / "manifest.json").read_text())
+    entry = next(e for e in manifest if e["source"] == "/data")
+    assert entry["status"] == "skipped"
+
+
+def test_a_task_with_steps_is_refused_before_anything_runs(tmp_path: Path):
+    toml = '[verifier]\nenvironment_mode = "separate"\n[[steps]]\nname = "one"\n'
+    task = _task(tmp_path, toml)
+    record = tmp_path / "record"
+    record.mkdir()
+    calls: list = []
+    with (
+        patch("pier.harbor_bridge._docker", _fake_docker(calls, {})),
+        pytest.raises(RuntimeError, match="with steps"),
+    ):
+        harbor_bridge.record_workspace("pier-ws", task, record, "pier")
+    assert calls == []
+
+
+def test_scoring_stops_every_container_of_the_workspace():
+    """An overlay's services stop with main: nothing keeps running while the
+    work is scored."""
+    calls = []
+
+    def docker(*args, timeout=None):
+        calls.append(args)
+        out = "abc123\ndef456\n" if args[0] == "ps" else ""
+        return MagicMock(returncode=0, stdout=out, stderr="")
+
+    with patch("pier.harbor_bridge._docker", docker):
+        harbor_bridge.stop_workspace_container("pier-ws")
+    project = harbor_bridge.get_compose_project("pier-ws")
+    assert calls[0] == (
+        "ps",
+        "-q",
+        "--filter",
+        f"label=com.docker.compose.project={project}",
+    )
+    assert calls[1] == (
+        "stop",
+        harbor_bridge.get_container_name("pier-ws"),
+        "abc123",
+        "def456",
+    )
