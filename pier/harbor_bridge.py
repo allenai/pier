@@ -1726,20 +1726,32 @@ def copy_trajectory(agent_name: str, logs_dir: Path, into: Path, root: Path) -> 
             trajectory,
         )
         return False
+
+    def left_out() -> bool:
+        # No trajectory is nothing to say; one refused is.
+        if os.path.lexists(trajectory):
+            logger.warning(
+                "left %s out of the trial: it is not a regular file reached "
+                "without following a link, or it is over %d bytes",
+                trajectory,
+                MAX_TRAJECTORY_BYTES,
+            )
+        return False
+
     try:
         relative = PurePosixPath(trajectory.relative_to(root).as_posix())
     except ValueError:
-        return False
+        return left_out()
     fd = _open_under(root, relative)
     if fd is None:
-        return False
+        return left_out()
     with os.fdopen(fd, "rb") as source:
         info = os.fstat(source.fileno())
         if not stat.S_ISREG(info.st_mode) or info.st_size > MAX_TRAJECTORY_BYTES:
-            return False
+            return left_out()
         data = source.read(MAX_TRAJECTORY_BYTES + 1)
     if len(data) > MAX_TRAJECTORY_BYTES:
-        return False
+        return left_out()
     return _write_under(into, "trajectory.json", data)
 
 
@@ -1747,19 +1759,28 @@ def _write_under(into: Path, name: str, data: bytes) -> bool:
     """Write ``into/name`` as a new file: *into* is entered from its parent
     without following a link, and whatever *name* was (a link, a hard link to
     another file) is replaced rather than written through."""
+
+    def not_written(why: OSError) -> bool:
+        logger.warning(
+            "did not write %s: %s (a link where a directory should be is refused)",
+            into / name,
+            why,
+        )
+        return False
+
     try:
         into.parent.mkdir(parents=True, exist_ok=True)
         parent = os.open(into.parent, os.O_RDONLY | os.O_DIRECTORY)
-    except OSError:
-        return False
+    except OSError as e:
+        return not_written(e)
     try:
         with contextlib.suppress(FileExistsError):
             os.mkdir(into.name, dir_fd=parent)
         directory = os.open(
             into.name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent
         )
-    except OSError:
-        return False
+    except OSError as e:
+        return not_written(e)
     finally:
         os.close(parent)
     try:
@@ -1771,8 +1792,8 @@ def _write_under(into: Path, name: str, data: bytes) -> bool:
             0o644,
             dir_fd=directory,
         )
-    except OSError:
-        return False
+    except OSError as e:
+        return not_written(e)
     finally:
         os.close(directory)
     with os.fdopen(out, "wb") as dest:
@@ -1800,14 +1821,16 @@ def _copy_tree_from(
 ) -> None:
     """Copy the directory open at *directory* into *dest*: directories and
     regular files only, each opened without following a link. Links, FIFOs,
-    devices and files over :data:`MAX_TRAJECTORY_BYTES` are left out. *budget*
-    holds the bytes and files copied so far; past a bound, or deeper than
-    :data:`MAX_SESSION_DEPTH`, it raises :class:`_SessionTooLarge`."""
+    devices, unreadable entries and files over :data:`MAX_TRAJECTORY_BYTES`
+    are left out. *budget* holds the bytes copied, the entries copied and the
+    entries left out; past a bound, or deeper than :data:`MAX_SESSION_DEPTH`,
+    it raises :class:`_SessionTooLarge`."""
     if depth > MAX_SESSION_DEPTH:
         raise _SessionTooLarge(f"deeper than {MAX_SESSION_DEPTH} directories")
     dest.mkdir(parents=True, exist_ok=True)
     for entry in os.scandir(directory):
         if entry.is_symlink():
+            budget[2] += 1
             continue
         if entry.is_dir(follow_symlinks=False):
             budget[1] += 1
@@ -1822,6 +1845,7 @@ def _copy_tree_from(
                     dir_fd=directory,
                 )
             except OSError:
+                budget[2] += 1
                 continue
             try:
                 _copy_tree_from(inner, dest / entry.name, budget, depth + 1)
@@ -1830,10 +1854,12 @@ def _copy_tree_from(
         elif entry.is_file(follow_symlinks=False):
             fd = _open_file_in(directory, entry.name)
             if fd is None:
+                budget[2] += 1
                 continue
             with os.fdopen(fd, "rb") as source:
                 data = source.read(MAX_TRAJECTORY_BYTES + 1)
             if len(data) > MAX_TRAJECTORY_BYTES:
+                budget[2] += 1
                 continue
             budget[0] += len(data)
             budget[1] += 1
@@ -1843,6 +1869,8 @@ def _copy_tree_from(
                     "and directories"
                 )
             (dest / entry.name).write_bytes(data)
+        else:
+            budget[2] += 1
 
 
 def extract_session(
@@ -1869,19 +1897,37 @@ def extract_session(
     try:
         relative = PurePosixPath(session.relative_to(root).as_posix())
     except ValueError:
+        logger.warning(
+            "did not extract %s: it is not in the agent's logs, %s", session, root
+        )
         return None, None
     directory = _open_dir_under(root, relative)
     if directory is None:
+        # No session yet is nothing to say; one refused is.
+        if os.path.lexists(session):
+            logger.warning(
+                "did not extract %s: it cannot be reached from the agent's logs "
+                "without following a link",
+                session,
+            )
         return None, None
+    budget = [0, 0, 0]
     with tempfile.TemporaryDirectory() as scratch:
         copy = Path(scratch) / "session"
         try:
-            _copy_tree_from(directory, copy, [0, 0])
+            _copy_tree_from(directory, copy, budget)
         except _SessionTooLarge as e:
             logger.warning("did not extract the agent's session: it is %s", e)
             return None, None
         finally:
             os.close(directory)
+        if budget[2]:
+            logger.warning(
+                "left %d entries out of the agent's session before extracting it: "
+                "links, special files, unreadable ones or files over %d bytes",
+                budget[2],
+                MAX_TRAJECTORY_BYTES,
+            )
         context = extract_agent_context(agent_name, copy)
         trajectory = copy / "trajectory.json"
         data = None
@@ -1889,6 +1935,10 @@ def extract_session(
             with trajectory.open("rb") as written:
                 data = written.read(MAX_TRAJECTORY_BYTES + 1)
             if len(data) > MAX_TRAJECTORY_BYTES:
+                logger.warning(
+                    "left the trajectory out of the trial: it is over %d bytes",
+                    MAX_TRAJECTORY_BYTES,
+                )
                 data = None
     return context, data
 
