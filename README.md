@@ -155,7 +155,7 @@ pier start                                  # restart a stopped container
 - `--no-mount` keeps workspace files inside the container only (no bind-mount to host). `pier stop` copies files back. Note: Harbor's internal mounts (agent logs, verifier output) still write to the host under `.pier/`.
 - `-f` / `--force` allows starting in a non-empty directory.
 - `--delete` replaces the pier workspace at `-d`: its container is stopped and its directory deleted, then a fresh one starts. If the container cannot be stopped, nothing is deleted.
-- `--exec "<command>"` runs a command in the container once it has started (container mode only).
+- `--exec "<command>"` runs a command in the container once it has started (container mode only), without a shell: for pipes or redirection, pass `"sh -c '...'"`.
 - `--host` skips the container (workspace only).
 - `--agent` installs a coding agent. To install additional agents, run `pier start --agent <name>` again from the workspace. When `task_path` is omitted, it operates on the current workspace.
 

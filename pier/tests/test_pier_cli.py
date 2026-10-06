@@ -1702,6 +1702,49 @@ def test_start_delete_needs_a_task_or_image(runner, index_path):
     assert "--delete needs a task path or --image" in result.output
 
 
+@patch("pier.harbor_bridge.download_task")
+def test_start_delete_never_infers_the_workspace(
+    mock_download, runner, index_path, task_dir, tmp_path, monkeypatch
+):
+    """A remote task's workspace defaults to ./<task-name>; --delete must not
+    delete a directory nobody named."""
+    mock_download.return_value = task_dir
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("PWD", str(tmp_path))
+    inferred = tmp_path / task_dir.name
+    inferred.mkdir(exist_ok=True)
+    _write_session(inferred, _container_session(task_dir=str(task_dir)), index_path)
+    (inferred / "work.txt").write_text("keep me")
+    result = runner.invoke(
+        cli, ["start", "https://github.com/org/repo#tasks/my-task", "--delete"]
+    )
+    assert result.exit_code != 0
+    assert "never inferred" in result.output
+    assert (inferred / "work.txt").read_text() == "keep me"
+
+
+@patch("pier.harbor_bridge.stop_environment")
+def test_stop_all_goes_on_past_a_workspace_it_cannot_query(
+    mock_stop, runner, index_path, tmp_path
+):
+    """Asking whether one container runs can fail too; the others still stop."""
+    for name in ("ws1", "ws2"):
+        ws = tmp_path / name
+        ws.mkdir()
+        _write_session(
+            ws, _container_session(harbor_session_id=f"pier-{name}"), index_path
+        )
+    with patch(
+        "pier.harbor_bridge.is_environment_running",
+        side_effect=[RuntimeError("docker is not answering"), True],
+    ):
+        result = runner.invoke(cli, ["stop", "--all"])
+    assert result.exit_code != 0
+    assert "Could not stop 'ws1': docker is not answering" in result.output
+    assert "Container for 'ws2' stopped." in result.output
+    mock_stop.assert_called_once()
+
+
 @patch("pier.harbor_bridge.exec_in_container", return_value=0)
 @patch("pier.harbor_bridge.is_environment_running", return_value=True)
 @patch("pier.harbor_bridge.start_environment")

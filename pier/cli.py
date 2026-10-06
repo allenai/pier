@@ -649,7 +649,11 @@ def cli():
     "--exec",
     "exec_cmd",
     default=None,
-    help="Run a command in the container once it has started (container mode only).",
+    help=(
+        "Run a command in the container once it has started (container mode "
+        "only). It runs without a shell; for pipes or redirection, pass "
+        "\"sh -c '...'\"."
+    ),
 )
 def start(
     task_path: str | None,
@@ -694,10 +698,10 @@ def start(
         raise click.ClickException("--no-mount and --host are mutually exclusive.")
     if host and exec_cmd:
         raise click.ClickException("--exec cannot be used with --host.")
-    if delete_workspace and task_path is None and not image:
+    if delete_workspace and (not workspace_dir or (task_path is None and not image)):
         raise click.ClickException(
-            "--delete needs a task path or --image, and -d: it replaces the "
-            "workspace at -d with a fresh one."
+            "--delete needs a task path or --image, and -d naming the workspace "
+            "it replaces: it is never inferred."
         )
     if host and extra_env_cli:
         raise click.ClickException("-e cannot be used with --host.")
@@ -1767,13 +1771,14 @@ def stop(workspace_dir: str | None, stop_all: bool) -> None:
         for sess, workspace in _all_workspaces():
             if sess.get("mode") != "container":
                 continue
-            if not harbor_bridge.is_environment_running(_get_hsid(sess, workspace)):
-                continue
             try:
+                if not harbor_bridge.is_environment_running(_get_hsid(sess, workspace)):
+                    continue
                 _stop_workspace(sess, workspace)
-            except click.ClickException as e:
+            except Exception as e:
+                reason = e.message if isinstance(e, click.ClickException) else e
                 click.echo(
-                    f"Could not stop {_workspace_label(workspace)!r}: {e.message}",
+                    f"Could not stop {_workspace_label(workspace)!r}: {reason}",
                     err=True,
                 )
                 failed += 1
