@@ -11,6 +11,7 @@ import os
 import pytest
 from click.testing import CliRunner
 
+from pier import harbor_bridge
 from pier.cli import cli
 
 
@@ -2239,6 +2240,60 @@ def test_verify_container_session_dir_copies_from_container(
     assert mock_copy.call_args[0][1] == "/root/.claude"
 
 
+def _copy_a_session_with_its_trajectory(hsid, container_path, dest):
+    dest.mkdir(parents=True, exist_ok=True)
+    (dest / "trajectory.json").write_text('{"steps": []}')
+
+
+@pytest.mark.skipif(
+    not harbor_bridge._can_open_without_links(),
+    reason="this platform leaves the trajectory beside the logs",
+)
+@patch("pier.harbor_bridge.extract_agent_logs", return_value={"cost_usd": 0.05})
+@patch("pier.cli._copy_session_from_container", _copy_a_session_with_its_trajectory)
+@patch("pier.harbor_bridge.verify_environment", return_value={"reward": 1.0})
+@patch("pier.harbor_bridge.is_environment_running", return_value=True)
+def test_verify_container_session_dir_keeps_its_trajectory(
+    mock_running, mock_verify, mock_extract, runner, index_path, task_dir, tmp_path
+):
+    """A session dir chosen inside the container can already hold a trajectory."""
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    _write_session(ws, _container_session(task_dir=str(task_dir)), index_path)
+    result = runner.invoke(
+        cli,
+        ["verify", "--agent", "claude-code", "--session-dir", "/logs/agent/exec/x"],
+        catch_exceptions=False,
+    )
+    assert result.exit_code == 0, result.output
+    trial = next((ws / ".pier" / "trials").iterdir())
+    assert (trial / "agent" / "trajectory.json").read_text() == '{"steps": []}'
+
+
+@pytest.mark.skipif(
+    not harbor_bridge._can_open_without_links(),
+    reason="this platform leaves the trajectory beside the logs",
+)
+@patch("pier.harbor_bridge.extract_agent_logs", return_value={"cost_usd": 0.05})
+@patch("pier.cli._copy_session_from_container", _copy_a_session_with_its_trajectory)
+def test_capture_container_session_dir_keeps_its_trajectory(
+    mock_extract, runner, index_path, tmp_path, monkeypatch
+):
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    _write_session(ws, _container_session(), index_path)
+    monkeypatch.chdir(ws)
+    monkeypatch.setenv("PWD", str(ws))
+    result = runner.invoke(
+        cli,
+        ["capture", "--agent", "claude-code", "--session-dir", "/logs/agent/exec/x"],
+        catch_exceptions=False,
+    )
+    assert result.exit_code == 0, result.output
+    trial = next((ws / ".pier" / "trials").iterdir())
+    assert (trial / "agent" / "trajectory.json").read_text() == '{"steps": []}'
+
+
 def test_verify_host_custom_trial_dir(runner, index_path, task_dir, tmp_path):
     """--trial-dir overrides the auto-generated trial directory for host mode."""
     ws = tmp_path / "ws"
@@ -2584,6 +2639,32 @@ def test_capture_explicit_session_dir(
     assert "trajectory extracted" in result.output.lower()
 
 
+@pytest.mark.skipif(
+    not harbor_bridge._can_open_without_links(),
+    reason="this platform leaves the trajectory beside the logs",
+)
+@patch("pier.harbor_bridge.extract_agent_logs", return_value={"cost_usd": 0.05})
+def test_capture_local_session_dir_keeps_its_trajectory(
+    mock_extract, runner, index_path, tmp_path, monkeypatch
+):
+    session_dir = tmp_path / "session"
+    session_dir.mkdir()
+    (session_dir / "trajectory.json").write_text('{"steps": []}')
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    _write_session(ws, _host_session(), index_path)
+    monkeypatch.chdir(ws)
+    monkeypatch.setenv("PWD", str(ws))
+    result = runner.invoke(
+        cli,
+        ["capture", "--session-dir", str(session_dir), "-a", "claude-code"],
+        catch_exceptions=False,
+    )
+    assert result.exit_code == 0, result.output
+    trial = next((ws / ".pier" / "trials").iterdir())
+    assert (trial / "agent" / "trajectory.json").read_text() == '{"steps": []}'
+
+
 def test_capture_session_dir_without_agent_errors(
     runner, index_path, tmp_path, monkeypatch
 ):
@@ -2715,6 +2796,204 @@ def test_capture_container_auto_discover(
     assert result.exit_code == 0
     assert "trajectory extracted" in result.output.lower()
     mock_extract.assert_called_once()
+
+
+def _claude_session_with_trajectory(ws: Path) -> None:
+    session = ws / ".pier" / "_harbor" / "agent" / "exec" / "2026-01-01_00-00-00-000000"
+    session.mkdir(parents=True)
+    (session / "claude-code.txt").write_text("a session\n")
+    (session / "trajectory.json").write_text('{"steps": []}')
+
+
+@pytest.mark.skipif(
+    not harbor_bridge._can_open_without_links(),
+    reason="this platform leaves the trajectory beside the logs",
+)
+@patch("pier.harbor_bridge.extract_agent_context", return_value={"cost_usd": 0.05})
+@patch("pier.harbor_bridge.verify_environment", return_value={"reward": 1.0})
+@patch("pier.harbor_bridge.is_environment_running", return_value=True)
+def test_verify_puts_the_trajectory_in_the_trial(
+    mock_running,
+    mock_verify,
+    mock_extract,
+    runner,
+    index_path,
+    task_dir,
+    tmp_path,
+    monkeypatch,
+):
+    """Harbor writes the trajectory beside the session's logs; the trial is
+    what is read afterwards."""
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    sess = _container_session(task_dir=str(task_dir), agents=["claude-code"])
+    _write_session(ws, sess, index_path)
+    _claude_session_with_trajectory(ws)
+    monkeypatch.chdir(ws)
+    monkeypatch.setenv("PWD", str(ws))
+    result = runner.invoke(cli, ["verify"], catch_exceptions=False)
+    assert result.exit_code == 0, result.output
+    trial = next((ws / ".pier" / "trials").iterdir())
+    assert (trial / "agent" / "trajectory.json").read_text() == '{"steps": []}'
+
+
+@pytest.mark.skipif(
+    not harbor_bridge._can_open_without_links(),
+    reason="this platform leaves the trajectory beside the logs",
+)
+@patch("pier.harbor_bridge.extract_agent_context", return_value={"cost_usd": 0.05})
+def test_capture_puts_the_trajectory_in_the_trial(
+    mock_extract, runner, index_path, tmp_path, monkeypatch
+):
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    _write_session(ws, _container_session(agents=["claude-code"]), index_path)
+    _claude_session_with_trajectory(ws)
+    monkeypatch.chdir(ws)
+    monkeypatch.setenv("PWD", str(ws))
+    result = runner.invoke(cli, ["capture"], catch_exceptions=False)
+    assert result.exit_code == 0, result.output
+    trial = next((ws / ".pier" / "trials").iterdir())
+    assert (trial / "agent" / "trajectory.json").read_text() == '{"steps": []}'
+
+
+@patch(
+    "pier.harbor_bridge.get_binary_agent_map",
+    return_value={"claude": "claude-code"},
+)
+@patch("pier.harbor_bridge.is_environment_running", return_value=True)
+def test_exec_claude_starts_with_what_setup_registered(
+    mock_running, mock_map, runner, index_path, tmp_path
+):
+    """Each exec has a config dir of its own, which started empty: Claude Code
+    ran with none of its skills and asked to log in."""
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    _write_session(ws, _container_session(agents=["claude-code"]), index_path)
+    with patch("subprocess.run", return_value=MagicMock(returncode=0)) as mock_run:
+        runner.invoke(cli, ["exec", "claude", "--print", "hello"])
+    calls = [" ".join(c[0][0]) for c in mock_run.call_args_list]
+    seeded = [i for i, c in enumerate(calls) if "cd /logs/agent/sessions;" in c]
+    ran = [i for i, c in enumerate(calls) if "claude-code.txt" in c]
+    assert seeded and ran and seeded[0] < ran[0], calls
+
+
+@patch(
+    "pier.harbor_bridge.get_binary_agent_map",
+    return_value={"claude": "claude-code"},
+)
+@patch("pier.harbor_bridge.is_environment_running", return_value=True)
+def test_exec_claude_says_so_when_setup_cannot_be_given_it(
+    mock_running, mock_map, runner, index_path, tmp_path
+):
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    _write_session(ws, _container_session(agents=["claude-code"]), index_path)
+
+    def run(args, **kwargs):
+        seeding = "cd /logs/agent/sessions;" in " ".join(args)
+        return MagicMock(returncode=1 if seeding else 0)
+
+    with patch("subprocess.run", side_effect=run):
+        result = runner.invoke(cli, ["exec", "claude", "--print", "hello"])
+    assert "could not give this session what setup registered" in result.output
+
+
+def _a_skill(tmp_path: Path) -> Path:
+    skill = tmp_path / "my-skill"
+    skill.mkdir()
+    (skill / "SKILL.md").write_text("---\nname: my-skill\ndescription: d\n---\nbody\n")
+    return skill
+
+
+@patch("pier.harbor_bridge.start_environment")
+def test_start_task_free_mounts_its_skills(mock_start, runner, index_path, tmp_path):
+    """--skill was accepted in task-free mode and never reached the container."""
+    ws = tmp_path / "ws"
+    result = runner.invoke(
+        cli,
+        [
+            "start",
+            "-d",
+            str(ws),
+            "--image",
+            "ubuntu:24.04",
+            "--skill",
+            str(_a_skill(tmp_path)),
+        ],
+        catch_exceptions=False,
+    )
+    assert result.exit_code == 0, result.output
+    mounts = mock_start.call_args[1]["extra_mounts"]
+    assert any(":/harbor/skills" in m for m in mounts), mounts
+    assert (ws / ".pier" / "skills" / "my-skill" / "SKILL.md").exists()
+
+
+@patch("pier.harbor_bridge.is_environment_running", return_value=True)
+def test_start_task_free_refuses_skill_for_an_existing_workspace(
+    mock_running, runner, index_path, tmp_path
+):
+    """A workspace's skills are set when it is created; a later --skill was
+    dropped without a word."""
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    _write_session(ws, _task_free_session(tmp_path), index_path)
+    result = runner.invoke(
+        cli,
+        [
+            "start",
+            "-d",
+            str(ws),
+            "--image",
+            "ubuntu:24.04",
+            "--skill",
+            str(_a_skill(tmp_path)),
+        ],
+    )
+    assert result.exit_code != 0
+    assert "applied when a workspace is created" in result.output
+
+
+@patch("pier.harbor_bridge.is_environment_running", return_value=True)
+def test_start_refuses_skill_for_an_existing_task_workspace(
+    mock_running, runner, index_path, task_dir, tmp_path
+):
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    _write_session(ws, _container_session(task_dir=str(task_dir)), index_path)
+    result = runner.invoke(
+        cli, ["start", str(task_dir), "-d", str(ws), "--skill", str(_a_skill(tmp_path))]
+    )
+    assert result.exit_code != 0
+    assert "applied when a workspace is created" in result.output
+
+
+@patch("pier.harbor_bridge.stop_environment")
+@patch("pier.harbor_bridge.start_environment")
+def test_start_delete_with_skill_replaces_the_workspace_with_it(
+    mock_start, mock_stop, runner, index_path, task_dir, tmp_path
+):
+    """--delete makes the workspace new, so --skill applies rather than being
+    refused for the workspace it replaces."""
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    _write_session(ws, _container_session(task_dir=str(task_dir)), index_path)
+    result = runner.invoke(
+        cli,
+        [
+            "start",
+            str(task_dir),
+            "-d",
+            str(ws),
+            "--delete",
+            "--skill",
+            str(_a_skill(tmp_path)),
+        ],
+        catch_exceptions=False,
+    )
+    assert result.exit_code == 0, result.output
+    mounts = mock_start.call_args[1]["extra_mounts"]
+    assert any("skills" in m for m in mounts), mounts
 
 
 @patch("pier.harbor_bridge.extract_agent_context", return_value=None)

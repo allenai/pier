@@ -28,7 +28,9 @@ import json
 import logging
 import os
 import re
+import shlex
 import shutil
+import stat
 import subprocess
 import sys
 from collections.abc import Callable
@@ -1266,6 +1268,31 @@ def get_log_capture_env(base_dir: str | None = None) -> dict[str, str]:
     return env
 
 
+def seed_agent_config_command(agent_name: str, config_dir: str) -> str | None:
+    """A shell command giving one exec's config dir what setup registered.
+
+    Setup registers claude-code's onboarding flag and MCP servers
+    (``.claude.json``), model (``settings.json``), skills and memory files in
+    the setup config dir, and each ``pier exec`` points CLAUDE_CONFIG_DIR at a
+    session dir of its own so logs do not collide: without this the agent
+    starts with none of its skills and asks to log in. Only those are copied,
+    not any session history the setup dir holds."""
+    setup_dir = _claude_config_dir()
+    if agent_name != "claude-code" or not config_dir or config_dir == setup_dir:
+        return None
+    to = shlex.quote(config_dir)
+    return (
+        f"set -e; mkdir -p {to}; "
+        f"if [ -d {shlex.quote(setup_dir)} ]; then cd {shlex.quote(setup_dir)}; "
+        f"for f in .claude.json settings.json; do "
+        f'if [ -f "$f" ]; then cp -p "$f" {to}/; fi; done; '
+        f"if [ -d skills ]; then cp -a skills {to}/; fi; "
+        f'for m in projects/*/memory; do if [ -d "$m" ]; then '
+        f'mkdir -p {to}/"${{m%/memory}}"; cp -a "$m" {to}/"${{m%/memory}}"/; '
+        f"fi; done; fi"
+    )
+
+
 def get_post_run_commands(agent_name: str, log_dir: str) -> list[str]:
     """Shell commands to collect agent artifacts after an interactive run.
 
@@ -1616,6 +1643,93 @@ def extract_agent_context(agent_name: str, logs_dir: Path) -> dict | None:
 
     result = context.model_dump(exclude_none=True)
     return result if result else None
+
+
+#: Beyond this a trajectory is not copied into the trial.
+MAX_TRAJECTORY_BYTES = 256 * 1024 * 1024
+
+
+def _can_open_without_links() -> bool:
+    """Whether this platform can open a path one component at a time without
+    following a link (not Windows)."""
+    return os.open in os.supports_dir_fd and hasattr(os, "O_NOFOLLOW")
+
+
+def _open_under(root: Path, relative: PurePosixPath) -> int | None:
+    """A read-only descriptor for ``root/relative``, or None.
+
+    Each component below *root* is opened from the one before it without
+    following a link, so nothing swapped in after a check can redirect the
+    read; non-blocking, so a FIFO cannot hang it."""
+    try:
+        fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+    except OSError:
+        return None
+    try:
+        for part in relative.parts[:-1]:
+            inner = os.open(
+                part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd
+            )
+            os.close(fd)
+            fd = inner
+        return os.open(
+            relative.parts[-1],
+            os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
+            dir_fd=fd,
+        )
+    except OSError:
+        return None
+    finally:
+        os.close(fd)
+
+
+def copy_trajectory(agent_name: str, logs_dir: Path, into: Path, root: Path) -> bool:
+    """Copy the trajectory Harbor wrote beside the logs
+    :func:`extract_agent_context` read into a trial's agent dir, and say
+    whether there was one.
+
+    *root* is the agent logs dir mounted from the container, and what lies
+    under it is the agent's to arrange while it runs: a link, a FIFO or a
+    swapped directory. The trajectory is copied only as a regular file reached
+    from *root* without following a link, and written without following one.
+    The trial itself is under pier's own ``.pier/``, hidden from the
+    container. Where the platform cannot open a path that way, the trajectory
+    is left beside the session's logs."""
+    trajectory = (_latest_session_dir(logs_dir, agent_name) or logs_dir) / (
+        "trajectory.json"
+    )
+    if not _can_open_without_links():
+        logger.warning(
+            "left %s beside the session's logs: this platform cannot open it "
+            "there without following links",
+            trajectory,
+        )
+        return False
+    try:
+        relative = PurePosixPath(trajectory.relative_to(root).as_posix())
+    except ValueError:
+        return False
+    fd = _open_under(root, relative)
+    if fd is None:
+        return False
+    with os.fdopen(fd, "rb") as source:
+        info = os.fstat(source.fileno())
+        if not stat.S_ISREG(info.st_mode) or info.st_size > MAX_TRAJECTORY_BYTES:
+            return False
+        data = source.read(MAX_TRAJECTORY_BYTES + 1)
+    if len(data) > MAX_TRAJECTORY_BYTES:
+        return False
+    into.mkdir(parents=True, exist_ok=True)
+    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_BINARY", 0)
+    try:
+        out = os.open(
+            into / "trajectory.json", flags | getattr(os, "O_NOFOLLOW", 0), 0o644
+        )
+    except OSError:
+        return False
+    with os.fdopen(out, "wb") as dest:
+        dest.write(data)
+    return True
 
 
 # ---------------------------------------------------------------------------

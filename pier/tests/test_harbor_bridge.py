@@ -1,6 +1,8 @@
 """Tests for harbor_bridge helpers (no Harbor or Docker required)."""
 
 import json
+import os
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -969,6 +971,140 @@ def test_binary_agent_map_finds_claude_in_the_installed_harbor(monkeypatch):
 
     monkeypatch.setattr(hb, "_binary_agent_map", None)
     assert hb.get_binary_agent_map().get("claude") == "claude-code"
+
+
+def test_seed_agent_config_is_only_for_another_claude_config_dir():
+    setup = harbor_bridge._claude_config_dir()
+    exec_dir = "/logs/agent/exec/x/sessions"
+    assert harbor_bridge.seed_agent_config_command("claude-code", exec_dir)
+    assert harbor_bridge.seed_agent_config_command("claude-code", setup) is None
+    assert harbor_bridge.seed_agent_config_command("codex", exec_dir) is None
+
+
+@pytest.mark.skipif(os.name == "nt", reason="the command runs in a Linux container")
+def test_seed_agent_config_copies_what_setup_registered_and_no_history(
+    tmp_path: Path, monkeypatch
+):
+    """Setup registers the onboarding flag, MCP servers, model, skills and
+    memory files; an earlier session's history stays where it is."""
+    import subprocess
+
+    setup = tmp_path / "sessions"
+    for path, text in {
+        ".claude.json": "{}",
+        "settings.json": "{}",
+        "skills/my-skill/SKILL.md": "body",
+        "projects/-app/memory/notes.md": "remember",
+        "projects/-app/earlier-session.jsonl": "history",
+        "todos/t.json": "[]",
+    }.items():
+        (setup / path).parent.mkdir(parents=True, exist_ok=True)
+        (setup / path).write_text(text)
+    monkeypatch.setattr(harbor_bridge, "_claude_config_dir", lambda: str(setup))
+    exec_dir = tmp_path / "exec" / "x" / "sessions"
+    cmd = harbor_bridge.seed_agent_config_command("claude-code", str(exec_dir))
+    assert cmd
+    subprocess.run(["sh", "-c", cmd], check=True)
+    copied = sorted(
+        p.relative_to(exec_dir).as_posix() for p in exec_dir.rglob("*") if p.is_file()
+    )
+    assert copied == [
+        ".claude.json",
+        "projects/-app/memory/notes.md",
+        "settings.json",
+        "skills/my-skill/SKILL.md",
+    ]
+
+
+def _mounted_logs(tmp_path: Path) -> tuple[Path, Path]:
+    """The agent logs dir mounted from the container, and one exec's session."""
+    root = tmp_path / "agent"
+    session = root / "exec" / "2026-01-01_00-00-00-000000"
+    session.mkdir(parents=True)
+    return root, session
+
+
+@pytest.mark.skipif(
+    not harbor_bridge._can_open_without_links(),
+    reason="this platform leaves the trajectory beside the logs",
+)
+def test_copy_trajectory_puts_harbors_trajectory_in_the_trial(tmp_path: Path):
+    root, session = _mounted_logs(tmp_path)
+    (session / "trajectory.json").write_text('{"steps": []}')
+    into = tmp_path / "trial" / "agent"
+    assert harbor_bridge.copy_trajectory("claude-code", session, into, root=root)
+    assert (into / "trajectory.json").read_text() == '{"steps": []}'
+
+
+def test_copy_trajectory_declines_where_it_cannot_open_without_links(
+    tmp_path: Path, monkeypatch, caplog
+):
+    """Without dir_fd and O_NOFOLLOW (Windows) a component could be swapped
+    for a link between a check and the open: the trajectory stays put."""
+    root, session = _mounted_logs(tmp_path)
+    (session / "trajectory.json").write_text('{"steps": []}')
+    monkeypatch.setattr(harbor_bridge, "_can_open_without_links", lambda: False)
+    into = tmp_path / "trial" / "agent"
+    assert not harbor_bridge.copy_trajectory("claude-code", session, into, root=root)
+    assert not (into / "trajectory.json").exists()
+    assert "beside the session's logs" in caplog.text
+
+
+def test_copy_trajectory_does_not_follow_a_symlinked_file(tmp_path: Path):
+    """A symlink the agent left in its mounted logs would resolve on this host."""
+    secret = tmp_path / "host-secret"
+    secret.write_text("not the agent's")
+    root, session = _mounted_logs(tmp_path)
+    (session / "trajectory.json").symlink_to(secret)
+    into = tmp_path / "trial" / "agent"
+    assert not harbor_bridge.copy_trajectory("claude-code", session, into, root=root)
+    assert not (into / "trajectory.json").exists()
+
+
+def test_copy_trajectory_does_not_follow_a_symlinked_directory(tmp_path: Path):
+    """The agent can make a session dir itself a link to a host directory."""
+    host_dir = tmp_path / "host-dir"
+    host_dir.mkdir()
+    (host_dir / "trajectory.json").write_text("not the agent's")
+    root = tmp_path / "agent"
+    (root / "exec").mkdir(parents=True)
+    session = root / "exec" / "2026-01-01_00-00-00-000000"
+    session.symlink_to(host_dir)
+    into = tmp_path / "trial" / "agent"
+    assert not harbor_bridge.copy_trajectory("claude-code", session, into, root=root)
+    assert not (into / "trajectory.json").exists()
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="no FIFOs on this platform")
+def test_copy_trajectory_does_not_hang_on_a_fifo(tmp_path: Path):
+    """The agent can leave a FIFO where the trajectory goes; opening one for
+    reading blocks until someone writes to it."""
+    root, session = _mounted_logs(tmp_path)
+    os.mkfifo(session / "trajectory.json")
+    into = tmp_path / "trial" / "agent"
+    copied: list[bool] = []
+    worker = threading.Thread(
+        target=lambda: copied.append(
+            harbor_bridge.copy_trajectory("claude-code", session, into, root=root)
+        ),
+        daemon=True,
+    )
+    worker.start()
+    worker.join(5)
+    assert not worker.is_alive(), "copying the trajectory blocked on a FIFO"
+    assert copied == [False]
+
+
+def test_copy_trajectory_does_not_write_through_a_link_in_the_trial(tmp_path: Path):
+    root, session = _mounted_logs(tmp_path)
+    (session / "trajectory.json").write_text('{"steps": []}')
+    host_file = tmp_path / "host-file"
+    host_file.write_text("untouched")
+    into = tmp_path / "trial" / "agent"
+    into.mkdir(parents=True)
+    (into / "trajectory.json").symlink_to(host_file)
+    assert not harbor_bridge.copy_trajectory("claude-code", session, into, root=root)
+    assert host_file.read_text() == "untouched"
 
 
 def test_a_symlink_one_artifact_leaves_cannot_redirect_the_next(tmp_path: Path):

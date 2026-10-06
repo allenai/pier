@@ -501,6 +501,11 @@ def _assemble_trial_output(
             raise click.ClickException(
                 "Pass -a/--agent with --session-dir to specify the agent."
             )
+        # A trajectory the session dir already holds, which one Harbor writes
+        # from its logs then replaces.
+        harbor_bridge.copy_trajectory(
+            agent, Path(session_dir), trial_dir / "agent", root=Path(session_dir)
+        )
         agent_context = harbor_bridge.extract_agent_logs(
             agent,
             Path(session_dir),
@@ -766,6 +771,7 @@ def start(
             no_mount=no_mount,
             force=force,
             delete_workspace=delete_workspace,
+            skill_paths=[Path(p) for p in skill_paths],
         )
         if exec_argv:
             _exec_after_start(workspace, exec_argv)
@@ -811,6 +817,8 @@ def start(
         )
     if delete_workspace and _session_json_path(workspace).exists():
         _delete_workspace(workspace)
+    if skill_paths and _session_json_path(workspace).exists():
+        raise click.ClickException(_SKILL_ON_AN_EXISTING_WORKSPACE)
 
     # Collision check — existing session in this workspace
     if _session_json_path(workspace).exists():
@@ -962,6 +970,11 @@ def _start_existing(agent: str | None) -> None:
 
 
 _HARBOR_DEFAULT_SKILLS_DIR = "/harbor/skills"
+
+_SKILL_ON_AN_EXISTING_WORKSPACE = (
+    "--skill is applied when a workspace is created, and this one exists. "
+    "Start a new workspace to change its skills."
+)
 
 
 def _inject_skills(
@@ -1193,6 +1206,7 @@ def _start_task_free(
     force: bool = False,
     extra_compose: list[str] | None = None,
     delete_workspace: bool = False,
+    skill_paths: list[Path] | None = None,
 ) -> None:
     """Start a task-free container from a base image.
 
@@ -1202,6 +1216,8 @@ def _start_task_free(
     """
     if delete_workspace and _session_json_path(workspace).exists():
         _delete_workspace(workspace)
+    if skill_paths and _session_json_path(workspace).exists():
+        raise click.ClickException(_SKILL_ON_AN_EXISTING_WORKSPACE)
 
     # If workspace already has a session, handle like _start_existing
     if _session_json_path(workspace).exists():
@@ -1254,6 +1270,13 @@ def _start_task_free(
     pier_dir.mkdir(parents=True, exist_ok=True)
     task_dir = harbor_bridge.create_synthetic_task_dir(image, pier_dir)
 
+    # --skill mounts as it does for a task, at the default skills dir.
+    skills_dir_override: str | None = None
+    injected = _inject_skills(skill_paths or [], workspace, task_dir)
+    if injected:
+        mount, skills_dir_override = injected
+        extra_mounts = [*(extra_mounts or []), mount]
+
     # Reuse the standard container start path
     _start_container(
         task_dir,
@@ -1264,6 +1287,7 @@ def _start_task_free(
         extra_compose=extra_compose,
         extra_env=extra_env,
         no_mount=no_mount,
+        skills_dir_override=skills_dir_override,
     )
 
     # Update session with task-free metadata (overwrite what _start_container wrote)
@@ -1412,6 +1436,16 @@ def _exec_container(
 
     for k, v in harbor_bridge.get_log_capture_env(container_session_dir).items():
         env.setdefault(k, v)
+
+    seed = active_agent and harbor_bridge.seed_agent_config_command(
+        active_agent, env.get("CLAUDE_CONFIG_DIR", "")
+    )
+    if seed and harbor_bridge.exec_in_container(hsid, task_dir, ["sh", "-c", seed]):
+        click.echo(
+            f"Warning: could not give this session what setup registered for "
+            f"{active_agent} (its skills, the onboarding flag); it starts without them.",
+            err=True,
+        )
 
     rc = harbor_bridge.exec_in_container(
         hsid,
@@ -1618,9 +1652,7 @@ def _verify_container(
                     f"Session {session!r} not found in {agent_dir}."
                 )
             click.echo(f"Extracting {agent} trajectory ({session}).")
-            container_agent_context = harbor_bridge.extract_agent_context(
-                agent, session_path
-            )
+            read_from = session_path
         else:
             sessions = harbor_bridge.get_agent_session_dirs(agent_dir, agent)
             ts = f" ({sessions[0].name})" if sessions else ""
@@ -1630,10 +1662,13 @@ def _verify_container(
                     f"  (using latest of {len(sessions)} sessions"
                     " — pass --session <timestamp> to select)"
                 )
-            container_agent_context = harbor_bridge.extract_agent_context(
-                agent, agent_dir
+            read_from = agent_dir
+        container_agent_context = harbor_bridge.extract_agent_context(agent, read_from)
+        if container_agent_context:
+            harbor_bridge.copy_trajectory(
+                agent, read_from, verify_trial_dir / "agent", root=agent_dir
             )
-        if not container_agent_context:
+        else:
             click.echo(
                 "Warning: trajectory extraction returned no data. "
                 "Try --session-dir to specify the session location.",
@@ -2089,6 +2124,8 @@ def capture(agent: str | None, session_dir: str | None, session: str | None) -> 
     # Discover session directory
     resolved_session_dir: Path | None = None
     container_agent_context = None
+    read_from: Path | None = None
+    read_root: Path | None = None
     _container_session_tmpdir: tempfile.TemporaryDirectory | None = None
 
     if session_dir and sess and sess.get("mode") == "container":
@@ -2131,9 +2168,7 @@ def capture(agent: str | None, session_dir: str | None, session: str | None) -> 
                         f"Session {session!r} not found in {agent_dir}."
                     )
                 click.echo(f"Extracting {agent} trajectory ({session}).")
-                container_agent_context = harbor_bridge.extract_agent_context(
-                    agent, session_path
-                )
+                read_from = session_path
             else:
                 sessions = harbor_bridge.get_agent_session_dirs(agent_dir, agent)
                 ts = f" ({sessions[0].name})" if sessions else ""
@@ -2143,9 +2178,11 @@ def capture(agent: str | None, session_dir: str | None, session: str | None) -> 
                         f"  (using latest of {len(sessions)} sessions"
                         " — pass --session <timestamp> to select)"
                     )
-                container_agent_context = harbor_bridge.extract_agent_context(
-                    agent, agent_dir
-                )
+                read_from = agent_dir
+            read_root = agent_dir
+            container_agent_context = harbor_bridge.extract_agent_context(
+                agent, read_from
+            )
             if not container_agent_context:
                 raise click.ClickException(
                     "Could not extract agent session from container.\n"
@@ -2173,6 +2210,10 @@ def capture(agent: str | None, session_dir: str | None, session: str | None) -> 
 
     # Create trial directory only after all validation passes.
     trial_dir = _new_trial_dir(ws)
+    if agent and read_from is not None and read_root is not None:
+        harbor_bridge.copy_trajectory(
+            agent, read_from, trial_dir / "agent", root=read_root
+        )
     now = datetime.now(timezone.utc)
     fake_sess = sess or {"task_dir": str(ws), "task_ref": ws.name}
     _assemble_trial_output(
