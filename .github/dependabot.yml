@@ -7,6 +7,9 @@ updates:
     directory: "/"
     schedule:
       interval: "weekly"
+    # Every package in uv.lock, not only the direct ones (Dependabot's default).
+    allow:
+      - dependency-type: "all"
     groups:
       everything-but-harbor:
         patterns: ["*"]
