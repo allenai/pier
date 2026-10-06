@@ -1691,10 +1691,10 @@ def copy_trajectory(agent_name: str, logs_dir: Path, into: Path, root: Path) -> 
     *root* is the agent logs dir mounted from the container, and what lies
     under it is the agent's to arrange while it runs: a link, a FIFO or a
     swapped directory. The trajectory is copied only as a regular file reached
-    from *root* without following a link, and written without following one.
-    The trial itself is under pier's own ``.pier/``, hidden from the
-    container. Where the platform cannot open a path that way, the trajectory
-    is left beside the session's logs."""
+    from *root* without following a link, and written the same way: the trial
+    is pier's own (under ``.pier/``, hidden from the container) unless
+    ``--trial-dir`` puts it elsewhere. Where the platform cannot open a path
+    that way, the trajectory is left beside the session's logs."""
     trajectory = (_latest_session_dir(logs_dir, agent_name) or logs_dir) / (
         "trajectory.json"
     )
@@ -1719,14 +1719,41 @@ def copy_trajectory(agent_name: str, logs_dir: Path, into: Path, root: Path) -> 
         data = source.read(MAX_TRAJECTORY_BYTES + 1)
     if len(data) > MAX_TRAJECTORY_BYTES:
         return False
-    into.mkdir(parents=True, exist_ok=True)
-    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_BINARY", 0)
+    return _write_under(into, "trajectory.json", data)
+
+
+def _write_under(into: Path, name: str, data: bytes) -> bool:
+    """Write ``into/name`` as a new file: *into* is entered from its parent
+    without following a link, and whatever *name* was (a link, a hard link to
+    another file) is replaced rather than written through."""
     try:
-        out = os.open(
-            into / "trajectory.json", flags | getattr(os, "O_NOFOLLOW", 0), 0o644
+        into.parent.mkdir(parents=True, exist_ok=True)
+        parent = os.open(into.parent, os.O_RDONLY | os.O_DIRECTORY)
+    except OSError:
+        return False
+    try:
+        with contextlib.suppress(FileExistsError):
+            os.mkdir(into.name, dir_fd=parent)
+        directory = os.open(
+            into.name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent
         )
     except OSError:
         return False
+    finally:
+        os.close(parent)
+    try:
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(name, dir_fd=directory)
+        out = os.open(
+            name,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+            0o644,
+            dir_fd=directory,
+        )
+    except OSError:
+        return False
+    finally:
+        os.close(directory)
     with os.fdopen(out, "wb") as dest:
         dest.write(data)
     return True

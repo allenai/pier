@@ -1095,16 +1095,39 @@ def test_copy_trajectory_does_not_hang_on_a_fifo(tmp_path: Path):
     assert copied == [False]
 
 
-def test_copy_trajectory_does_not_write_through_a_link_in_the_trial(tmp_path: Path):
+@pytest.mark.parametrize("link", ["symlink", "hard link"])
+def test_copy_trajectory_replaces_a_link_in_the_trial_rather_than_writing_through(
+    tmp_path: Path, link
+):
+    """A trial placed with --trial-dir can sit where the agent writes."""
     root, session = _mounted_logs(tmp_path)
     (session / "trajectory.json").write_text('{"steps": []}')
     host_file = tmp_path / "host-file"
     host_file.write_text("untouched")
     into = tmp_path / "trial" / "agent"
     into.mkdir(parents=True)
-    (into / "trajectory.json").symlink_to(host_file)
-    assert not harbor_bridge.copy_trajectory("claude-code", session, into, root=root)
+    if link == "symlink":
+        (into / "trajectory.json").symlink_to(host_file)
+    else:
+        os.link(host_file, into / "trajectory.json")
+    assert harbor_bridge.copy_trajectory("claude-code", session, into, root=root)
     assert host_file.read_text() == "untouched"
+    written = into / "trajectory.json"
+    assert not written.is_symlink() and written.read_text() == '{"steps": []}'
+
+
+def test_copy_trajectory_does_not_enter_a_linked_agent_dir(tmp_path: Path):
+    root, session = _mounted_logs(tmp_path)
+    (session / "trajectory.json").write_text('{"steps": []}')
+    host_dir = tmp_path / "host-dir"
+    host_dir.mkdir()
+    trial = tmp_path / "trial"
+    trial.mkdir()
+    (trial / "agent").symlink_to(host_dir)
+    assert not harbor_bridge.copy_trajectory(
+        "claude-code", session, trial / "agent", root=root
+    )
+    assert list(host_dir.iterdir()) == []
 
 
 def test_a_symlink_one_artifact_leaves_cannot_redirect_the_next(tmp_path: Path):
