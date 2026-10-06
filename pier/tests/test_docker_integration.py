@@ -477,6 +477,7 @@ class TestVerifyIntegration:
             "[[verifier.collect]]\n"
             "command = \"sh -c 'sleep 2; echo late > /app/late.txt' & wait\"\n"
             "timeout_sec = 0.2\n"
+            "[[verifier.collect]]\ncommand = \"sleep 3\"\ntimeout_sec = 5\n"
         )
         (task_dir / "tests" / "Dockerfile").write_text(
             "FROM python:3.12-slim\nWORKDIR /app\n"
