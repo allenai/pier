@@ -443,11 +443,11 @@ def _delete_workspace(workspace: Path) -> None:
     click.echo(f"Deleted the workspace at {workspace}.")
 
 
-def _exec_after_start(workspace: Path, command: str) -> None:
+def _exec_after_start(workspace: Path, command: list[str]) -> None:
     """Run ``pier start --exec``'s command in the started container."""
     sess, ws = _resolve_workspace(str(workspace))
     try:
-        _exec_container(sess, ws, shlex.split(command))
+        _exec_container(sess, ws, command)
     except SystemExit as e:
         if e.code:
             click.echo(f"--exec command exited with code {e.code}.", err=True)
@@ -698,6 +698,16 @@ def start(
         raise click.ClickException("--no-mount and --host are mutually exclusive.")
     if host and exec_cmd:
         raise click.ClickException("--exec cannot be used with --host.")
+    # Parsed before anything starts, so a command that cannot run leaves no
+    # workspace behind.
+    exec_argv: list[str] = []
+    if exec_cmd is not None:
+        try:
+            exec_argv = shlex.split(exec_cmd)
+        except ValueError as e:
+            raise click.ClickException(f"--exec {exec_cmd!r}: {e}")
+        if not exec_argv:
+            raise click.ClickException("--exec needs a command.")
     if delete_workspace and (not workspace_dir or (task_path is None and not image)):
         raise click.ClickException(
             "--delete needs a task path or --image, and -d naming the workspace "
@@ -757,8 +767,8 @@ def start(
             force=force,
             delete_workspace=delete_workspace,
         )
-        if exec_cmd:
-            _exec_after_start(workspace, exec_cmd)
+        if exec_argv:
+            _exec_after_start(workspace, exec_argv)
         return
 
     # No task_path, no image → operate on existing workspace from cwd
@@ -786,6 +796,10 @@ def start(
             "e.g. pier start ./tasks/my-task -d ./my-workspace"
         )
 
+    if delete_workspace and task_dir.resolve().is_relative_to(workspace.resolve()):
+        raise click.ClickException(
+            f"--delete would delete the task it starts: {task_dir} is in {workspace}."
+        )
     if delete_workspace and _session_json_path(workspace).exists():
         _delete_workspace(workspace)
 
@@ -801,8 +815,8 @@ def start(
                     _install_agents_into_running(existing_sess, workspace, [agent])
                 else:
                     click.echo("Container is already running.")
-                if exec_cmd:
-                    _exec_after_start(workspace, exec_cmd)
+                if exec_argv:
+                    _exec_after_start(workspace, exec_argv)
                 return
             else:
                 # Container stopped — restart it
@@ -828,8 +842,8 @@ def start(
                     extra_env=extra_env_list or existing_sess.get("extra_env", []),
                     no_mount=existing_sess.get("no_mount", False),
                 )
-                if exec_cmd:
-                    _exec_after_start(workspace, exec_cmd)
+                if exec_argv:
+                    _exec_after_start(workspace, exec_argv)
                 return
         else:
             if exec_cmd:
@@ -877,8 +891,8 @@ def start(
             no_mount=no_mount,
             skills_dir_override=skills_dir_override,
         )
-        if exec_cmd:
-            _exec_after_start(workspace, exec_cmd)
+        if exec_argv:
+            _exec_after_start(workspace, exec_argv)
 
     if not host and not agent:
         click.echo(

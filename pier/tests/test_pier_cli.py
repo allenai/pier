@@ -1785,6 +1785,37 @@ def test_start_exec_refuses_host_mode(runner, index_path, task_dir, tmp_path):
     assert "--exec cannot be used with --host" in result.output
 
 
+@pytest.mark.parametrize("command", ["   ", "echo 'unterminated"])
+@patch("pier.harbor_bridge.start_environment")
+def test_start_exec_refuses_a_command_it_cannot_run_before_starting(
+    mock_start, command, runner, index_path, task_dir, tmp_path
+):
+    """Parsed after the start, a bad --exec left a started workspace behind."""
+    result = runner.invoke(
+        cli, ["start", str(task_dir), "-d", str(tmp_path / "ws"), "--exec", command]
+    )
+    assert result.exit_code != 0
+    assert "--exec" in result.output
+    mock_start.assert_not_called()
+
+
+@patch("pier.harbor_bridge.stop_environment")
+@patch("pier.harbor_bridge.start_environment")
+def test_start_delete_refuses_to_delete_the_task_it_starts(
+    mock_start, mock_stop, runner, index_path, task_dir, tmp_path
+):
+    """-d naming a directory that holds the task would delete the task first."""
+    holder = task_dir.parent
+    _write_session(holder, _container_session(task_dir=str(task_dir)), index_path)
+    result = runner.invoke(
+        cli, ["start", str(task_dir), "-d", str(holder), "--delete", "-f"]
+    )
+    assert result.exit_code != 0
+    assert "would delete the task it starts" in result.output
+    assert (task_dir / "task.toml").exists()
+    mock_stop.assert_not_called()
+
+
 def test_stop_rejects_delete_flag(runner, index_path, tmp_path):
     ws = tmp_path / "ws"
     ws.mkdir()
