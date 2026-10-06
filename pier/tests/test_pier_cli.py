@@ -1596,6 +1596,263 @@ def test_a_failed_stop_that_left_nothing_claims_no_cleanup(
     assert "removed them" not in result.output
 
 
+@patch("pier.harbor_bridge.is_environment_running", return_value=True)
+@patch("pier.harbor_bridge.stop_environment")
+def test_stop_all_stops_every_running_container(
+    mock_stop, mock_running, runner, index_path, tmp_path
+):
+    """Host-mode workspaces have no container and are passed over."""
+    for name in ("ws1", "ws2"):
+        ws = tmp_path / name
+        ws.mkdir()
+        _write_session(
+            ws, _container_session(harbor_session_id=f"pier-{name}"), index_path
+        )
+    host = tmp_path / "ws3"
+    host.mkdir()
+    _write_session(host, _host_session(), index_path)
+    result = runner.invoke(cli, ["stop", "--all"], catch_exceptions=False)
+    assert result.exit_code == 0, result.output
+    assert mock_stop.call_count == 2
+    assert result.output.count("stopped.") == 2
+
+
+@patch("pier.harbor_bridge.is_environment_running", return_value=False)
+@patch("pier.harbor_bridge.stop_environment")
+def test_stop_all_passes_over_stopped_containers(
+    mock_stop, mock_running, runner, index_path, tmp_path
+):
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    _write_session(ws, _container_session(), index_path)
+    result = runner.invoke(cli, ["stop", "--all"], catch_exceptions=False)
+    assert result.exit_code == 0, result.output
+    mock_stop.assert_not_called()
+    assert "No workspace has a running container." in result.output
+
+
+@patch("pier.harbor_bridge.is_environment_running", return_value=True)
+@patch(
+    "pier.harbor_bridge.stop_environment",
+    side_effect=[RuntimeError("stuck"), None],
+)
+def test_stop_all_goes_on_past_a_failure_and_reports_it(
+    mock_stop, mock_running, runner, index_path, tmp_path
+):
+    for name in ("ws1", "ws2"):
+        ws = tmp_path / name
+        ws.mkdir()
+        _write_session(
+            ws, _container_session(harbor_session_id=f"pier-{name}"), index_path
+        )
+    with patch(
+        "pier.harbor_bridge.remove_workspace_containers",
+        side_effect=[RuntimeError("no docker"), []],
+    ):
+        result = runner.invoke(cli, ["stop", "--all"])
+    assert result.exit_code != 0
+    assert mock_stop.call_count == 2
+    assert "Could not stop 'ws1'" in result.output
+    assert "Container for 'ws2' stopped." in result.output
+    assert "1 workspace(s) could not be stopped" in result.output
+
+
+@patch("pier.harbor_bridge.stop_environment")
+@patch("pier.harbor_bridge.start_environment")
+def test_start_delete_replaces_the_workspace(
+    mock_start, mock_stop, runner, index_path, task_dir, tmp_path
+):
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    _write_session(ws, _container_session(task_dir=str(task_dir)), index_path)
+    (ws / "stale-file.txt").write_text("old")
+    result = runner.invoke(
+        cli, ["start", str(task_dir), "-d", str(ws), "--delete"], catch_exceptions=False
+    )
+    assert result.exit_code == 0, result.output
+    mock_stop.assert_called_once()
+    assert "Deleted the workspace" in result.output
+    assert not (ws / "stale-file.txt").exists()
+    assert (ws / ".pier" / "session.json").exists()
+
+
+@patch("pier.harbor_bridge.stop_environment", side_effect=RuntimeError("stuck"))
+@patch("pier.harbor_bridge.start_environment")
+def test_start_delete_keeps_the_directory_when_the_stop_fails(
+    mock_start, mock_stop, runner, index_path, task_dir, tmp_path
+):
+    """A container that may still be running keeps the directory it mounts."""
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    _write_session(ws, _container_session(task_dir=str(task_dir)), index_path)
+    (ws / "work.txt").write_text("keep me")
+    with patch(
+        "pier.harbor_bridge.remove_workspace_containers",
+        side_effect=RuntimeError("no docker"),
+    ):
+        result = runner.invoke(cli, ["start", str(task_dir), "-d", str(ws), "--delete"])
+    assert result.exit_code != 0
+    assert (ws / "work.txt").read_text() == "keep me"
+    mock_start.assert_not_called()
+
+
+def test_start_delete_needs_a_task_or_image(runner, index_path):
+    result = runner.invoke(cli, ["start", "--delete"])
+    assert result.exit_code != 0
+    assert "--delete needs a task path or --image" in result.output
+
+
+@patch("pier.harbor_bridge.download_task")
+def test_start_delete_never_infers_the_workspace(
+    mock_download, runner, index_path, task_dir, tmp_path, monkeypatch
+):
+    """A remote task's workspace defaults to ./<task-name>; --delete must not
+    delete a directory nobody named."""
+    mock_download.return_value = task_dir
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("PWD", str(tmp_path))
+    inferred = tmp_path / task_dir.name
+    inferred.mkdir(exist_ok=True)
+    _write_session(inferred, _container_session(task_dir=str(task_dir)), index_path)
+    (inferred / "work.txt").write_text("keep me")
+    result = runner.invoke(
+        cli, ["start", "https://github.com/org/repo#tasks/my-task", "--delete"]
+    )
+    assert result.exit_code != 0
+    assert "never inferred" in result.output
+    assert (inferred / "work.txt").read_text() == "keep me"
+
+
+@patch("pier.harbor_bridge.stop_environment")
+def test_stop_all_goes_on_past_a_workspace_it_cannot_query(
+    mock_stop, runner, index_path, tmp_path
+):
+    """Asking whether one container runs can fail too; the others still stop."""
+    for name in ("ws1", "ws2"):
+        ws = tmp_path / name
+        ws.mkdir()
+        _write_session(
+            ws, _container_session(harbor_session_id=f"pier-{name}"), index_path
+        )
+    with patch(
+        "pier.harbor_bridge.is_environment_running",
+        side_effect=[RuntimeError("docker is not answering"), True],
+    ):
+        result = runner.invoke(cli, ["stop", "--all"])
+    assert result.exit_code != 0
+    assert "Could not stop 'ws1': docker is not answering" in result.output
+    assert "Container for 'ws2' stopped." in result.output
+    mock_stop.assert_called_once()
+
+
+@patch("pier.harbor_bridge.exec_in_container", return_value=0)
+@patch("pier.harbor_bridge.is_environment_running", return_value=True)
+@patch("pier.harbor_bridge.start_environment")
+def test_start_exec_runs_the_command_once_started(
+    mock_start, mock_running, mock_exec, runner, index_path, task_dir, tmp_path
+):
+    ws = tmp_path / "ws"
+    result = runner.invoke(
+        cli,
+        ["start", str(task_dir), "-d", str(ws), "--exec", "claude --version"],
+        catch_exceptions=False,
+    )
+    assert result.exit_code == 0, result.output
+    mock_start.assert_called_once()
+    assert mock_exec.call_args[0][2] == ["claude", "--version"]
+
+
+@patch("pier.harbor_bridge.exec_in_container", return_value=3)
+@patch("pier.harbor_bridge.is_environment_running", return_value=True)
+@patch("pier.harbor_bridge.start_environment")
+def test_start_exec_fails_with_its_command(
+    mock_start, mock_running, mock_exec, runner, index_path, task_dir, tmp_path
+):
+    ws = tmp_path / "ws"
+    result = runner.invoke(
+        cli, ["start", str(task_dir), "-d", str(ws), "--exec", "false"]
+    )
+    assert result.exit_code == 3
+    assert "--exec command exited with code 3." in result.output
+
+
+@patch("pier.harbor_bridge.exec_in_container", return_value=0)
+@patch("pier.harbor_bridge.is_environment_running", return_value=True)
+def test_start_exec_runs_in_the_current_workspace(
+    mock_running, mock_exec, runner, index_path, tmp_path, monkeypatch
+):
+    """With no task path, pier start works on the workspace it is run in;
+    --exec was dropped there without a word."""
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    _write_session(ws, _container_session(), index_path)
+    monkeypatch.chdir(ws)
+    monkeypatch.setenv("PWD", str(ws))
+    result = runner.invoke(
+        cli, ["start", "--exec", "claude --version"], catch_exceptions=False
+    )
+    assert result.exit_code == 0, result.output
+    assert mock_exec.call_args[0][2] == ["claude", "--version"]
+
+
+@patch("pier.cli._start_existing")
+def test_start_exec_in_a_host_workspace_is_refused_before_anything_starts(
+    mock_start_existing, runner, index_path, tmp_path, monkeypatch
+):
+    """--agent with --exec used to install the agent, then refuse the exec."""
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    _write_session(ws, _host_session(), index_path)
+    monkeypatch.chdir(ws)
+    monkeypatch.setenv("PWD", str(ws))
+    result = runner.invoke(
+        cli, ["start", "--agent", "claude-code", "--exec", "claude --version"]
+    )
+    assert result.exit_code != 0
+    assert "host-mode" in result.output
+    mock_start_existing.assert_not_called()
+
+
+def test_start_exec_refuses_host_mode(runner, index_path, task_dir, tmp_path):
+    result = runner.invoke(
+        cli,
+        ["start", str(task_dir), "-d", str(tmp_path / "ws"), "--host", "--exec", "ls"],
+    )
+    assert result.exit_code != 0
+    assert "--exec cannot be used with --host" in result.output
+
+
+@pytest.mark.parametrize("command", ["   ", "echo 'unterminated"])
+@patch("pier.harbor_bridge.start_environment")
+def test_start_exec_refuses_a_command_it_cannot_run_before_starting(
+    mock_start, command, runner, index_path, task_dir, tmp_path
+):
+    """Parsed after the start, a bad --exec left a started workspace behind."""
+    result = runner.invoke(
+        cli, ["start", str(task_dir), "-d", str(tmp_path / "ws"), "--exec", command]
+    )
+    assert result.exit_code != 0
+    assert "--exec" in result.output
+    mock_start.assert_not_called()
+
+
+@patch("pier.harbor_bridge.stop_environment")
+@patch("pier.harbor_bridge.start_environment")
+def test_start_delete_refuses_to_delete_the_task_it_starts(
+    mock_start, mock_stop, runner, index_path, task_dir, tmp_path
+):
+    """-d naming a directory that holds the task would delete the task first."""
+    holder = task_dir.parent
+    _write_session(holder, _container_session(task_dir=str(task_dir)), index_path)
+    result = runner.invoke(
+        cli, ["start", str(task_dir), "-d", str(holder), "--delete", "-f"]
+    )
+    assert result.exit_code != 0
+    assert "would delete the task it starts" in result.output
+    assert (task_dir / "task.toml").exists()
+    mock_stop.assert_not_called()
+
+
 def test_stop_rejects_delete_flag(runner, index_path, tmp_path):
     ws = tmp_path / "ws"
     ws.mkdir()

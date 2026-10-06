@@ -154,6 +154,8 @@ pier start                                  # restart a stopped container
 - `--extra-docker-compose` adds a compose overlay, as `harbor run --extra-docker-compose` does — a service beside the agent's container, or a change to that container (repeatable, container mode only). Kept in the session and reused by restart, `pier verify` and `pier stop`.
 - `--no-mount` keeps workspace files inside the container only (no bind-mount to host). `pier stop` copies files back. Note: Harbor's internal mounts (agent logs, verifier output) still write to the host under `.pier/`.
 - `-f` / `--force` allows starting in a non-empty directory.
+- `--delete` replaces the pier workspace at `-d`: its container is stopped and its directory deleted, then a fresh one starts. If the container cannot be stopped, nothing is deleted.
+- `--exec "<command>"` runs a command in the container once it has started (container mode only), without a shell: for pipes or redirection, pass `"sh -c '...'"`.
 - `--host` skips the container (workspace only).
 - `--agent` installs a coding agent. To install additional agents, run `pier start --agent <name>` again from the workspace. When `task_path` is omitted, it operates on the current workspace.
 
@@ -188,6 +190,11 @@ The agent is inferred from the session (set by `pier start --agent`). If no agen
 ### `pier stop`
 
 Stop the Docker container for the current workspace (container mode only). The workspace directory is preserved. Restart later with `pier start` (no arguments, from inside the workspace).
+
+```bash
+pier stop          # the current workspace's container
+pier stop --all    # every running container of a workspace pier knows
+```
 
 ### `pier list`
 
