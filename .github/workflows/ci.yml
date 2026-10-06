@@ -26,6 +26,18 @@ jobs:
       - if: runner.os == 'Linux' && matrix.python-version == '3.14'
         run: make lint typecheck
 
+  # What a fresh `uv tool install` gets: the newest release of every dependency
+  # within pyproject's ranges. uv.lock pins the job above; users never see it.
+  test-latest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+      - run: uv run --upgrade --extra dev pytest -rs
+
   agent-integration:
     runs-on: ubuntu-latest
     timeout-minutes: 45

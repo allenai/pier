@@ -1,0 +1,13 @@
+# Weekly uv.lock updates, each a PR that CI tests. harbor, which pier builds
+# on most directly, gets PRs of its own so a break is attributable; the rest
+# are grouped.
+version: 2
+updates:
+  - package-ecosystem: "uv"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    groups:
+      everything-but-harbor:
+        patterns: ["*"]
+        exclude-patterns: ["harbor"]
