@@ -28,9 +28,12 @@ import json
 import logging
 import os
 import re
+import shlex
 import shutil
+import stat
 import subprocess
 import sys
+import tempfile
 from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path, PurePosixPath
@@ -1266,6 +1269,31 @@ def get_log_capture_env(base_dir: str | None = None) -> dict[str, str]:
     return env
 
 
+def seed_agent_config_command(agent_name: str, config_dir: str) -> str | None:
+    """A shell command giving one exec's config dir what setup registered.
+
+    Setup registers claude-code's onboarding flag and MCP servers
+    (``.claude.json``), model (``settings.json``), skills and memory files in
+    the setup config dir, and each ``pier exec`` points CLAUDE_CONFIG_DIR at a
+    session dir of its own so logs do not collide: without this the agent
+    starts with none of its skills and asks to log in. Only those are copied,
+    not any session history the setup dir holds."""
+    setup_dir = _claude_config_dir()
+    if agent_name != "claude-code" or not config_dir or config_dir == setup_dir:
+        return None
+    to = shlex.quote(config_dir)
+    return (
+        f"set -e; mkdir -p {to}; "
+        f"if [ -d {shlex.quote(setup_dir)} ]; then cd {shlex.quote(setup_dir)}; "
+        f"for f in .claude.json settings.json; do "
+        f'if [ -f "$f" ]; then cp -p "$f" {to}/; fi; done; '
+        f"if [ -d skills ]; then cp -a skills {to}/; fi; "
+        f'for m in projects/*/memory; do if [ -d "$m" ]; then '
+        f'mkdir -p {to}/"${{m%/memory}}"; cp -a "$m" {to}/"${{m%/memory}}"/; '
+        f"fi; done; fi"
+    )
+
+
 def get_post_run_commands(agent_name: str, log_dir: str) -> list[str]:
     """Shell commands to collect agent artifacts after an interactive run.
 
@@ -1616,6 +1644,303 @@ def extract_agent_context(agent_name: str, logs_dir: Path) -> dict | None:
 
     result = context.model_dump(exclude_none=True)
     return result if result else None
+
+
+#: Beyond this a trajectory is not copied into the trial.
+MAX_TRAJECTORY_BYTES = 256 * 1024 * 1024
+
+
+def _can_open_without_links() -> bool:
+    """Whether this platform can open a path one component at a time without
+    following a link (not Windows)."""
+    return os.open in os.supports_dir_fd and hasattr(os, "O_NOFOLLOW")
+
+
+def _open_dir_under(root: Path, relative: PurePosixPath) -> int | None:
+    """A descriptor for the directory ``root/relative``, or None. Each
+    component below *root* is opened from the one before it without following
+    a link, so nothing swapped in after a check can redirect what follows."""
+    try:
+        fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+    except OSError:
+        return None
+    for part in relative.parts:
+        try:
+            inner = os.open(
+                part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd
+            )
+        except OSError:
+            os.close(fd)
+            return None
+        os.close(fd)
+        fd = inner
+    return fd
+
+
+def _open_file_in(directory: int, name: str) -> int | None:
+    """A read-only descriptor for the regular file *name* in *directory*, or
+    None: not followed if a link, non-blocking so a FIFO cannot hang it."""
+    try:
+        fd = os.open(
+            name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory
+        )
+    except OSError:
+        return None
+    if not stat.S_ISREG(os.fstat(fd).st_mode):
+        os.close(fd)
+        return None
+    return fd
+
+
+def _open_under(root: Path, relative: PurePosixPath) -> int | None:
+    """A read-only descriptor for the regular file ``root/relative``, or None,
+    reached without following a link at any step."""
+    directory = _open_dir_under(root, PurePosixPath(*relative.parts[:-1]))
+    if directory is None:
+        return None
+    try:
+        return _open_file_in(directory, relative.parts[-1])
+    finally:
+        os.close(directory)
+
+
+def copy_trajectory(agent_name: str, logs_dir: Path, into: Path, root: Path) -> bool:
+    """Copy the trajectory Harbor wrote beside the logs
+    :func:`extract_agent_context` read into a trial's agent dir, and say
+    whether there was one.
+
+    *root* is the agent logs dir mounted from the container, and what lies
+    under it is the agent's to arrange while it runs: a link, a FIFO or a
+    swapped directory. The trajectory is copied only as a regular file reached
+    from *root* without following a link, and written the same way: the trial
+    is pier's own (under ``.pier/``, hidden from the container) unless
+    ``--trial-dir`` puts it elsewhere. Where the platform cannot open a path
+    that way, the trajectory is left beside the session's logs."""
+    trajectory = (_latest_session_dir(logs_dir, agent_name) or logs_dir) / (
+        "trajectory.json"
+    )
+    if not _can_open_without_links():
+        logger.warning(
+            "left %s beside the session's logs: this platform cannot open it "
+            "there without following links",
+            trajectory,
+        )
+        return False
+
+    def left_out() -> bool:
+        # No trajectory is nothing to say; one refused is.
+        if os.path.lexists(trajectory):
+            logger.warning(
+                "left %s out of the trial: it is not a regular file reached "
+                "without following a link, or it is over %d bytes",
+                trajectory,
+                MAX_TRAJECTORY_BYTES,
+            )
+        return False
+
+    try:
+        relative = PurePosixPath(trajectory.relative_to(root).as_posix())
+    except ValueError:
+        return left_out()
+    fd = _open_under(root, relative)
+    if fd is None:
+        return left_out()
+    with os.fdopen(fd, "rb") as source:
+        info = os.fstat(source.fileno())
+        if not stat.S_ISREG(info.st_mode) or info.st_size > MAX_TRAJECTORY_BYTES:
+            return left_out()
+        data = source.read(MAX_TRAJECTORY_BYTES + 1)
+    if len(data) > MAX_TRAJECTORY_BYTES:
+        return left_out()
+    return _write_under(into, "trajectory.json", data)
+
+
+def _write_under(into: Path, name: str, data: bytes) -> bool:
+    """Write ``into/name`` as a new file: *into* is entered from its parent
+    without following a link, and whatever *name* was (a link, a hard link to
+    another file) is replaced rather than written through."""
+
+    def not_written(why: OSError) -> bool:
+        logger.warning(
+            "did not write %s: %s (a link where a directory should be is refused)",
+            into / name,
+            why,
+        )
+        return False
+
+    try:
+        into.parent.mkdir(parents=True, exist_ok=True)
+        parent = os.open(into.parent, os.O_RDONLY | os.O_DIRECTORY)
+    except OSError as e:
+        return not_written(e)
+    try:
+        with contextlib.suppress(FileExistsError):
+            os.mkdir(into.name, dir_fd=parent)
+        directory = os.open(
+            into.name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent
+        )
+    except OSError as e:
+        return not_written(e)
+    finally:
+        os.close(parent)
+    try:
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(name, dir_fd=directory)
+        out = os.open(
+            name,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+            0o644,
+            dir_fd=directory,
+        )
+    except OSError as e:
+        return not_written(e)
+    finally:
+        os.close(directory)
+    with os.fdopen(out, "wb") as dest:
+        dest.write(data)
+    return True
+
+
+def write_trajectory(into: Path, data: bytes) -> bool:
+    """Write a trajectory into a trial's agent dir, as :func:`_write_under`."""
+    return _write_under(into, "trajectory.json", data)
+
+
+#: Beyond any of these a session is not copied out, so not extracted.
+MAX_SESSION_BYTES = 1024 * 1024 * 1024
+MAX_SESSION_FILES = 100_000
+MAX_SESSION_DEPTH = 32
+
+
+class _SessionTooLarge(Exception):
+    """A session over one of the MAX_SESSION_* bounds."""
+
+
+def _copy_tree_from(
+    directory: int, dest: Path, budget: list[int], depth: int = 0
+) -> None:
+    """Copy the directory open at *directory* into *dest*: directories and
+    regular files only, each opened without following a link. Links, FIFOs,
+    devices, unreadable entries and files over :data:`MAX_TRAJECTORY_BYTES`
+    are left out. *budget* holds the bytes copied, the entries copied and the
+    entries left out; past a bound, or deeper than :data:`MAX_SESSION_DEPTH`,
+    it raises :class:`_SessionTooLarge`."""
+    if depth > MAX_SESSION_DEPTH:
+        raise _SessionTooLarge(f"deeper than {MAX_SESSION_DEPTH} directories")
+    dest.mkdir(parents=True, exist_ok=True)
+    for entry in os.scandir(directory):
+        if entry.is_symlink():
+            budget[2] += 1
+            continue
+        if entry.is_dir(follow_symlinks=False):
+            budget[1] += 1
+            if budget[1] > MAX_SESSION_FILES:
+                raise _SessionTooLarge(
+                    f"over {MAX_SESSION_FILES} files and directories"
+                )
+            try:
+                inner = os.open(
+                    entry.name,
+                    os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                    dir_fd=directory,
+                )
+            except OSError:
+                budget[2] += 1
+                continue
+            try:
+                _copy_tree_from(inner, dest / entry.name, budget, depth + 1)
+            finally:
+                os.close(inner)
+        elif entry.is_file(follow_symlinks=False):
+            fd = _open_file_in(directory, entry.name)
+            if fd is None:
+                budget[2] += 1
+                continue
+            with os.fdopen(fd, "rb") as source:
+                data = source.read(MAX_TRAJECTORY_BYTES + 1)
+            if len(data) > MAX_TRAJECTORY_BYTES:
+                budget[2] += 1
+                continue
+            budget[0] += len(data)
+            budget[1] += 1
+            if budget[0] > MAX_SESSION_BYTES or budget[1] > MAX_SESSION_FILES:
+                raise _SessionTooLarge(
+                    f"over {MAX_SESSION_BYTES} bytes or {MAX_SESSION_FILES} files "
+                    "and directories"
+                )
+            (dest / entry.name).write_bytes(data)
+        else:
+            budget[2] += 1
+
+
+def extract_session(
+    agent_name: str, logs_dir: Path, root: Path
+) -> tuple[dict | None, bytes | None]:
+    """Harbor's extraction of the session :func:`extract_agent_context` would
+    read under *logs_dir*: the usage it found, and the trajectory it wrote.
+
+    *root* is the agent logs dir mounted from the container, which the agent
+    arranges while it runs. Harbor reads a session where it lies and writes
+    its trajectory there, following links, so a session dir the agent made a
+    link to a host directory would have Harbor read and write on this host.
+    So the session is first copied out from *root* without following a link,
+    within the MAX_SESSION_* bounds, and Harbor reads and writes the copy.
+    Where the platform cannot open a path that way (Windows), or the session
+    is past a bound, nothing is extracted, with a warning."""
+    if not _can_open_without_links():
+        logger.warning(
+            "did not extract the agent's session: this platform cannot read it "
+            "without following links, and the agent arranges it"
+        )
+        return None, None
+    session = _latest_session_dir(logs_dir, agent_name) or logs_dir
+    try:
+        relative = PurePosixPath(session.relative_to(root).as_posix())
+    except ValueError:
+        logger.warning(
+            "did not extract %s: it is not in the agent's logs, %s", session, root
+        )
+        return None, None
+    directory = _open_dir_under(root, relative)
+    if directory is None:
+        # No session yet is nothing to say; one refused is.
+        if os.path.lexists(session):
+            logger.warning(
+                "did not extract %s: it cannot be reached from the agent's logs "
+                "without following a link",
+                session,
+            )
+        return None, None
+    budget = [0, 0, 0]
+    with tempfile.TemporaryDirectory() as scratch:
+        copy = Path(scratch) / "session"
+        try:
+            _copy_tree_from(directory, copy, budget)
+        except _SessionTooLarge as e:
+            logger.warning("did not extract the agent's session: it is %s", e)
+            return None, None
+        finally:
+            os.close(directory)
+        if budget[2]:
+            logger.warning(
+                "left %d entries out of the agent's session before extracting it: "
+                "links, special files, unreadable ones or files over %d bytes",
+                budget[2],
+                MAX_TRAJECTORY_BYTES,
+            )
+        context = extract_agent_context(agent_name, copy)
+        trajectory = copy / "trajectory.json"
+        data = None
+        if trajectory.is_file():
+            with trajectory.open("rb") as written:
+                data = written.read(MAX_TRAJECTORY_BYTES + 1)
+            if len(data) > MAX_TRAJECTORY_BYTES:
+                logger.warning(
+                    "left the trajectory out of the trial: it is over %d bytes",
+                    MAX_TRAJECTORY_BYTES,
+                )
+                data = None
+    return context, data
 
 
 # ---------------------------------------------------------------------------

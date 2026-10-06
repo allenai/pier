@@ -1,6 +1,8 @@
 """Tests for harbor_bridge helpers (no Harbor or Docker required)."""
 
 import json
+import os
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -969,6 +971,386 @@ def test_binary_agent_map_finds_claude_in_the_installed_harbor(monkeypatch):
 
     monkeypatch.setattr(hb, "_binary_agent_map", None)
     assert hb.get_binary_agent_map().get("claude") == "claude-code"
+
+
+def test_seed_agent_config_is_only_for_another_claude_config_dir():
+    setup = harbor_bridge._claude_config_dir()
+    exec_dir = "/logs/agent/exec/x/sessions"
+    assert harbor_bridge.seed_agent_config_command("claude-code", exec_dir)
+    assert harbor_bridge.seed_agent_config_command("claude-code", setup) is None
+    assert harbor_bridge.seed_agent_config_command("codex", exec_dir) is None
+
+
+@pytest.mark.skipif(os.name == "nt", reason="the command runs in a Linux container")
+def test_seed_agent_config_copies_what_setup_registered_and_no_history(
+    tmp_path: Path, monkeypatch
+):
+    """Setup registers the onboarding flag, MCP servers, model, skills and
+    memory files; an earlier session's history stays where it is."""
+    import subprocess
+
+    setup = tmp_path / "sessions"
+    for path, text in {
+        ".claude.json": "{}",
+        "settings.json": "{}",
+        "skills/my-skill/SKILL.md": "body",
+        "projects/-app/memory/notes.md": "remember",
+        "projects/-app/earlier-session.jsonl": "history",
+        "todos/t.json": "[]",
+    }.items():
+        (setup / path).parent.mkdir(parents=True, exist_ok=True)
+        (setup / path).write_text(text)
+    monkeypatch.setattr(harbor_bridge, "_claude_config_dir", lambda: str(setup))
+    exec_dir = tmp_path / "exec" / "x" / "sessions"
+    cmd = harbor_bridge.seed_agent_config_command("claude-code", str(exec_dir))
+    assert cmd
+    subprocess.run(["sh", "-c", cmd], check=True)
+    copied = sorted(
+        p.relative_to(exec_dir).as_posix() for p in exec_dir.rglob("*") if p.is_file()
+    )
+    assert copied == [
+        ".claude.json",
+        "projects/-app/memory/notes.md",
+        "settings.json",
+        "skills/my-skill/SKILL.md",
+    ]
+
+
+def _mounted_logs(tmp_path: Path) -> tuple[Path, Path]:
+    """The agent logs dir mounted from the container, and one exec's session."""
+    root = tmp_path / "agent"
+    session = root / "exec" / "2026-01-01_00-00-00-000000"
+    session.mkdir(parents=True)
+    return root, session
+
+
+def _said(caplog, refusal: str) -> bool:
+    """*refusal* was logged, or where links cannot be refused, the decline
+    that comes before it."""
+    if not harbor_bridge._can_open_without_links():
+        refusal = "beside the session's logs"
+    return refusal in caplog.text
+
+
+@pytest.mark.skipif(
+    not harbor_bridge._can_open_without_links(),
+    reason="this platform leaves the trajectory beside the logs",
+)
+def test_copy_trajectory_puts_harbors_trajectory_in_the_trial(tmp_path: Path):
+    root, session = _mounted_logs(tmp_path)
+    (session / "trajectory.json").write_text('{"steps": []}')
+    into = tmp_path / "trial" / "agent"
+    assert harbor_bridge.copy_trajectory("claude-code", session, into, root=root)
+    assert (into / "trajectory.json").read_text() == '{"steps": []}'
+
+
+def test_copy_trajectory_declines_where_it_cannot_open_without_links(
+    tmp_path: Path, monkeypatch, caplog
+):
+    """Without dir_fd and O_NOFOLLOW (Windows) a component could be swapped
+    for a link between a check and the open: the trajectory stays put."""
+    root, session = _mounted_logs(tmp_path)
+    (session / "trajectory.json").write_text('{"steps": []}')
+    monkeypatch.setattr(harbor_bridge, "_can_open_without_links", lambda: False)
+    into = tmp_path / "trial" / "agent"
+    assert not harbor_bridge.copy_trajectory("claude-code", session, into, root=root)
+    assert not (into / "trajectory.json").exists()
+    assert "beside the session's logs" in caplog.text
+
+
+def test_copy_trajectory_does_not_follow_a_symlinked_file(tmp_path: Path, caplog):
+    """A symlink the agent left in its mounted logs would resolve on this host."""
+    secret = tmp_path / "host-secret"
+    secret.write_text("not the agent's")
+    root, session = _mounted_logs(tmp_path)
+    (session / "trajectory.json").symlink_to(secret)
+    into = tmp_path / "trial" / "agent"
+    assert not harbor_bridge.copy_trajectory("claude-code", session, into, root=root)
+    assert not (into / "trajectory.json").exists()
+    assert _said(caplog, "out of the trial")
+
+
+def test_copy_trajectory_does_not_follow_a_symlinked_directory(tmp_path: Path):
+    """The agent can make a session dir itself a link to a host directory."""
+    host_dir = tmp_path / "host-dir"
+    host_dir.mkdir()
+    (host_dir / "trajectory.json").write_text("not the agent's")
+    root = tmp_path / "agent"
+    (root / "exec").mkdir(parents=True)
+    session = root / "exec" / "2026-01-01_00-00-00-000000"
+    session.symlink_to(host_dir)
+    into = tmp_path / "trial" / "agent"
+    assert not harbor_bridge.copy_trajectory("claude-code", session, into, root=root)
+    assert not (into / "trajectory.json").exists()
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="no FIFOs on this platform")
+def test_copy_trajectory_does_not_hang_on_a_fifo(tmp_path: Path, caplog):
+    """The agent can leave a FIFO where the trajectory goes; opening one for
+    reading blocks until someone writes to it."""
+    root, session = _mounted_logs(tmp_path)
+    os.mkfifo(session / "trajectory.json")
+    into = tmp_path / "trial" / "agent"
+    copied: list[bool] = []
+    worker = threading.Thread(
+        target=lambda: copied.append(
+            harbor_bridge.copy_trajectory("claude-code", session, into, root=root)
+        ),
+        daemon=True,
+    )
+    worker.start()
+    worker.join(5)
+    assert not worker.is_alive(), "copying the trajectory blocked on a FIFO"
+    assert copied == [False]
+    assert _said(caplog, "out of the trial")
+
+
+@pytest.mark.skipif(
+    not harbor_bridge._can_open_without_links(),
+    reason="this platform leaves the trajectory beside the logs",
+)
+@pytest.mark.parametrize("link", ["symlink", "hard link"])
+def test_copy_trajectory_replaces_a_link_in_the_trial_rather_than_writing_through(
+    tmp_path: Path, link
+):
+    """A trial placed with --trial-dir can sit where the agent writes."""
+    root, session = _mounted_logs(tmp_path)
+    (session / "trajectory.json").write_text('{"steps": []}')
+    host_file = tmp_path / "host-file"
+    host_file.write_text("untouched")
+    into = tmp_path / "trial" / "agent"
+    into.mkdir(parents=True)
+    if link == "symlink":
+        (into / "trajectory.json").symlink_to(host_file)
+    else:
+        os.link(host_file, into / "trajectory.json")
+    assert harbor_bridge.copy_trajectory("claude-code", session, into, root=root)
+    assert host_file.read_text() == "untouched"
+    written = into / "trajectory.json"
+    assert not written.is_symlink() and written.read_text() == '{"steps": []}'
+
+
+def test_copy_trajectory_does_not_enter_a_linked_agent_dir(tmp_path: Path, caplog):
+    root, session = _mounted_logs(tmp_path)
+    (session / "trajectory.json").write_text('{"steps": []}')
+    host_dir = tmp_path / "host-dir"
+    host_dir.mkdir()
+    trial = tmp_path / "trial"
+    trial.mkdir()
+    (trial / "agent").symlink_to(host_dir)
+    assert not harbor_bridge.copy_trajectory(
+        "claude-code", session, trial / "agent", root=root
+    )
+    assert list(host_dir.iterdir()) == []
+    assert _said(caplog, "did not write")
+
+
+def _harbor_writes_a_trajectory(read):
+    """Stands in for Harbor's extraction: records where it read, and writes a
+    trajectory there, as Harbor does."""
+
+    def extract(agent_name, logs_dir):
+        read.append(logs_dir)
+        (logs_dir / "trajectory.json").write_text('{"steps": ["fresh"]}')
+        return {"cost_usd": 0.05}
+
+    return extract
+
+
+@pytest.mark.skipif(
+    not harbor_bridge._can_open_without_links(),
+    reason="this platform extracts the session where it lies",
+)
+def test_extract_session_reads_and_writes_a_copy(tmp_path: Path, monkeypatch):
+    root, session = _mounted_logs(tmp_path)
+    (session / "claude-code.txt").write_text("a session\n")
+    read: list[Path] = []
+    monkeypatch.setattr(
+        harbor_bridge, "extract_agent_context", _harbor_writes_a_trajectory(read)
+    )
+    context, trajectory = harbor_bridge.extract_session("claude-code", session, root)
+    assert context == {"cost_usd": 0.05}
+    assert trajectory == b'{"steps": ["fresh"]}'
+    assert not read[0].is_relative_to(root), "Harbor read the mounted session"
+    assert not (session / "trajectory.json").exists(), "Harbor wrote into it"
+
+
+@pytest.mark.skipif(
+    not harbor_bridge._can_open_without_links(),
+    reason="this platform extracts the session where it lies",
+)
+def test_extract_session_does_not_follow_a_linked_session_dir(
+    tmp_path: Path, monkeypatch, caplog
+):
+    """Harbor reads and writes a session dir following links: one the agent
+    made a link to a host directory had Harbor write a file there."""
+    host_dir = tmp_path / "host-dir"
+    host_dir.mkdir()
+    root = tmp_path / "agent"
+    (root / "exec").mkdir(parents=True)
+    session = root / "exec" / "2026-01-01_00-00-00-000000"
+    session.symlink_to(host_dir)
+    read: list[Path] = []
+    monkeypatch.setattr(
+        harbor_bridge, "extract_agent_context", _harbor_writes_a_trajectory(read)
+    )
+    assert harbor_bridge.extract_session("claude-code", session, root) == (None, None)
+    assert read == []
+    assert list(host_dir.iterdir()) == []
+    assert "without following a link" in caplog.text
+
+
+@pytest.mark.skipif(
+    not harbor_bridge._can_open_without_links(),
+    reason="this platform extracts the session where it lies",
+)
+def test_extract_session_leaves_links_inside_the_session_out(
+    tmp_path: Path, monkeypatch, caplog
+):
+    """A session file linked to a host file would have Harbor read the host's."""
+    secret = tmp_path / "host-secret.jsonl"
+    secret.write_text('{"not": "the agent\'s"}\n')
+    root, session = _mounted_logs(tmp_path)
+    projects = session / "sessions" / "projects" / "-workspace"
+    projects.mkdir(parents=True)
+    (projects / "real.jsonl").write_text("{}\n")
+    (projects / "planted.jsonl").symlink_to(secret)
+    copied: list[set[str]] = []
+
+    def extract(agent_name, logs_dir):
+        copied.append(
+            {
+                p.name
+                for p in (logs_dir / "sessions" / "projects" / "-workspace").iterdir()
+            }
+        )
+        return {"cost_usd": 0.05}
+
+    monkeypatch.setattr(harbor_bridge, "extract_agent_context", extract)
+    harbor_bridge.extract_session("claude-code", session, root)
+    assert copied == [{"real.jsonl"}]
+    assert "left 1 entries out of the agent's session" in caplog.text
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="no FIFOs on this platform")
+@pytest.mark.skipif(
+    not harbor_bridge._can_open_without_links(),
+    reason="this platform extracts the session where it lies",
+)
+def test_extract_session_leaves_special_files_out(tmp_path: Path, monkeypatch, caplog):
+    """A FIFO in the session would block whoever reads it."""
+    root, session = _mounted_logs(tmp_path)
+    projects = session / "sessions" / "projects" / "-workspace"
+    projects.mkdir(parents=True)
+    (projects / "real.jsonl").write_text("{}\n")
+    os.mkfifo(projects / "planted.jsonl")
+    copied: list[set[str]] = []
+
+    def extract(agent_name, logs_dir):
+        copied.append(
+            {
+                p.name
+                for p in (logs_dir / "sessions" / "projects" / "-workspace").iterdir()
+            }
+        )
+        return {"cost_usd": 0.05}
+
+    monkeypatch.setattr(harbor_bridge, "extract_agent_context", extract)
+    harbor_bridge.extract_session("claude-code", session, root)
+    assert copied == [{"real.jsonl"}]
+    assert "left 1 entries out of the agent's session" in caplog.text
+
+
+@pytest.mark.skipif(
+    not harbor_bridge._can_open_without_links(),
+    reason="this platform does not extract the session",
+)
+def test_extract_session_says_nothing_when_there_is_no_session(tmp_path: Path, caplog):
+    """No session yet is nothing to warn about; the caller says no data."""
+    root = tmp_path / "agent"
+    root.mkdir()
+    missing = root / "exec" / "2026-01-01_00-00-00-000000"
+    assert harbor_bridge.extract_session("claude-code", missing, root) == (None, None)
+    assert caplog.text == ""
+
+
+@pytest.mark.skipif(
+    not harbor_bridge._can_open_without_links(),
+    reason="this platform leaves the trajectory beside the logs",
+)
+def test_copy_trajectory_says_nothing_without_a_trajectory(tmp_path: Path, caplog):
+    root, session = _mounted_logs(tmp_path)
+    into = tmp_path / "trial" / "agent"
+    assert not harbor_bridge.copy_trajectory("claude-code", session, into, root=root)
+    assert caplog.text == ""
+
+
+def test_extract_session_declines_where_links_cannot_be_refused(
+    tmp_path: Path, monkeypatch, caplog
+):
+    """Without dir_fd and O_NOFOLLOW (Windows), reading the session where it
+    lies would follow any link the agent left in it."""
+    root, session = _mounted_logs(tmp_path)
+    read: list[Path] = []
+    monkeypatch.setattr(harbor_bridge, "_can_open_without_links", lambda: False)
+    monkeypatch.setattr(
+        harbor_bridge, "extract_agent_context", _harbor_writes_a_trajectory(read)
+    )
+    assert harbor_bridge.extract_session("claude-code", session, root) == (None, None)
+    assert read == []
+    assert "did not extract the agent's session" in caplog.text
+
+
+@pytest.mark.skipif(
+    not harbor_bridge._can_open_without_links(),
+    reason="this platform does not extract the session",
+)
+@pytest.mark.parametrize("bound", ["bytes", "files", "directories", "depth"])
+def test_extract_session_declines_a_session_past_its_bounds(
+    tmp_path: Path, monkeypatch, caplog, bound
+):
+    """The agent arranges its session: a copy without bounds could fill the
+    disk or recurse until verify fails."""
+    root, session = _mounted_logs(tmp_path)
+    if bound == "bytes":
+        monkeypatch.setattr(harbor_bridge, "MAX_SESSION_BYTES", 10)
+        (session / "big.jsonl").write_text("x" * 11)
+    elif bound == "files":
+        monkeypatch.setattr(harbor_bridge, "MAX_SESSION_FILES", 2)
+        for i in range(3):
+            (session / f"{i}.jsonl").write_text("{}")
+    elif bound == "directories":
+        monkeypatch.setattr(harbor_bridge, "MAX_SESSION_FILES", 2)
+        for i in range(3):
+            (session / f"empty-{i}").mkdir()
+    else:
+        monkeypatch.setattr(harbor_bridge, "MAX_SESSION_DEPTH", 2)
+        (session / "a" / "b" / "c").mkdir(parents=True)
+    read: list[Path] = []
+    monkeypatch.setattr(
+        harbor_bridge, "extract_agent_context", _harbor_writes_a_trajectory(read)
+    )
+    assert harbor_bridge.extract_session("claude-code", session, root) == (None, None)
+    assert read == []
+    assert "did not extract the agent's session" in caplog.text
+
+
+@pytest.mark.skipif(
+    not harbor_bridge._can_open_without_links(),
+    reason="this platform does not extract the session",
+)
+def test_extract_session_caps_the_trajectory_harbor_writes(
+    tmp_path: Path, monkeypatch, caplog
+):
+    root, session = _mounted_logs(tmp_path)
+    monkeypatch.setattr(harbor_bridge, "MAX_TRAJECTORY_BYTES", 10)
+    read: list[Path] = []
+    monkeypatch.setattr(
+        harbor_bridge, "extract_agent_context", _harbor_writes_a_trajectory(read)
+    )
+    context, trajectory = harbor_bridge.extract_session("claude-code", session, root)
+    assert context and trajectory is None
+    assert "over 10 bytes" in caplog.text
 
 
 def test_a_symlink_one_artifact_leaves_cannot_redirect_the_next(tmp_path: Path):
