@@ -1615,9 +1615,10 @@ def _refuse_a_trial_dir_the_agent_can_write(
     target = trial_dir.expanduser().resolve()
     writable = [workspace.resolve()]
     for raw in sess.get("extra_mounts") or []:
-        host, _, rest = raw.partition(":")
-        if host and rest and rest.split(":")[1:2] != ["ro"]:
-            writable.append(Path(host).expanduser().resolve())
+        # host:container[:ro], where a Windows host starts with its drive (C:\).
+        mount = re.match(r"^((?:[A-Za-z]:[\\/])?[^:]*):([^:]*)(?::(.*))?$", raw)
+        if mount and mount[1] and mount[3] != "ro":
+            writable.append(Path(mount[1]).expanduser().resolve())
     for place in writable:
         if target.is_relative_to(place):
             raise click.ClickException(
