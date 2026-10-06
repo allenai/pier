@@ -754,6 +754,8 @@ def _fake_docker(
         if args[0] == "exec" and "test" in args:
             is_file = args[-1] in file_sources
             return MagicMock(returncode=1 if is_file else 0, stdout="", stderr="")
+        if args[0] == "ps":
+            return MagicMock(returncode=0, stdout="sidecar-id\n", stderr="")
         if args[0] == "cp":
             source = args[1].split(":", 1)[1]
             dest = Path(args[2])
@@ -872,6 +874,186 @@ def test_a_symlink_the_agent_left_is_not_in_the_record(tmp_path: Path, caplog):
     assert entry["status"] == "empty", "what the symlink was is not counted"
 
 
+@pytest.mark.parametrize(
+    "destinations",
+    [("first", "first/leak"), ("first/leak", "first"), ("first", "first")],
+)
+def test_overlapping_artifact_destinations_are_skipped_without_host_writes(
+    tmp_path: Path, destinations
+):
+    first, second = destinations
+    task = _task(
+        tmp_path,
+        f'artifacts = [{{source = "/one", destination = "{first}"}}, '
+        f'{{source = "/two", destination = "{second}"}}]\n'
+        '[verifier]\nenvironment_mode = "separate"\n',
+    )
+    record = tmp_path / "record"
+    record.mkdir()
+    host_dir = tmp_path / "host"
+    host_dir.mkdir()
+    calls: list = []
+    fake = _fake_docker(
+        calls, {"/two": "overwritten"}, links={"/one": ("leak", host_dir)}
+    )
+    with patch("pier.harbor_bridge._docker", fake):
+        harbor_bridge.record_workspace("pier-ws", task, record, "pier")
+    assert not list(host_dir.iterdir())
+    assert not any(args[0] == "cp" and ":/two/." in args[1] for args in calls)
+    manifest = json.loads((record / "artifacts" / "manifest.json").read_text())
+    assert next(e for e in manifest if e["source"] == "/two")["status"] == "skipped"
+
+
+def test_symlinks_are_removed_before_the_next_artifact_copy(tmp_path: Path):
+    task = _task(
+        tmp_path,
+        'artifacts = ["/one", "/two"]\n[verifier]\nenvironment_mode = "separate"\n',
+    )
+    record = tmp_path / "record"
+    record.mkdir()
+    host_dir = tmp_path / "host"
+    host_dir.mkdir()
+    fake = _fake_docker([], {}, links={"/one": ("leak", host_dir)})
+
+    def docker(*args, **kwargs):
+        if args[0] == "cp" and ":/two/." in args[1]:
+            assert not (record / "artifacts" / "one" / "leak").is_symlink()
+        return fake(*args, **kwargs)
+
+    with patch("pier.harbor_bridge._docker", docker):
+        harbor_bridge.record_workspace("pier-ws", task, record, "pier")
+    assert not list(host_dir.iterdir())
+
+
+@pytest.mark.parametrize("source", ["/manifest.json", "/"])
+def test_an_artifact_cannot_overwrite_the_record_manifest(tmp_path: Path, source):
+    task = _task(
+        tmp_path,
+        f'artifacts = ["{source}"]\n[verifier]\nenvironment_mode = "separate"\n',
+    )
+    record = tmp_path / "record"
+    record.mkdir()
+    calls: list = []
+    with (
+        patch("pier.harbor_bridge._docker", _fake_docker(calls, {})),
+        pytest.raises(RuntimeError, match="overlapping"),
+    ):
+        harbor_bridge.record_workspace("pier-ws", task, record, "pier")
+    assert calls == []
+
+
+def test_a_destination_redirected_outside_the_record_is_refused(tmp_path: Path):
+    task = _task(tmp_path, SEPARATE)
+    record = tmp_path / "record"
+    (record / "artifacts").mkdir(parents=True)
+    host_dir = tmp_path / "host"
+    host_dir.mkdir()
+    (record / "artifacts" / "workspace").symlink_to(host_dir, target_is_directory=True)
+    calls: list = []
+    with (
+        patch(
+            "pier.harbor_bridge._docker",
+            _fake_docker(calls, {"/workspace": "overwritten"}),
+        ),
+        pytest.raises(RuntimeError, match="outside the record"),
+    ):
+        harbor_bridge.record_workspace("pier-ws", task, record, "pier")
+    assert calls == []
+    assert not list(host_dir.iterdir())
+
+
+def test_a_file_artifact_that_is_a_symlink_is_removed(tmp_path: Path):
+    task = _task(
+        tmp_path,
+        'artifacts = ["/out.txt"]\n[verifier]\nenvironment_mode = "separate"\n',
+    )
+    record = tmp_path / "record"
+    record.mkdir()
+    host_file = tmp_path / "host-file"
+    host_file.write_text("host contents")
+    fake = _fake_docker([], {}, file_sources=("/out.txt",))
+
+    def docker(*args, **kwargs):
+        if args[0] == "cp" and args[1].endswith(":/out.txt"):
+            Path(args[2]).symlink_to(host_file)
+            return MagicMock(returncode=0)
+        return fake(*args, **kwargs)
+
+    with patch("pier.harbor_bridge._docker", docker):
+        harbor_bridge.record_workspace("pier-ws", task, record, "pier")
+    assert not (record / "artifacts" / "out.txt").is_symlink()
+    assert host_file.read_text() == "host contents"
+    manifest = json.loads((record / "artifacts" / "manifest.json").read_text())
+    assert next(e for e in manifest if e["source"] == "/out.txt")["status"] == "failed"
+
+
+def test_sidecar_evidence_is_collected_after_stopping_main(tmp_path: Path):
+    task = _task(
+        tmp_path,
+        'artifacts = [{source = "/sidecar-results", service = "database"}, "/workspace"]\n'
+        '[verifier]\nenvironment_mode = "separate"\n'
+        '[[verifier.collect]]\ncommand = "sidecar-collect"\nservice = "database"\nuser = "postgres"\n'
+        '[[verifier.collect]]\ncommand = "main-collect"\n',
+    )
+    record = tmp_path / "record"
+    record.mkdir()
+    calls: list = []
+    with patch(
+        "pier.harbor_bridge._docker",
+        _fake_docker(calls, {"/sidecar-results": "evidence.txt"}),
+    ):
+        harbor_bridge.record_workspace("pier-ws", task, record, "pier")
+    main = harbor_bridge.get_container_name("pier-ws")
+    main_hook = calls.index(("exec", main, "sh", "-c", "main-collect"))
+    main_artifact = calls.index(
+        ("cp", f"{main}:/workspace/.", str(record / "artifacts" / "workspace"))
+    )
+    stop = calls.index(("stop", main))
+    sidecar_hook = calls.index(
+        ("exec", "-u", "postgres", "sidecar-id", "sh", "-c", "sidecar-collect")
+    )
+    sidecar_copy = calls.index(
+        (
+            "cp",
+            "sidecar-id:/sidecar-results/.",
+            str(record / "artifacts" / "sidecar-results"),
+        )
+    )
+    assert main_hook < main_artifact < stop < sidecar_hook < sidecar_copy
+    assert (record / "artifacts" / "sidecar-results" / "evidence.txt").is_file()
+    manifest = json.loads((record / "artifacts" / "manifest.json").read_text())
+    assert (
+        next(e for e in manifest if e["source"] == "/sidecar-results")["service"]
+        == "database"
+    )
+
+
+def test_an_explicit_convention_artifact_is_not_collected_twice(tmp_path: Path):
+    task = _task(
+        tmp_path,
+        'artifacts = ["/logs/artifacts"]\n[verifier]\nenvironment_mode = "separate"\n',
+    )
+    record = tmp_path / "record"
+    record.mkdir()
+    with patch("pier.harbor_bridge._docker", _fake_docker([], {})):
+        harbor_bridge.record_workspace("pier-ws", task, record, "pier")
+    manifest = json.loads((record / "artifacts" / "manifest.json").read_text())
+    assert len(manifest) == 1
+
+
+def test_multistep_recording_is_rejected_before_collect_hooks(tmp_path: Path):
+    task = _task(tmp_path, SEPARATE + '[[steps]]\nname = "first"\n')
+    record = tmp_path / "record"
+    record.mkdir()
+    calls: list = []
+    with (
+        patch("pier.harbor_bridge._docker", _fake_docker(calls, {})),
+        pytest.raises(RuntimeError, match="with steps"),
+    ):
+        harbor_bridge.record_workspace("pier-ws", task, record, "pier")
+    assert calls == []
+
+
 def test_an_artifact_harbor_would_collect_differently_is_refused(tmp_path: Path):
     toml = (
         'artifacts = [{source = "/workspace", exclude = ["*.log"]}]\n'
@@ -894,6 +1076,43 @@ def test_a_container_that_will_not_stop_is_not_scored():
         pytest.raises(RuntimeError, match="not scored"),
     ):
         harbor_bridge.stop_workspace_container("pier-ws")
+
+
+def test_stopping_the_workspace_includes_overlay_containers():
+    calls: list = []
+
+    def docker(*args, **kwargs):
+        calls.append(args)
+        if args[0] == "ps":
+            return MagicMock(
+                returncode=0, stdout="main-id\noverlay-id\n" if len(calls) == 1 else ""
+            )
+        return MagicMock(returncode=0)
+
+    with patch("pier.harbor_bridge._docker", docker):
+        harbor_bridge.stop_workspace_environment("pier-ws")
+    assert calls[0] == (
+        "ps",
+        "-q",
+        "--filter",
+        "label=com.docker.compose.project=pier-ws",
+    )
+    assert calls[1] == ("stop", "pier-ws-main-1", "main-id", "overlay-id")
+    assert calls[2] == calls[0]
+
+
+@pytest.mark.parametrize("stop_fails", [False, True])
+def test_a_workspace_that_is_not_fully_stopped_is_not_scored(stop_fails):
+    def docker(*args, **kwargs):
+        if args[0] == "ps":
+            return MagicMock(returncode=0, stdout="overlay-id\n")
+        return MagicMock(returncode=int(stop_fails), stderr="stop failed")
+
+    with (
+        patch("pier.harbor_bridge._docker", docker),
+        pytest.raises(RuntimeError, match="not scored"),
+    ):
+        harbor_bridge.stop_workspace_environment("pier-ws")
 
 
 def test_binary_agent_map_reads_the_public_registry(monkeypatch):

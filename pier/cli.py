@@ -1568,7 +1568,7 @@ def _verify_apart(
     sess: dict, hsid: str, task_dir: Path, verify_trial_dir: Path
 ) -> tuple[dict, Path]:
     """Score a task that declares `[verifier] environment_mode = "separate"` as
-    Harbor does: the workspace's work recorded, its container stopped, and the
+    Harbor does: the workspace's work recorded, its services stopped, and the
     record scored in an environment built from the task's tests/, which never
     enter the workspace. Returns the reward and the scored trial's verifier dir."""
     agents = sess.get("agents") or []
@@ -1577,10 +1577,10 @@ def _verify_apart(
     record.mkdir(parents=True, exist_ok=True)
     try:
         harbor_bridge.record_workspace(hsid, task_dir, record, agent_name)
-        harbor_bridge.stop_workspace_container(hsid)
+        harbor_bridge.stop_workspace_environment(hsid)
         click.echo(
             "Scoring apart from the workspace, as the task declares: its "
-            "container is stopped ('pier start' restarts it)."
+            "environment is stopped ('pier start' restarts it)."
         )
         reward = harbor_bridge.regrade(record, task_dir, verify_trial_dir, "scored")
     except Exception as e:

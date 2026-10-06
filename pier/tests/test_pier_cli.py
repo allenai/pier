@@ -3655,7 +3655,7 @@ def test_verify_scores_apart_when_the_task_declares_it(
     calls.regrade.return_value = {"reward": 1.0}
     with (
         patch("pier.harbor_bridge.record_workspace", calls.record_workspace),
-        patch("pier.harbor_bridge.stop_workspace_container", calls.stop),
+        patch("pier.harbor_bridge.stop_workspace_environment", calls.stop),
         patch("pier.harbor_bridge.regrade", calls.regrade),
     ):
         result = runner.invoke(cli, ["verify"], catch_exceptions=False)
@@ -3681,13 +3681,58 @@ def test_verify_scores_in_the_workspace_when_the_task_does_not_say_otherwise(
     _write_session(ws, _container_session(task_dir=str(task_dir)), index_path)
     with (
         patch("pier.harbor_bridge.regrade") as mock_regrade,
-        patch("pier.harbor_bridge.stop_workspace_container") as mock_stop,
+        patch("pier.harbor_bridge.stop_workspace_environment") as mock_stop,
     ):
         result = runner.invoke(cli, ["verify"], catch_exceptions=False)
     assert result.exit_code == 0
     mock_verify.assert_called_once()
     mock_regrade.assert_not_called()
     mock_stop.assert_not_called()
+
+
+@patch("pier.harbor_bridge.is_environment_running", return_value=True)
+def test_separate_multistep_verify_is_rejected_before_collection_or_stop(
+    mock_running, runner, index_path, task_dir, tmp_path
+):
+    _scored_apart(task_dir)
+    with (task_dir / "task.toml").open("a") as f:
+        f.write('[[steps]]\nname = "first"\n')
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    _write_session(ws, _container_session(task_dir=str(task_dir)), index_path)
+    with (
+        patch("pier.harbor_bridge._docker") as docker,
+        patch("pier.harbor_bridge.stop_workspace_environment") as stop,
+        patch("pier.harbor_bridge.regrade") as regrade,
+    ):
+        result = runner.invoke(cli, ["verify"])
+    assert result.exit_code != 0
+    assert "with steps" in result.output
+    docker.assert_not_called()
+    stop.assert_not_called()
+    regrade.assert_not_called()
+
+
+@patch("pier.harbor_bridge.is_environment_running", return_value=True)
+def test_separate_verify_does_not_regrade_after_workspace_shutdown_fails(
+    mock_running, runner, index_path, task_dir, tmp_path
+):
+    _scored_apart(task_dir)
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    _write_session(ws, _container_session(task_dir=str(task_dir)), index_path)
+    with (
+        patch("pier.harbor_bridge.record_workspace"),
+        patch(
+            "pier.harbor_bridge.stop_workspace_environment",
+            side_effect=RuntimeError("workspace still running"),
+        ),
+        patch("pier.harbor_bridge.regrade") as regrade,
+    ):
+        result = runner.invoke(cli, ["verify"])
+    assert result.exit_code != 0
+    assert "workspace still running" in result.output
+    regrade.assert_not_called()
 
 
 @patch(
