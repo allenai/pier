@@ -1579,6 +1579,23 @@ def test_stop_removes_what_a_silently_failed_stop_left(
     assert "left 1 container(s)" in result.output
 
 
+@patch(
+    "pier.harbor_bridge.stop_environment",
+    side_effect=FileNotFoundError("overlay.yaml"),
+)
+def test_a_failed_stop_that_left_nothing_claims_no_cleanup(
+    mock_stop, runner, index_path, tmp_path
+):
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    _write_session(ws, _container_session(), index_path)
+    with patch("pier.harbor_bridge.remove_workspace_containers", return_value=[]):
+        result = runner.invoke(cli, ["stop"], catch_exceptions=False)
+    assert result.exit_code == 0, result.output
+    assert "no container of its compose project was left" in result.output
+    assert "removed them" not in result.output
+
+
 def test_stop_rejects_delete_flag(runner, index_path, tmp_path):
     ws = tmp_path / "ws"
     ws.mkdir()

@@ -1734,12 +1734,18 @@ def _stop_container_env(sess: dict, workspace: Path) -> None:
             + (f"{error}; " if error else "")
             + f"removing what was left by its compose project failed too: {fallback}"
         )
-    if error or removed:
+    if removed:
         click.echo(
             "Stopping through Harbor "
             + (f"failed ({error}) and " if error else "")
             + f"left {len(removed)} container(s); removed them by their compose "
             "project.",
+            err=True,
+        )
+    elif error:
+        click.echo(
+            f"Stopping through Harbor failed ({error}); no container of its "
+            "compose project was left.",
             err=True,
         )
 
