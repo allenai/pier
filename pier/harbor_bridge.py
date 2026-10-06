@@ -822,7 +822,7 @@ def record_workspace(
         logger.warning(
             "left %s out of the scored record: it is a symlink, which would "
             "resolve on this host",
-            link.relative_to(record),
+            link.relative_to(record).as_posix(),
         )
 
     manifest = []
