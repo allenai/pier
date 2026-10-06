@@ -701,12 +701,13 @@ AGENT_LOGS = "/logs/agent"
 
 
 def scores_apart(task_dir: Path) -> bool:
-    """Whether the task's verifier runs in an environment of its own."""
-    from harbor.models.task.config import TaskConfig, VerifierEnvironmentMode
-    from harbor.models.task.verifier_mode import resolve_task_verifier_mode
+    """Whether any of the task's verifiers runs in an environment of its own:
+    the task's, or for a task with steps, any step's."""
+    from harbor.models.task.config import TaskConfig
+    from harbor.models.task.verifier_mode import task_has_any_separate_verifier
 
     config = TaskConfig.model_validate_toml((task_dir / "task.toml").read_text())
-    return resolve_task_verifier_mode(config) == VerifierEnvironmentMode.SEPARATE
+    return task_has_any_separate_verifier(config)
 
 
 def _docker(*args: str, timeout: float | None = None) -> subprocess.CompletedProcess:
@@ -760,7 +761,7 @@ def record_workspace(
     """The workspace's work, as a trial record Harbor's regrade reads: the
     task's collect hooks run in the container, then its artifacts and the
     agent's logs copied out, with the manifest and result.json beside them."""
-    from harbor.models.task.config import TaskConfig
+    from harbor.models.task.config import TaskConfig, TaskOS
     from harbor.models.trial.artifact_manifest import ArtifactManifestEntry
     from harbor.trial.artifact_handler import artifact_host_path
 
@@ -770,6 +771,11 @@ def record_workspace(
         raise RuntimeError(
             "a task with steps is not scored apart by pier verify yet: its record "
             "would need each step's results"
+        )
+    if config.environment.os == TaskOS.WINDOWS:
+        raise RuntimeError(
+            "a Windows-container task is not scored apart by pier verify: it "
+            "collects with POSIX paths and sh"
         )
     for hook in config.verifier.collect:
         if (hook.service or "main") != "main":
@@ -802,7 +808,7 @@ def record_workspace(
 
     artifacts_dir = record / "artifacts"
     inside = record.resolve()
-    collected: list[tuple[str, str, Path, bool]] = []
+    collected: list[tuple[str, str, Path, bool, bool]] = []
     skipped: list[tuple[str, str]] = []
     dropped: list[Path] = []
     for artifact in _declared_artifacts(task_dir):
@@ -815,7 +821,7 @@ def record_workspace(
         )
         # As Harbor collects: an artifact overlapping one collected before it
         # is left out, so nothing one copy left can lie on another's path.
-        earlier = [t for _, _, t, _ in collected]
+        earlier = [t for _, _, t, _, _ in collected]
         if any(
             target == t or t in target.parents or target in t.parents for t in earlier
         ):
@@ -836,11 +842,16 @@ def record_workspace(
             target.parent.mkdir(parents=True, exist_ok=True)
             copied = _docker("cp", f"{container}:{source}", str(target))
         if copied.returncode:
-            raise RuntimeError(
-                f"could not copy {source} out of the workspace: "
-                + copied.stderr.strip()[-300:]
+            # As Harbor collects: best effort, so an artifact the agent never
+            # wrote is a failed entry in the manifest, and the work is scored.
+            logger.warning(
+                "could not copy artifact %s out of the workspace (%s)",
+                source,
+                copied.stderr.strip()[-300:],
             )
-        collected.append((source, destination, target, is_dir.returncode == 0))
+        collected.append(
+            (source, destination, target, is_dir.returncode == 0, not copied.returncode)
+        )
         dropped += _drop_symlinks(record)
     (record / "agent").mkdir(exist_ok=True)
     copied = _docker("cp", f"{container}:{AGENT_LOGS}/.", str(record / "agent"))
@@ -858,11 +869,14 @@ def record_workspace(
         )
 
     manifest = []
-    for source, destination, target, a_directory in collected:
-        if a_directory:
-            kind, status = "directory", "ok" if any(target.iterdir()) else "empty"
+    for source, destination, target, a_directory, ok in collected:
+        kind = "directory" if a_directory else "file"
+        if not ok:
+            status = "failed"
+        elif a_directory:
+            status = "ok" if any(target.iterdir()) else "empty"
         else:
-            kind, status = "file", "ok" if target.is_file() else "failed"
+            status = "ok" if target.is_file() else "failed"
         manifest.append(
             ArtifactManifestEntry(
                 source=source, destination=destination, type=kind, status=status
