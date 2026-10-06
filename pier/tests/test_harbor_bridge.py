@@ -737,16 +737,34 @@ def test_scores_apart_reads_the_tasks_declaration(tmp_path: Path, toml, apart):
     assert harbor_bridge.scores_apart(_task(tmp_path, toml)) is apart
 
 
-def _fake_docker(calls: list, files: dict[str, str], exec_rc: int = 0):
-    """`docker exec` runs nothing; `docker cp` writes `files` for a source."""
+def _fake_docker(
+    calls: list,
+    files: dict[str, str],
+    exec_rc: int = 0,
+    file_sources: tuple[str, ...] = (),
+    links: dict[str, Path] | None = None,
+):
+    """`docker exec` runs a hook (exit *exec_rc*) or answers `test -d`: every
+    source is a directory but *file_sources*. `docker cp` writes `files` for a
+    directory source, a file for a file source, and plants *links*: a symlink
+    named for each source, pointing at a host path."""
 
     def docker(*args, timeout=None):
         calls.append(args)
+        if args[0] == "exec" and "test" in args:
+            is_file = args[-1] in file_sources
+            return MagicMock(returncode=1 if is_file else 0, stdout="", stderr="")
         if args[0] == "cp":
-            source = args[1].split(":", 1)[1].removesuffix("/.")
+            source = args[1].split(":", 1)[1]
             dest = Path(args[2])
-            if source in files:
-                (dest / files[source]).write_text("x")
+            if source.endswith("/."):
+                source = source.removesuffix("/.")
+                if source in files:
+                    (dest / files[source]).write_text("x")
+                if source in (links or {}):
+                    (dest / "leak").symlink_to(links[source])
+            elif source in file_sources:
+                dest.write_text("x")
         rc = exec_rc if args[0] == "exec" else 0
         return MagicMock(returncode=rc, stdout="", stderr="it failed")
 
@@ -774,17 +792,83 @@ def test_record_workspace_writes_what_regrade_reads(tmp_path: Path):
     assert result["agent_info"]["name"] == "pier:claude-code"
 
 
-def test_a_failing_collect_hook_stops_the_scoring(tmp_path: Path):
+def test_a_failing_collect_hook_warns_and_the_scoring_goes_on(tmp_path: Path, caplog):
+    """As Harbor runs collect hooks: best effort."""
     task = _task(tmp_path, SEPARATE)
     record = tmp_path / "record"
     record.mkdir()
-    calls: list = []
-    with (
-        patch("pier.harbor_bridge._docker", _fake_docker(calls, {}, exec_rc=3)),
-        pytest.raises(RuntimeError, match="collect hook 'collect-it' failed"),
-    ):
+    with patch("pier.harbor_bridge._docker", _fake_docker([], {}, exec_rc=3)):
         harbor_bridge.record_workspace("pier-ws", task, record, "pier")
-    assert not (record / "result.json").exists()
+    assert "collect hook 'collect-it' failed (exit 3" in caplog.text
+    assert (record / "result.json").exists()
+
+
+def test_a_collect_hook_runs_as_its_user(tmp_path: Path):
+    toml = (
+        '[verifier]\nenvironment_mode = "separate"\n'
+        '[[verifier.collect]]\ncommand = "collect-it"\nuser = "agent"\n'
+    )
+    task = _task(tmp_path, toml)
+    record = tmp_path / "record"
+    record.mkdir()
+    calls: list = []
+    with patch("pier.harbor_bridge._docker", _fake_docker(calls, {})):
+        harbor_bridge.record_workspace("pier-ws", task, record, "pier")
+    container = harbor_bridge.get_container_name("pier-ws")
+    assert calls[0] == ("exec", "-u", "agent", container, "sh", "-c", "collect-it")
+
+
+def test_a_file_artifact_is_copied_as_a_file(tmp_path: Path):
+    toml = (
+        'artifacts = ["/workspace/out.txt"]\n'
+        '[verifier]\nenvironment_mode = "separate"\n'
+    )
+    task = _task(tmp_path, toml)
+    record = tmp_path / "record"
+    record.mkdir()
+    docker = _fake_docker([], {}, file_sources=("/workspace/out.txt",))
+    with patch("pier.harbor_bridge._docker", docker):
+        harbor_bridge.record_workspace("pier-ws", task, record, "pier")
+    assert (record / "artifacts" / "workspace" / "out.txt").is_file()
+    manifest = json.loads((record / "artifacts" / "manifest.json").read_text())
+    entry = next(e for e in manifest if e["source"] == "/workspace/out.txt")
+    assert (entry["type"], entry["status"]) == ("file", "ok")
+
+
+def test_an_artifact_lands_at_its_declared_destination(tmp_path: Path):
+    toml = (
+        'artifacts = [{source = "/workspace/results", destination = "results"}]\n'
+        '[verifier]\nenvironment_mode = "separate"\n'
+    )
+    task = _task(tmp_path, toml)
+    record = tmp_path / "record"
+    record.mkdir()
+    docker = _fake_docker([], {"/workspace/results": "scores.json"})
+    with patch("pier.harbor_bridge._docker", docker):
+        harbor_bridge.record_workspace("pier-ws", task, record, "pier")
+    assert (record / "artifacts" / "results" / "scores.json").exists()
+    manifest = json.loads((record / "artifacts" / "manifest.json").read_text())
+    entry = next(e for e in manifest if e["source"] == "/workspace/results")
+    assert entry["destination"] == "artifacts/results"
+
+
+def test_a_symlink_the_agent_left_is_not_in_the_record(tmp_path: Path, caplog):
+    """Regrade copies the record following symlinks, so one left in it would
+    copy this host's file into the scored trial."""
+    secret = tmp_path / "host-secret"
+    secret.write_text("not the agent's")
+    task = _task(tmp_path, SEPARATE)
+    record = tmp_path / "record"
+    record.mkdir()
+    docker = _fake_docker([], {}, links={"/workspace": secret})
+    with patch("pier.harbor_bridge._docker", docker):
+        harbor_bridge.record_workspace("pier-ws", task, record, "pier")
+    leak = record / "artifacts" / "workspace" / "leak"
+    assert not leak.exists() and not leak.is_symlink()
+    assert "artifacts/workspace/leak" in caplog.text
+    manifest = json.loads((record / "artifacts" / "manifest.json").read_text())
+    entry = next(e for e in manifest if e["source"] == "/workspace")
+    assert entry["status"] == "empty", "what the symlink was is not counted"
 
 
 def test_an_artifact_harbor_would_collect_differently_is_refused(tmp_path: Path):

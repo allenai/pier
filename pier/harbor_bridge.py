@@ -713,26 +713,43 @@ def _docker(*args: str, timeout: float | None = None) -> subprocess.CompletedPro
     )
 
 
-def _declared_artifacts(task_dir: Path) -> list[str]:
-    """The directories to collect: the convention's and the task's own.
+def _declared_artifacts(task_dir: Path) -> list:
+    """The artifacts to collect: the convention's and the task's own, as
+    Harbor's ``ArtifactConfig``.
 
     An entry with excludes, or from a service other than main, is refused
     rather than collected differently from how Harbor collects it."""
-    from harbor.models.task.config import TaskConfig
+    from harbor.models.task.config import ArtifactConfig, TaskConfig
 
     config = TaskConfig.model_validate_toml((task_dir / "task.toml").read_text())
-    sources = [ARTIFACTS_CONVENTION]
+    entries = [ArtifactConfig(source=ARTIFACTS_CONVENTION)]
     for entry in config.artifacts:
         if isinstance(entry, str):
-            sources.append(entry)
+            entries.append(ArtifactConfig(source=entry))
             continue
         if entry.exclude or (entry.service or "main") != "main":
             raise RuntimeError(
                 f"artifact {entry.source}: excludes and services other than "
                 "main are not collected by pier verify yet"
             )
-        sources.append(entry.source)
-    return sources
+        entries.append(entry)
+    return entries
+
+
+def _drop_symlinks(root: Path) -> list[Path]:
+    """Delete every symlink under *root*, and return them.
+
+    ``docker cp`` keeps a symlink the agent left, and Harbor's regrade copies
+    the record following symlinks, so one would resolve on this host rather
+    than in the container: a host file copied into the scored trial."""
+    dropped: list[Path] = []
+    for dirpath, dirnames, filenames in os.walk(root):
+        for name in [*dirnames, *filenames]:
+            path = Path(dirpath) / name
+            if path.is_symlink():
+                path.unlink()
+                dropped.append(path)
+    return dropped
 
 
 def record_workspace(
@@ -743,6 +760,7 @@ def record_workspace(
     agent's logs copied out, with the manifest and result.json beside them."""
     from harbor.models.task.config import TaskConfig
     from harbor.models.trial.artifact_manifest import ArtifactManifestEntry
+    from harbor.trial.artifact_handler import artifact_host_path
 
     container = get_container_name(harbor_session_id)
     config = TaskConfig.model_validate_toml((task_dir / "task.toml").read_text())
@@ -752,35 +770,73 @@ def record_workspace(
                 f"collect hook {hook.command!r} runs in {hook.service!r}; "
                 "pier verify runs hooks in main only"
             )
-        ran = _docker(
-            "exec", container, "sh", "-c", hook.command, timeout=hook.timeout_sec
-        )
-        if ran.returncode:
-            raise RuntimeError(
-                f"collect hook {hook.command!r} failed (exit {ran.returncode}): "
-                + (ran.stderr or ran.stdout).strip()[-300:]
+        # As Harbor runs them: as the hook's user, and best effort, so a hook
+        # that fails leaves its output out rather than stopping the scoring.
+        user = ["-u", str(hook.user)] if hook.user is not None else []
+        try:
+            ran = _docker(
+                "exec",
+                *user,
+                container,
+                "sh",
+                "-c",
+                hook.command,
+                timeout=hook.timeout_sec,
             )
+            failed = (
+                f"exit {ran.returncode}: " + (ran.stderr or ran.stdout).strip()[-300:]
+                if ran.returncode
+                else ""
+            )
+        except subprocess.TimeoutExpired:
+            failed = f"timed out after {hook.timeout_sec:g}s"
+        if failed:
+            logger.warning("collect hook %r failed (%s)", hook.command, failed)
 
-    manifest = []
-    for source in _declared_artifacts(task_dir):
-        destination = "artifacts/" + source.strip("/")
-        dest = record / destination
-        dest.mkdir(parents=True, exist_ok=True)
-        copied = _docker("cp", f"{container}:{source}/.", str(dest))
+    artifacts_dir = record / "artifacts"
+    collected = []
+    for artifact in _declared_artifacts(task_dir):
+        source = artifact.source
+        target = artifact_host_path(artifacts_dir, artifact)
+        destination = (
+            "artifacts"
+            if target == artifacts_dir
+            else f"artifacts/{target.relative_to(artifacts_dir).as_posix()}"
+        )
+        is_dir = _docker("exec", "-u", "root", container, "test", "-d", source)
+        if is_dir.returncode == 0:
+            target.mkdir(parents=True, exist_ok=True)
+            copied = _docker("cp", f"{container}:{source}/.", str(target))
+        else:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            copied = _docker("cp", f"{container}:{source}", str(target))
         if copied.returncode:
             raise RuntimeError(
                 f"could not copy {source} out of the workspace: "
                 + copied.stderr.strip()[-300:]
             )
-        status = "ok" if any(dest.iterdir()) else "empty"
-        manifest.append(
-            ArtifactManifestEntry(
-                source=source, destination=destination, type="directory", status=status
-            ).model_dump(mode="json")
-        )
-    (record / "artifacts" / "manifest.json").write_text(json.dumps(manifest, indent=2))
+        collected.append((source, destination, target, is_dir.returncode == 0))
     (record / "agent").mkdir(exist_ok=True)
     _docker("cp", f"{container}:{AGENT_LOGS}/.", str(record / "agent"))
+    for link in _drop_symlinks(record):
+        logger.warning(
+            "left %s out of the scored record: it is a symlink, which would "
+            "resolve on this host",
+            link.relative_to(record),
+        )
+
+    manifest = []
+    for source, destination, target, a_directory in collected:
+        if a_directory:
+            kind, status = "directory", "ok" if any(target.iterdir()) else "empty"
+        else:
+            kind, status = "file", "ok" if target.is_file() else "failed"
+        manifest.append(
+            ArtifactManifestEntry(
+                source=source, destination=destination, type=kind, status=status
+            ).model_dump(mode="json")
+        )
+    (artifacts_dir / "manifest.json").write_text(json.dumps(manifest, indent=2))
 
     name = config.task.name if config.task is not None else task_dir.name
     trial_config = {
