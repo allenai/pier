@@ -480,14 +480,17 @@ class TestVerifyIntegration:
             '[[verifier.collect]]\ncommand = "sleep 3"\ntimeout_sec = 5\n'
         )
         (task_dir / "tests" / "Dockerfile").write_text(
-            "FROM python:3.12-slim\nWORKDIR /app\n"
+            "FROM python:3.12-slim\nWORKDIR /app\nCOPY . /tests/\n"
         )
         try:
             _start_workspace(runner, task_dir, workspace)
             (workspace / "hello.txt").write_text("Hello, world!")
             result = runner.invoke(cli, ["verify"], catch_exceptions=False)
-            assert result.exit_code == 0, result.output
             trial = next((workspace / ".pier" / "trials").iterdir())
+            stdout = trial / "scored" / "verifier" / "test-stdout.txt"
+            assert result.exit_code == 0, result.output + (
+                stdout.read_text() if stdout.exists() else ""
+            )
             data = json.loads((trial / "result.json").read_text())
             assert data["verifier_result"]["rewards"] == {"reward": 1.0}
             assert (trial / "record" / "artifacts" / "app" / "hello.txt").is_file()
