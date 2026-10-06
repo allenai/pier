@@ -1134,6 +1134,106 @@ def test_copy_trajectory_does_not_enter_a_linked_agent_dir(tmp_path: Path):
     assert list(host_dir.iterdir()) == []
 
 
+def _harbor_writes_a_trajectory(read):
+    """Stands in for Harbor's extraction: records where it read, and writes a
+    trajectory there, as Harbor does."""
+
+    def extract(agent_name, logs_dir):
+        read.append(logs_dir)
+        (logs_dir / "trajectory.json").write_text('{"steps": ["fresh"]}')
+        return {"cost_usd": 0.05}
+
+    return extract
+
+
+@pytest.mark.skipif(
+    not harbor_bridge._can_open_without_links(),
+    reason="this platform extracts the session where it lies",
+)
+def test_extract_session_reads_and_writes_a_copy(tmp_path: Path, monkeypatch):
+    root, session = _mounted_logs(tmp_path)
+    (session / "claude-code.txt").write_text("a session\n")
+    read: list[Path] = []
+    monkeypatch.setattr(
+        harbor_bridge, "extract_agent_context", _harbor_writes_a_trajectory(read)
+    )
+    context, trajectory = harbor_bridge.extract_session("claude-code", session, root)
+    assert context == {"cost_usd": 0.05}
+    assert trajectory == b'{"steps": ["fresh"]}'
+    assert not read[0].is_relative_to(root), "Harbor read the mounted session"
+    assert not (session / "trajectory.json").exists(), "Harbor wrote into it"
+
+
+@pytest.mark.skipif(
+    not harbor_bridge._can_open_without_links(),
+    reason="this platform extracts the session where it lies",
+)
+def test_extract_session_does_not_follow_a_linked_session_dir(
+    tmp_path: Path, monkeypatch
+):
+    """Harbor reads and writes a session dir following links: one the agent
+    made a link to a host directory had Harbor write a file there."""
+    host_dir = tmp_path / "host-dir"
+    host_dir.mkdir()
+    root = tmp_path / "agent"
+    (root / "exec").mkdir(parents=True)
+    session = root / "exec" / "2026-01-01_00-00-00-000000"
+    session.symlink_to(host_dir)
+    read: list[Path] = []
+    monkeypatch.setattr(
+        harbor_bridge, "extract_agent_context", _harbor_writes_a_trajectory(read)
+    )
+    assert harbor_bridge.extract_session("claude-code", session, root) == (None, None)
+    assert read == []
+    assert list(host_dir.iterdir()) == []
+
+
+@pytest.mark.skipif(
+    not harbor_bridge._can_open_without_links(),
+    reason="this platform extracts the session where it lies",
+)
+def test_extract_session_leaves_links_inside_the_session_out(
+    tmp_path: Path, monkeypatch
+):
+    """A session file linked to a host file would have Harbor read the host's."""
+    secret = tmp_path / "host-secret.jsonl"
+    secret.write_text('{"not": "the agent\'s"}\n')
+    root, session = _mounted_logs(tmp_path)
+    projects = session / "sessions" / "projects" / "-workspace"
+    projects.mkdir(parents=True)
+    (projects / "real.jsonl").write_text("{}\n")
+    (projects / "planted.jsonl").symlink_to(secret)
+    copied: list[set[str]] = []
+
+    def extract(agent_name, logs_dir):
+        copied.append(
+            {
+                p.name
+                for p in (logs_dir / "sessions" / "projects" / "-workspace").iterdir()
+            }
+        )
+        return {"cost_usd": 0.05}
+
+    monkeypatch.setattr(harbor_bridge, "extract_agent_context", extract)
+    harbor_bridge.extract_session("claude-code", session, root)
+    assert copied == [{"real.jsonl"}]
+
+
+def test_extract_session_where_links_cannot_be_refused_reads_in_place(
+    tmp_path: Path, monkeypatch, caplog
+):
+    root, session = _mounted_logs(tmp_path)
+    read: list[Path] = []
+    monkeypatch.setattr(harbor_bridge, "_can_open_without_links", lambda: False)
+    monkeypatch.setattr(
+        harbor_bridge, "extract_agent_context", _harbor_writes_a_trajectory(read)
+    )
+    context, trajectory = harbor_bridge.extract_session("claude-code", session, root)
+    assert context and trajectory is None
+    assert read == [session]
+    assert "beside the session's logs" in caplog.text
+
+
 def test_a_symlink_one_artifact_leaves_cannot_redirect_the_next(tmp_path: Path):
     """The first artifact plants a symlink where the second would land: it
     must not write through it, onto this host."""

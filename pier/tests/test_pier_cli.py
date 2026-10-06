@@ -2047,6 +2047,46 @@ def test_verify_container_custom_trial_dir(
     assert mock_assemble.call_args[0][0] == custom  # trial_dir is first arg
 
 
+@pytest.mark.parametrize(
+    "where,mounts,refused",
+    [
+        ("ws/my-trial", [], True),
+        ("shared/my-trial", ["{tmp}/shared:/data"], True),
+        ("shared/my-trial", ["{tmp}/shared:/data:ro"], False),
+        ("elsewhere/my-trial", ["{tmp}/shared:/data"], False),
+    ],
+)
+@patch("pier.cli._assemble_trial_output")
+@patch("pier.harbor_bridge.verify_environment", return_value={"reward": 1.0})
+@patch("pier.harbor_bridge.is_environment_running", return_value=True)
+def test_verify_refuses_a_trial_dir_the_agent_can_write(
+    mock_running,
+    mock_verify,
+    mock_assemble,
+    where,
+    mounts,
+    refused,
+    runner,
+    index_path,
+    task_dir,
+    tmp_path,
+):
+    """pier writes the whole trial there; where the agent writes, a link it
+    swaps in could redirect those writes onto this host."""
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    sess = _container_session(task_dir=str(task_dir))
+    sess["extra_mounts"] = [m.format(tmp=tmp_path) for m in mounts]
+    _write_session(ws, sess, index_path)
+    result = runner.invoke(cli, ["verify", "--trial-dir", str(tmp_path / where)])
+    if refused:
+        assert result.exit_code != 0
+        assert "which the agent can write" in result.output
+        mock_verify.assert_not_called()
+    else:
+        assert result.exit_code == 0, result.output
+
+
 @patch("pier.cli._assemble_trial_output")
 @patch("pier.harbor_bridge.verify_environment", return_value={"reward": 1.0})
 @patch("pier.harbor_bridge.is_environment_running", return_value=True)
@@ -2238,6 +2278,50 @@ def test_verify_container_session_dir_copies_from_container(
     mock_copy.assert_called_once()
     # Verify the container path was passed through
     assert mock_copy.call_args[0][1] == "/root/.claude"
+
+
+def test_a_session_copied_from_the_container_keeps_no_links(tmp_path, capsys):
+    """`docker cp` keeps the links the agent left; on this host they would
+    resolve here when the session is read."""
+    from pier.cli import _copy_session_from_container
+
+    secret = tmp_path / "host-secret"
+    secret.write_text("not the agent's")
+    dest = tmp_path / "session"
+
+    def docker_cp(args, **kwargs):
+        (dest / "projects").mkdir(parents=True)
+        (dest / "projects" / "real.jsonl").write_text("{}\n")
+        (dest / "projects" / "planted.jsonl").symlink_to(secret)
+        return MagicMock(returncode=0)
+
+    with patch("subprocess.run", side_effect=docker_cp):
+        _copy_session_from_container("pier-ws", "/logs/agent/exec/x", dest)
+    assert sorted(p.name for p in (dest / "projects").iterdir()) == ["real.jsonl"]
+    assert secret.read_text() == "not the agent's"
+    assert "planted.jsonl" in capsys.readouterr().err
+
+
+def test_a_session_dir_that_is_a_link_in_the_container_is_refused(tmp_path):
+    """Walking a copied link would walk the host directory it points to."""
+    from pier.cli import _copy_session_from_container
+
+    host_dir = tmp_path / "host-dir"
+    host_dir.mkdir()
+    (host_dir / "keep-me").symlink_to(tmp_path)
+    dest = tmp_path / "session"
+
+    def docker_cp(args, **kwargs):
+        dest.symlink_to(host_dir)
+        return MagicMock(returncode=0)
+
+    with (
+        patch("subprocess.run", side_effect=docker_cp),
+        pytest.raises(click.ClickException, match="is a link in the container"),
+    ):
+        _copy_session_from_container("pier-ws", "/logs/agent/exec/x", dest)
+    assert (host_dir / "keep-me").is_symlink(), "a link on the host was deleted"
+    assert not dest.exists() and not dest.is_symlink()
 
 
 def _copy_a_session_with_its_trajectory(hsid, container_path, dest):
@@ -2789,6 +2873,7 @@ def test_capture_container_auto_discover(
     ws.mkdir()
     sess = _container_session(agents=["claude-code"])
     _write_session(ws, sess, index_path)
+    _claude_session_with_trajectory(ws)
     monkeypatch.chdir(ws)
     monkeypatch.setenv("PWD", str(ws))
 

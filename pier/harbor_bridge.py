@@ -33,6 +33,7 @@ import shutil
 import stat
 import subprocess
 import sys
+import tempfile
 from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path, PurePosixPath
@@ -1655,32 +1656,52 @@ def _can_open_without_links() -> bool:
     return os.open in os.supports_dir_fd and hasattr(os, "O_NOFOLLOW")
 
 
-def _open_under(root: Path, relative: PurePosixPath) -> int | None:
-    """A read-only descriptor for ``root/relative``, or None.
-
-    Each component below *root* is opened from the one before it without
-    following a link, so nothing swapped in after a check can redirect the
-    read; non-blocking, so a FIFO cannot hang it."""
+def _open_dir_under(root: Path, relative: PurePosixPath) -> int | None:
+    """A descriptor for the directory ``root/relative``, or None. Each
+    component below *root* is opened from the one before it without following
+    a link, so nothing swapped in after a check can redirect what follows."""
     try:
         fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
     except OSError:
         return None
-    try:
-        for part in relative.parts[:-1]:
+    for part in relative.parts:
+        try:
             inner = os.open(
                 part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd
             )
+        except OSError:
             os.close(fd)
-            fd = inner
-        return os.open(
-            relative.parts[-1],
-            os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
-            dir_fd=fd,
+            return None
+        os.close(fd)
+        fd = inner
+    return fd
+
+
+def _open_file_in(directory: int, name: str) -> int | None:
+    """A read-only descriptor for the regular file *name* in *directory*, or
+    None: not followed if a link, non-blocking so a FIFO cannot hang it."""
+    try:
+        fd = os.open(
+            name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory
         )
     except OSError:
         return None
-    finally:
+    if not stat.S_ISREG(os.fstat(fd).st_mode):
         os.close(fd)
+        return None
+    return fd
+
+
+def _open_under(root: Path, relative: PurePosixPath) -> int | None:
+    """A read-only descriptor for the regular file ``root/relative``, or None,
+    reached without following a link at any step."""
+    directory = _open_dir_under(root, PurePosixPath(*relative.parts[:-1]))
+    if directory is None:
+        return None
+    try:
+        return _open_file_in(directory, relative.parts[-1])
+    finally:
+        os.close(directory)
 
 
 def copy_trajectory(agent_name: str, logs_dir: Path, into: Path, root: Path) -> bool:
@@ -1757,6 +1778,82 @@ def _write_under(into: Path, name: str, data: bytes) -> bool:
     with os.fdopen(out, "wb") as dest:
         dest.write(data)
     return True
+
+
+def write_trajectory(into: Path, data: bytes) -> bool:
+    """Write a trajectory into a trial's agent dir, as :func:`_write_under`."""
+    return _write_under(into, "trajectory.json", data)
+
+
+def _copy_tree_from(directory: int, dest: Path) -> None:
+    """Copy the directory open at *directory* into *dest*: directories and
+    regular files only, each opened without following a link. Links, FIFOs,
+    devices and files over :data:`MAX_TRAJECTORY_BYTES` are left out."""
+    dest.mkdir(parents=True, exist_ok=True)
+    for entry in os.scandir(directory):
+        if entry.is_symlink():
+            continue
+        if entry.is_dir(follow_symlinks=False):
+            try:
+                inner = os.open(
+                    entry.name,
+                    os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                    dir_fd=directory,
+                )
+            except OSError:
+                continue
+            try:
+                _copy_tree_from(inner, dest / entry.name)
+            finally:
+                os.close(inner)
+        elif entry.is_file(follow_symlinks=False):
+            fd = _open_file_in(directory, entry.name)
+            if fd is None:
+                continue
+            with os.fdopen(fd, "rb") as source:
+                data = source.read(MAX_TRAJECTORY_BYTES + 1)
+            if len(data) <= MAX_TRAJECTORY_BYTES:
+                (dest / entry.name).write_bytes(data)
+
+
+def extract_session(
+    agent_name: str, logs_dir: Path, root: Path
+) -> tuple[dict | None, bytes | None]:
+    """Harbor's extraction of the session :func:`extract_agent_context` would
+    read under *logs_dir*: the usage it found, and the trajectory it wrote.
+
+    *root* is the agent logs dir mounted from the container, which the agent
+    arranges while it runs. Harbor reads a session where it lies and writes
+    its trajectory there, following links, so a session dir the agent made a
+    link to a host directory would have Harbor read and write on this host.
+    So the session is first copied out from *root* without following a link,
+    and Harbor reads and writes the copy. Where the platform cannot open a
+    path that way (Windows), Harbor reads the session where it lies, and the
+    trajectory is left beside it."""
+    if not _can_open_without_links():
+        logger.warning(
+            "left the trajectory beside the session's logs: this platform "
+            "cannot copy them out without following links"
+        )
+        return extract_agent_context(agent_name, logs_dir), None
+    session = _latest_session_dir(logs_dir, agent_name) or logs_dir
+    try:
+        relative = PurePosixPath(session.relative_to(root).as_posix())
+    except ValueError:
+        return None, None
+    directory = _open_dir_under(root, relative)
+    if directory is None:
+        return None, None
+    with tempfile.TemporaryDirectory() as scratch:
+        copy = Path(scratch) / "session"
+        try:
+            _copy_tree_from(directory, copy)
+        finally:
+            os.close(directory)
+        context = extract_agent_context(agent_name, copy)
+        trajectory = copy / "trajectory.json"
+        data = trajectory.read_bytes() if trajectory.is_file() else None
+    return context, data
 
 
 # ---------------------------------------------------------------------------
