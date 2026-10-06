@@ -26,6 +26,7 @@ import asyncio
 import contextlib
 import json
 import logging
+import math
 import os
 import re
 import subprocess
@@ -848,6 +849,11 @@ def record_workspace(
             "would need each step's results; use harbor run to record each step"
         )
     artifacts_dir = record / "artifacts"
+    if any(
+        not math.isfinite(h.timeout_sec) or h.timeout_sec <= 0
+        for h in config.verifier.collect
+    ):
+        raise RuntimeError("collect hook timeout must be finite and greater than zero")
     artifacts = _declared_artifacts(task_dir)
     for artifact in artifacts:
         target = artifact_host_path(artifacts_dir, artifact)
@@ -868,18 +874,24 @@ def record_workspace(
                 "exec",
                 *user,
                 container,
+                "timeout",
+                "-s",
+                "KILL",
+                f"{hook.timeout_sec:g}",
                 "sh",
                 "-c",
                 hook.command,
-                timeout=hook.timeout_sec,
+                timeout=hook.timeout_sec + 10,
             )
             failed = (
                 f"exit {ran.returncode}: " + (ran.stderr or ran.stdout).strip()[-300:]
                 if ran.returncode
                 else ""
             )
-        except subprocess.TimeoutExpired:
-            failed = f"timed out after {hook.timeout_sec:g}s"
+        except subprocess.TimeoutExpired as exc:
+            raise RuntimeError(
+                "collect hook client timed out; cannot confirm the hook stopped"
+            ) from exc
         except (RuntimeError, OSError) as exc:
             failed = str(exc)
         if failed:

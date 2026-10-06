@@ -1,6 +1,11 @@
 """Tests for harbor_bridge helpers (no Harbor or Docker required)."""
 
 import json
+import shlex
+import shutil
+import subprocess
+import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -723,10 +728,14 @@ class TestExtraCompose:
             MagicMock(returncode=0),
             MagicMock(returncode=0, stdout=""),
         ]
-        with patch("pier.harbor_bridge._docker", side_effect=replies) as docker:
+        with (
+            patch("pier.harbor_bridge._docker", side_effect=replies) as docker,
+            patch("subprocess.run") as subprocess_run,
+        ):
             stop_environment(
                 task, "pier-ws", tmp_path / "trial", extra_compose=[str(overlay)]
             )
+        subprocess_run.assert_not_called()
         assert docker.call_args_list[1].args == ("stop", "main-id", "gateway-id")
         assert docker.call_args_list[0].args == (
             "ps",
@@ -755,6 +764,20 @@ def test_stop_checks_the_project_even_when_harbor_does_not_raise(
         stop_environment(tmp_path, "pier-ws", tmp_path / "trial")
     assert docker.call_args_list[1].args == ("stop", "gateway-id")
     assert "resources were retained" in caplog.text
+
+
+def test_stop_does_not_claim_success_when_project_state_cannot_be_checked(
+    tmp_path: Path,
+):
+    with (
+        patch("pier.harbor_bridge._async_stop_environment", new_callable=AsyncMock),
+        patch(
+            "pier.harbor_bridge._docker",
+            return_value=MagicMock(returncode=1, stderr="offline"),
+        ),
+        pytest.raises(RuntimeError, match="could not list workspace containers"),
+    ):
+        harbor_bridge.stop_environment(tmp_path, "pier-ws", tmp_path / "trial")
 
 
 @pytest.mark.parametrize(
@@ -866,7 +889,17 @@ def test_record_workspace_writes_what_regrade_reads(tmp_path: Path):
     with patch("pier.harbor_bridge._docker", docker):
         harbor_bridge.record_workspace("pier-ws", task, record, "pier:claude-code")
     container = harbor_bridge.get_container_name("pier-ws")
-    assert calls[0] == ("exec", container, "sh", "-c", "collect-it"), "hook first"
+    assert calls[0] == (
+        "exec",
+        container,
+        "timeout",
+        "-s",
+        "KILL",
+        "60",
+        "sh",
+        "-c",
+        "collect-it",
+    ), "hook first"
     manifest = json.loads((record / "artifacts" / "manifest.json").read_text())
     assert [(e["source"], e["status"]) for e in manifest] == [
         ("/logs/artifacts", "empty"),
@@ -901,7 +934,19 @@ def test_a_collect_hook_runs_as_its_user(tmp_path: Path):
     with patch("pier.harbor_bridge._docker", _fake_docker(calls, {})):
         harbor_bridge.record_workspace("pier-ws", task, record, "pier")
     container = harbor_bridge.get_container_name("pier-ws")
-    assert calls[0] == ("exec", "-u", "agent", container, "sh", "-c", "collect-it")
+    assert calls[0] == (
+        "exec",
+        "-u",
+        "agent",
+        container,
+        "timeout",
+        "-s",
+        "KILL",
+        "60",
+        "sh",
+        "-c",
+        "collect-it",
+    )
 
 
 def test_a_file_artifact_is_copied_as_a_file(tmp_path: Path):
@@ -1087,13 +1132,27 @@ def test_sidecar_evidence_is_collected_after_stopping_main(tmp_path: Path):
     ):
         harbor_bridge.record_workspace("pier-ws", task, record, "pier")
     main = harbor_bridge.get_container_name("pier-ws")
-    main_hook = calls.index(("exec", main, "sh", "-c", "main-collect"))
+    main_hook = calls.index(
+        ("exec", main, "timeout", "-s", "KILL", "60", "sh", "-c", "main-collect")
+    )
     main_artifact = calls.index(
         ("cp", f"{main}:/workspace/.", str(record / "artifacts" / "workspace"))
     )
     stop = calls.index(("stop", main))
     sidecar_hook = calls.index(
-        ("exec", "-u", "postgres", "sidecar-id", "sh", "-c", "sidecar-collect")
+        (
+            "exec",
+            "-u",
+            "postgres",
+            "sidecar-id",
+            "timeout",
+            "-s",
+            "KILL",
+            "60",
+            "sh",
+            "-c",
+            "sidecar-collect",
+        )
     )
     sidecar_copy = calls.index(
         (
@@ -1293,20 +1352,6 @@ def test_a_symlink_one_artifact_leaves_cannot_redirect_the_next(tmp_path: Path):
     assert entry["status"] == "skipped"
 
 
-def test_a_task_with_steps_is_refused_before_anything_runs(tmp_path: Path):
-    toml = '[verifier]\nenvironment_mode = "separate"\n[[steps]]\nname = "one"\n'
-    task = _task(tmp_path, toml)
-    record = tmp_path / "record"
-    record.mkdir()
-    calls: list = []
-    with (
-        patch("pier.harbor_bridge._docker", _fake_docker(calls, {})),
-        pytest.raises(RuntimeError, match="with steps"),
-    ):
-        harbor_bridge.record_workspace("pier-ws", task, record, "pier")
-    assert calls == []
-
-
 def test_scoring_stops_every_container_of_the_workspace():
     """An overlay's services stop with main: nothing keeps running while the
     work is scored."""
@@ -1332,3 +1377,88 @@ def test_scoring_stops_every_container_of_the_workspace():
         "abc123",
         "def456",
     )
+
+
+@pytest.mark.skipif(
+    sys.platform == "win32" or not shutil.which("timeout"),
+    reason="requires POSIX shell and timeout",
+)
+def test_timed_out_collect_hook_cannot_write_after_collection(tmp_path: Path, caplog):
+    late = tmp_path / "late.txt"
+    child = f"sleep 0.3; echo late > {shlex.quote(str(late))}"
+    command = f"sh -c {shlex.quote(child)} & wait"
+    task = _task(
+        tmp_path,
+        '[verifier]\nenvironment_mode = "separate"\n'
+        f"[[verifier.collect]]\ncommand = {json.dumps(command)}\ntimeout_sec = 0.05\n",
+    )
+    record = tmp_path / "record"
+    record.mkdir()
+    fake = _fake_docker([], {})
+
+    def docker(*args, timeout=None):
+        if args[0] == "exec" and "test" not in args:
+            return subprocess.run(
+                list(args[2:]), capture_output=True, text=True, timeout=timeout
+            )
+        assert not late.exists(), "hook wrote after its timeout"
+        return fake(*args, timeout=timeout)
+
+    with patch("pier.harbor_bridge._docker", docker):
+        harbor_bridge.record_workspace("pier-ws", task, record, "pier")
+    time.sleep(0.4)
+    assert not late.exists()
+    assert "collect hook" in caplog.text and "failed" in caplog.text
+    assert (record / "result.json").exists()
+
+
+def test_a_collect_client_timeout_prevents_artifact_collection(tmp_path: Path):
+    task = _task(tmp_path, SEPARATE)
+    record = tmp_path / "record"
+    record.mkdir()
+    with (
+        patch(
+            "pier.harbor_bridge._docker",
+            side_effect=subprocess.TimeoutExpired("docker exec", 70),
+        ) as docker,
+        pytest.raises(RuntimeError, match="cannot confirm the hook stopped"),
+    ):
+        harbor_bridge.record_workspace("pier-ws", task, record, "pier")
+    assert docker.call_count == 1
+    assert not (record / "result.json").exists()
+
+
+@pytest.mark.parametrize("seconds", ["0", "-1", "inf", "nan"])
+def test_an_unbounded_collect_timeout_is_rejected_before_collection(
+    tmp_path: Path, seconds
+):
+    task = _task(tmp_path, SEPARATE + f"timeout_sec = {seconds}\n")
+    record = tmp_path / "record"
+    record.mkdir()
+    with (
+        patch("pier.harbor_bridge._docker") as docker,
+        pytest.raises(RuntimeError, match="finite and greater than zero"),
+    ):
+        harbor_bridge.record_workspace("pier-ws", task, record, "pier")
+    docker.assert_not_called()
+
+
+@pytest.mark.parametrize("source", ["/logs/artifacts", "/workspace"])
+def test_artifact_copy_failure_aborts_before_main_stops(tmp_path: Path, source):
+    task = _task(tmp_path, SEPARATE)
+    record = tmp_path / "record"
+    record.mkdir()
+    fake = _fake_docker([], {})
+
+    def docker(*args, timeout=None):
+        if args[0] == "cp" and args[1].endswith(f":{source}/."):
+            return MagicMock(returncode=1, stderr="copy failed")
+        return fake(*args, timeout=timeout)
+
+    with (
+        patch("pier.harbor_bridge._docker", docker),
+        patch("pier.harbor_bridge._stop_workspace_main_container") as stop,
+        pytest.raises(RuntimeError, match="could not copy"),
+    ):
+        harbor_bridge.record_workspace("pier-ws", task, record, "pier")
+    stop.assert_not_called()

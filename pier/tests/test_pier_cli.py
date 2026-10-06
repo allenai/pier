@@ -3652,6 +3652,9 @@ def test_verify_scores_apart_when_the_task_declares_it(
         index_path,
     )
     calls = MagicMock()
+    calls.record_workspace.side_effect = lambda hsid, task, record, agent: (
+        record / "agent"
+    ).mkdir()
     calls.regrade.return_value = {"reward": 1.0}
     with (
         patch("pier.harbor_bridge.record_workspace", calls.record_workspace),
@@ -3781,3 +3784,96 @@ def test_exec_detects_the_session_s_agent_when_two_share_a_binary(
     args = mock_run.call_args[0][0]
     cmd_str = args[args.index("-c") + 1]
     assert "kimi-cli.txt" in cmd_str
+
+
+@pytest.mark.parametrize(
+    "content",
+    ["[verifier", '[verifier]\nenvironment_mode = "invalid"\n'],
+)
+@patch("pier.harbor_bridge.is_environment_running", return_value=True)
+def test_verify_reports_invalid_task_configuration_without_a_traceback(
+    mock_running, runner, index_path, task_dir, tmp_path, content
+):
+    (task_dir / "task.toml").write_text(content)
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    _write_session(ws, _container_session(task_dir=str(task_dir)), index_path)
+    with (
+        patch("pier.harbor_bridge.verify_environment") as verify,
+        patch("pier.harbor_bridge.record_workspace") as record,
+        patch("pier.harbor_bridge.stop_workspace_environment") as stop,
+    ):
+        result = runner.invoke(cli, ["verify"])
+    assert result.exit_code == 1
+    assert "Error: Cannot read verifier configuration:" in result.output
+    verify.assert_not_called()
+    record.assert_not_called()
+    stop.assert_not_called()
+
+
+@pytest.mark.parametrize("selected_session", [None, "2026-01-01_00-00-00"])
+@patch("pier.harbor_bridge.is_environment_running", return_value=True)
+def test_separate_verify_assembles_output_from_recorded_agent_logs(
+    mock_running, runner, index_path, task_dir, tmp_path, selected_session
+):
+    _scored_apart(task_dir)
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    _write_session(
+        ws,
+        _container_session(task_dir=str(task_dir), agents=["claude-code"]),
+        index_path,
+    )
+    trial = tmp_path / "trial"
+    timestamp = "2026-01-01_00-00-00"
+    live = ws / ".pier" / "_harbor" / "agent" / "exec" / timestamp
+    live.mkdir(parents=True)
+    (live / "claude-code.txt").write_text("stale live logs")
+    stopped = False
+
+    def record(hsid, task, dest, agent):
+        logs = dest / "agent" / "exec" / timestamp
+        logs.mkdir(parents=True)
+        (logs / "claude-code.txt").write_text("recorded logs")
+
+    def stop(hsid):
+        nonlocal stopped
+        stopped = True
+
+    def extract(agent, logs):
+        assert stopped
+        selected = logs if logs.name == timestamp else logs / "exec" / timestamp
+        assert (selected / "claude-code.txt").read_text() == "recorded logs"
+        (selected / "trajectory.json").write_text('{"steps": []}')
+        return {"cost_usd": 0.05}
+
+    args = ["verify", "--trial-dir", str(trial)]
+    if selected_session:
+        args.extend(["--session", selected_session])
+    with (
+        patch("pier.harbor_bridge.record_workspace", record),
+        patch("pier.harbor_bridge.stop_workspace_environment", stop),
+        patch("pier.harbor_bridge.regrade", return_value={"reward": 1.0}),
+        patch("pier.harbor_bridge.extract_agent_context", extract),
+        patch("pier.cli._copy_session_from_container") as copy,
+        patch(
+            "subprocess.run", side_effect=AssertionError("container access after stop")
+        ),
+    ):
+        result = runner.invoke(cli, args, catch_exceptions=False)
+    assert result.exit_code == 0, result.output
+    copy.assert_not_called()
+    data = json.loads((trial / "result.json").read_text())
+    assert data["verifier_result"]["rewards"] == {"reward": 1.0}
+    assert data["agent_result"]["cost_usd"] == 0.05
+    assert (trial / "agent" / "exec" / timestamp / "trajectory.json").exists()
+    assert (live / "claude-code.txt").read_text() == "stale live logs"
+
+
+def test_an_invalid_registered_agent_does_not_disable_detection():
+    from pier.cli import _detect_agent_from_command
+
+    assert (
+        _detect_agent_from_command(["codex"], ["nonexistent-agent", "codex"]) == "codex"
+    )
+    assert _detect_agent_from_command(["codex"], ["nonexistent-agent"]) == "codex"

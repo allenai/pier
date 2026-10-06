@@ -150,6 +150,7 @@ pier start                                  # restart a stopped container
 - `-e` passes container-mode environment variables in `KEY=VALUE` format (repeatable). Stored in the session and forwarded on every `pier exec`.
 - `--env-file` loads container-mode environment variables from a `.env` file. Same behavior as `-e` for each line.
 - `--extra-docker-compose` adds a compose overlay, as `harbor run --extra-docker-compose` does — a service beside the agent's container, or a change to that container (repeatable, container mode only). Its path is kept in the session and reused by restart and `pier verify`; keep the file available for these commands.
+  Restart without this option retains the saved overlays; it does not clear them. Relative build and volume paths in overlays resolve against the task's `environment/` directory, which Harbor uses as the Compose project directory, rather than the overlay's directory. Use absolute paths when an overlay lives elsewhere.
 - `--no-mount` keeps workspace files inside the container only (no bind-mount to host). `pier stop` copies files back. Note: Harbor's internal mounts (agent logs, verifier output) still write to the host under `.pier/`.
 - `-f` / `--force` allows starting in a non-empty directory.
 - `--host` skips the container (workspace only).
@@ -182,6 +183,7 @@ The agent is inferred from the session (set by `pier start --agent`). If no agen
 - **Container mode**: uses Harbor's `Verifier` (same verifier as `harbor run`). The trajectory is captured automatically when an agent is registered. For unregistered agents (e.g. baked into the image), pass `--session-dir` (container path) and `-a`.
 - **Host mode**: spins up a temporary container to run the verifier, then tears it down. Pass `--session-dir` and `-a` to capture the trajectory.
 - **A task scored apart** — one whose `task.toml` declares `[verifier] environment_mode = "separate"` — is scored through Harbor's `trial regrade`: pier collects main-service hooks, artifacts and agent logs, stops main before collecting sidecar evidence, then stops all remaining workspace services, including compose overlays. The record is scored in an environment built from the task's `tests/`, which never enter the workspace. `pier start` restarts the workspace; the scored trial is under the verify run's `scored/`. Symlinks are removed from each copy before the next artifact is collected. Overlapping artifacts are skipped with a warning, as Harbor collects them; regrade refuses a record missing a declared input. Multi-step tasks and artifact exclusions are rejected before collection; use `harbor run` for those tasks.
+  Collect hooks require `timeout` in their service image; its timer kills the hook's process group before artifact collection. Hook failures warn and collection continues, but an unresponsive Docker client aborts verification because hook completion cannot be confirmed. Artifact and agent-log copy failures also abort verification: regrade requires every declared input. Automatic trajectory extraction uses the copied record's logs; an explicit `--session-dir` can still be copied from the stopped container.
 
 ### `pier stop`
 

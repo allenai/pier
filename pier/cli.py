@@ -1487,7 +1487,11 @@ def _verify_container(
     harbor_td = _harbor_trial_dir(workspace)
     task_dir = Path(sess["task_dir"])
     start_time = datetime.now(timezone.utc)
-    if harbor_bridge.scores_apart(task_dir):
+    try:
+        apart = harbor_bridge.scores_apart(task_dir)
+    except Exception as e:
+        raise click.ClickException(f"Cannot read verifier configuration: {e}") from e
+    if apart:
         reward, harbor_verifier = _verify_apart(sess, hsid, task_dir, verify_trial_dir)
     else:
         try:
@@ -1502,6 +1506,13 @@ def _verify_container(
         harbor_verifier = harbor_td / "verifier"
     end_time = datetime.now(timezone.utc)
 
+    if apart:
+        shutil.copytree(
+            verify_trial_dir / "record" / "agent",
+            verify_trial_dir / "agent",
+            dirs_exist_ok=True,
+        )
+
     # Copy verifier output from Harbor's dir to the per-verify trial dir
     if harbor_verifier.is_dir():
         shutil.copytree(
@@ -1510,12 +1521,11 @@ def _verify_container(
 
     _print_reward(reward)
 
-    # In container mode, agent logs are already in Harbor's expected layout
-    # under harbor_td/agent/ — let Harbor find sessions directly rather than
-    # reimplementing its detection logic in pier.
+    # Separate scoring reads the recorded snapshot; shared scoring reads the
+    # live mount. Both retain Harbor's session layout.
     container_agent_context = None
     if agent and not session_dir:
-        agent_dir = harbor_td / "agent"
+        agent_dir = verify_trial_dir / "agent" if apart else harbor_td / "agent"
         if session:
             # Explicit --session: use that specific timestamp dir.
             session_path = agent_dir / "exec" / session
