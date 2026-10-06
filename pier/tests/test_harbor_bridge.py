@@ -786,7 +786,7 @@ def test_record_workspace_writes_what_regrade_reads(tmp_path: Path):
     with patch("pier.harbor_bridge._docker", docker):
         harbor_bridge.record_workspace("pier-ws", task, record, "pier:claude-code")
     container = harbor_bridge.get_container_name("pier-ws")
-    assert calls[0] == ("exec", container, "sh", "-c", "collect-it"), "hook first"
+    assert calls[0] == ("exec", container, "bash", "-c", "collect-it"), "hook first"
     manifest = json.loads((record / "artifacts" / "manifest.json").read_text())
     assert [(e["source"], e["status"]) for e in manifest] == [
         ("/logs/artifacts", "empty"),
@@ -809,7 +809,8 @@ def test_a_failing_collect_hook_warns_and_the_scoring_goes_on(tmp_path: Path, ca
     assert (record / "result.json").exists()
 
 
-def test_a_collect_hook_runs_as_its_user(tmp_path: Path):
+def test_a_collect_hook_runs_as_its_user_in_bash(tmp_path: Path):
+    """As Harbor runs a hook in main."""
     toml = (
         '[verifier]\nenvironment_mode = "separate"\n'
         '[[verifier.collect]]\ncommand = "collect-it"\nuser = "agent"\n'
@@ -821,7 +822,7 @@ def test_a_collect_hook_runs_as_its_user(tmp_path: Path):
     with patch("pier.harbor_bridge._docker", _fake_docker(calls, {})):
         harbor_bridge.record_workspace("pier-ws", task, record, "pier")
     container = harbor_bridge.get_container_name("pier-ws")
-    assert calls[0] == ("exec", "-u", "agent", container, "sh", "-c", "collect-it")
+    assert calls[0] == ("exec", "-u", "agent", container, "bash", "-c", "collect-it")
 
 
 def test_a_file_artifact_is_copied_as_a_file(tmp_path: Path):

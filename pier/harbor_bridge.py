@@ -774,7 +774,7 @@ def record_workspace(
     if config.environment.os == TaskOS.WINDOWS:
         raise RuntimeError(
             "a Windows-container task is not scored apart by pier verify: it "
-            "collects with POSIX paths and sh"
+            "collects with POSIX paths and bash"
         )
     for hook in config.verifier.collect:
         if (hook.service or "main") != "main":
@@ -782,15 +782,16 @@ def record_workspace(
                 f"collect hook {hook.command!r} runs in {hook.service!r}; "
                 "pier verify runs hooks in main only"
             )
-        # As Harbor runs them: as the hook's user, and best effort, so a hook
-        # that fails leaves its output out rather than stopping the scoring.
+        # As Harbor runs them in main: in bash, as the hook's user, and best
+        # effort, so a hook that fails leaves its output out rather than
+        # stopping the scoring.
         user = ["-u", str(hook.user)] if hook.user is not None else []
         try:
             ran = _docker(
                 "exec",
                 *user,
                 container,
-                "sh",
+                "bash",
                 "-c",
                 hook.command,
                 timeout=hook.timeout_sec,
@@ -960,11 +961,15 @@ async def _async_regrade(
     from harbor.trial.trial import Trial
 
     source = TrialResult.model_validate_json((record / "result.json").read_text())
+    # Harbor looks the agent's class up by name for its setup timeout unless
+    # one is given, and a pier session's agent is not one of Harbor's. A
+    # regrade sets no agent up, so the timeout is never used.
+    agent = source.config.agent.model_copy(update={"override_setup_timeout_sec": 0.0})
     config = TrialConfig(
         task=TaskConfig(path=task_dir),
         trial_name=trial_name,
         trials_dir=trials_dir,
-        agent=source.config.agent,
+        agent=agent,
         artifacts=source.config.artifacts,
         source_trial=SourceTrialConfig(
             action="regrade", type="local", trial_id=source.id, path=record.resolve()
