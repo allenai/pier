@@ -45,8 +45,9 @@ cat .task/instruction.md  # read the task instruction (Harbor tasks)
 pier exec claude          # run the agent interactively
 pier exec bash            # drop into the container shell
 
-# Non-interactive (scripted or automated use):
-pier exec -- claude -p "Read .task/instruction.md and do the task" --dangerously-skip-permissions
+# Non-interactive (scripted or automated use). Harbor pipes instruction.md in
+# as the prompt rather than asking the agent to read it, so this matches it:
+pier exec -- sh -c 'claude -p --dangerously-skip-permissions < .task/instruction.md'
 # TODO: pier run — run the agent non-interactively and verify, via harbor run
 
 # Run a background process (e.g., live document preview):
