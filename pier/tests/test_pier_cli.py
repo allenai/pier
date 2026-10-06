@@ -1795,6 +1795,24 @@ def test_start_exec_runs_in_the_current_workspace(
     assert mock_exec.call_args[0][2] == ["claude", "--version"]
 
 
+@patch("pier.cli._start_existing")
+def test_start_exec_in_a_host_workspace_is_refused_before_anything_starts(
+    mock_start_existing, runner, index_path, tmp_path, monkeypatch
+):
+    """--agent with --exec used to install the agent, then refuse the exec."""
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    _write_session(ws, _host_session(), index_path)
+    monkeypatch.chdir(ws)
+    monkeypatch.setenv("PWD", str(ws))
+    result = runner.invoke(
+        cli, ["start", "--agent", "claude-code", "--exec", "claude --version"]
+    )
+    assert result.exit_code != 0
+    assert "host-mode" in result.output
+    mock_start_existing.assert_not_called()
+
+
 def test_start_exec_refuses_host_mode(runner, index_path, task_dir, tmp_path):
     result = runner.invoke(
         cli,

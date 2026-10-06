@@ -773,13 +773,15 @@ def start(
 
     # No task_path, no image → operate on existing workspace from cwd
     if task_path is None:
-        _start_existing(agent=agent)
         if exec_argv:
+            # Checked before anything is started or installed.
             sess, ws = _resolve_workspace(None)
             if sess.get("mode") != "container":
                 raise click.ClickException(
                     f"--exec needs a container, and the workspace at {ws} is host-mode."
                 )
+        _start_existing(agent=agent)
+        if exec_argv:
             _exec_after_start(ws, exec_argv)
         return
 
