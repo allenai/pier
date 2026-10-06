@@ -878,6 +878,30 @@ def test_a_symlink_the_agent_left_is_not_in_the_record(tmp_path: Path, caplog):
     assert entry["status"] == "empty", "what the symlink was is not counted"
 
 
+def test_pier_session_data_in_the_workspace_stays_out_of_the_record(tmp_path: Path):
+    """In the container the workspace's .pier/ is an empty tmpfs, and `docker
+    cp` reads through it to pier's session and earlier trials beneath."""
+    toml = 'artifacts = ["/app"]\n[verifier]\nenvironment_mode = "separate"\n'
+    task = _task(tmp_path, toml)
+    record = tmp_path / "record"
+    record.mkdir()
+    fake = _fake_docker([], {})
+
+    def docker(*args, timeout=None):
+        if args[0] == "cp" and args[1].endswith(":/app/."):
+            dest = Path(args[2])
+            (dest / ".pier" / "trials").mkdir(parents=True)
+            (dest / ".pier" / "session.json").write_text("{}")
+            (dest / "submission.json").write_text("{}")
+        return fake(*args, timeout=timeout)
+
+    with patch("pier.harbor_bridge._docker", docker):
+        harbor_bridge.record_workspace("pier-ws", task, record, "pier")
+    workspace = record / "artifacts" / "app"
+    assert (workspace / "submission.json").exists()
+    assert list((workspace / ".pier").iterdir()) == []
+
+
 def test_an_artifact_harbor_would_collect_differently_is_refused(tmp_path: Path):
     toml = (
         'artifacts = [{source = "/workspace", exclude = ["*.log"]}]\n'

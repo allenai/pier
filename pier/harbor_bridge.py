@@ -28,11 +28,12 @@ import json
 import logging
 import os
 import re
+import shutil
 import subprocess
 import sys
 from collections.abc import Callable
 from datetime import datetime
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -808,6 +809,10 @@ def record_workspace(
 
     artifacts_dir = record / "artifacts"
     inside = record.resolve()
+    # pier's session data lies under the workspace, hidden in the container by
+    # an empty tmpfs that `docker cp` reads through: the record holds what the
+    # container shows there, so no session, earlier trial or env of pier's.
+    hidden = PurePosixPath(get_container_workdir(task_dir), ".pier")
     collected: list[tuple[str, str, Path, bool]] = []
     skipped: list[tuple[str, str]] = []
     dropped: list[Path] = []
@@ -848,6 +853,14 @@ def record_workspace(
                 f"could not copy {source} out of the workspace, and the task's "
                 "verifier reads it: " + copied.stderr.strip()[-300:]
             )
+        copied_from = PurePosixPath(source)
+        if is_dir.returncode == 0 and (
+            copied_from == hidden or copied_from in hidden.parents
+        ):
+            under = target / hidden.relative_to(copied_from)
+            if under.is_dir() and not under.is_symlink():
+                shutil.rmtree(under)
+                under.mkdir()
         collected.append((source, destination, target, is_dir.returncode == 0))
         dropped += _drop_symlinks(record)
     (record / "agent").mkdir(exist_ok=True)
