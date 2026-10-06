@@ -23,6 +23,7 @@ import json
 import logging
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import tempfile
@@ -432,6 +433,27 @@ def _resolve_task_path(task_path: str) -> Path:
     return task_dir
 
 
+def _delete_workspace(workspace: Path) -> None:
+    """Stop a pier workspace's container, then delete its directory. A stop
+    that fails leaves the directory, which the container may still mount."""
+    sess = _load_session(workspace)
+    if sess.get("mode") == "container":
+        _stop_container_env(sess, workspace)
+    shutil.rmtree(workspace)
+    click.echo(f"Deleted the workspace at {workspace}.")
+
+
+def _exec_after_start(workspace: Path, command: str) -> None:
+    """Run ``pier start --exec``'s command in the started container."""
+    sess, ws = _resolve_workspace(str(workspace))
+    try:
+        _exec_container(sess, ws, shlex.split(command))
+    except SystemExit as e:
+        if e.code:
+            click.echo(f"--exec command exited with code {e.code}.", err=True)
+            raise
+
+
 def _print_reward(reward: dict) -> None:
     """Print reward value and any extra details from a reward dict."""
     click.echo(f"Reward: {reward.get('reward', 'N/A')}")
@@ -613,6 +635,22 @@ def cli():
     default=False,
     help="Allow starting in a non-empty directory.",
 )
+@click.option(
+    "--delete",
+    "delete_workspace",
+    is_flag=True,
+    default=False,
+    help=(
+        "Delete the pier workspace at -d first (its container stopped, its "
+        "directory removed), then start a fresh one."
+    ),
+)
+@click.option(
+    "--exec",
+    "exec_cmd",
+    default=None,
+    help="Run a command in the container once it has started (container mode only).",
+)
 def start(
     task_path: str | None,
     host: bool,
@@ -627,6 +665,8 @@ def start(
     no_mount: bool,
     skill_paths: tuple[str, ...],
     force: bool,
+    delete_workspace: bool,
+    exec_cmd: str | None,
 ) -> None:
     """Launch a workspace, or install an agent into an existing one.
 
@@ -652,6 +692,13 @@ def start(
 
     if no_mount and host:
         raise click.ClickException("--no-mount and --host are mutually exclusive.")
+    if host and exec_cmd:
+        raise click.ClickException("--exec cannot be used with --host.")
+    if delete_workspace and task_path is None and not image:
+        raise click.ClickException(
+            "--delete needs a task path or --image, and -d: it replaces the "
+            "workspace at -d with a fresh one."
+        )
     if host and extra_env_cli:
         raise click.ClickException("-e cannot be used with --host.")
     if host and extra_compose:
@@ -704,7 +751,10 @@ def start(
             extra_env=extra_env_list,
             no_mount=no_mount,
             force=force,
+            delete_workspace=delete_workspace,
         )
+        if exec_cmd:
+            _exec_after_start(workspace, exec_cmd)
         return
 
     # No task_path, no image → operate on existing workspace from cwd
@@ -732,6 +782,9 @@ def start(
             "e.g. pier start ./tasks/my-task -d ./my-workspace"
         )
 
+    if delete_workspace and _session_json_path(workspace).exists():
+        _delete_workspace(workspace)
+
     # Collision check — existing session in this workspace
     if _session_json_path(workspace).exists():
         existing_sess = _load_session(workspace)
@@ -742,8 +795,10 @@ def start(
             if harbor_bridge.is_environment_running(hsid):
                 if agent:
                     _install_agents_into_running(existing_sess, workspace, [agent])
-                    return
-                click.echo("Container is already running.")
+                else:
+                    click.echo("Container is already running.")
+                if exec_cmd:
+                    _exec_after_start(workspace, exec_cmd)
                 return
             else:
                 # Container stopped — restart it
@@ -769,8 +824,15 @@ def start(
                     extra_env=extra_env_list or existing_sess.get("extra_env", []),
                     no_mount=existing_sess.get("no_mount", False),
                 )
+                if exec_cmd:
+                    _exec_after_start(workspace, exec_cmd)
                 return
         else:
+            if exec_cmd:
+                raise click.ClickException(
+                    f"--exec needs a container, and the workspace at {workspace} "
+                    "is host-mode."
+                )
             # Host mode — workspace already exists, nothing to do
             click.echo(f"Workspace already exists at {workspace}.")
             return
@@ -811,6 +873,8 @@ def start(
             no_mount=no_mount,
             skills_dir_override=skills_dir_override,
         )
+        if exec_cmd:
+            _exec_after_start(workspace, exec_cmd)
 
     if not host and not agent:
         click.echo(
@@ -1101,6 +1165,7 @@ def _start_task_free(
     no_mount: bool = False,
     force: bool = False,
     extra_compose: list[str] | None = None,
+    delete_workspace: bool = False,
 ) -> None:
     """Start a task-free container from a base image.
 
@@ -1108,6 +1173,8 @@ def _start_task_free(
     so we can reuse Harbor's standard environment machinery instead of
     maintaining a separate code path.
     """
+    if delete_workspace and _session_json_path(workspace).exists():
+        _delete_workspace(workspace)
 
     # If workspace already has a session, handle like _start_existing
     if _session_json_path(workspace).exists():
@@ -1684,8 +1751,41 @@ def _verify_host_in_container(
     type=click.Path(),
     help="Workspace directory.",
 )
-def stop(workspace_dir: str | None) -> None:
+@click.option(
+    "--all",
+    "stop_all",
+    is_flag=True,
+    default=False,
+    help="Stop the container of every workspace pier knows.",
+)
+def stop(workspace_dir: str | None, stop_all: bool) -> None:
     """Stop the container for a workspace."""
+    if stop_all:
+        if workspace_dir:
+            raise click.ClickException("--all stops every workspace; drop -d.")
+        stopped = failed = 0
+        for sess, workspace in _all_workspaces():
+            if sess.get("mode") != "container":
+                continue
+            if not harbor_bridge.is_environment_running(_get_hsid(sess, workspace)):
+                continue
+            try:
+                _stop_workspace(sess, workspace)
+            except click.ClickException as e:
+                click.echo(
+                    f"Could not stop {_workspace_label(workspace)!r}: {e.message}",
+                    err=True,
+                )
+                failed += 1
+                continue
+            click.echo(f"Container for {_workspace_label(workspace)!r} stopped.")
+            stopped += 1
+        if not stopped and not failed:
+            click.echo("No workspace has a running container.")
+        if failed:
+            raise click.ClickException(f"{failed} workspace(s) could not be stopped.")
+        return
+
     sess, workspace = _resolve_workspace(workspace_dir)
 
     if sess.get("mode") != "container":
@@ -1693,6 +1793,13 @@ def stop(workspace_dir: str | None) -> None:
             f"Nothing to stop — workspace {_workspace_label(workspace)!r} has no container."
         )
 
+    _stop_workspace(sess, workspace)
+    click.echo(f"Container for {_workspace_label(workspace)!r} stopped.")
+
+
+def _stop_workspace(sess: dict, workspace: Path) -> None:
+    """Stop one container-mode workspace, copying a no-mount workspace's files
+    back to the host first."""
     if sess.get("no_mount"):
         # Copy workspace files from container to host before stopping,
         # excluding .pier/ to avoid overwriting session data.
@@ -1704,7 +1811,6 @@ def stop(workspace_dir: str | None) -> None:
             _tar_copy_from_container(container, workdir, workspace)
 
     _stop_container_env(sess, workspace)
-    click.echo(f"Container for {_workspace_label(workspace)!r} stopped.")
 
 
 def _stop_container_env(sess: dict, workspace: Path) -> None:
