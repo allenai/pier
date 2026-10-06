@@ -3735,6 +3735,34 @@ def test_separate_verify_does_not_regrade_after_workspace_shutdown_fails(
     regrade.assert_not_called()
 
 
+@patch("pier.harbor_bridge.is_environment_running", return_value=True)
+def test_separate_verify_does_not_stop_or_score_when_agent_logs_cannot_be_copied(
+    mock_running, runner, index_path, task_dir, tmp_path
+):
+    _scored_apart(task_dir)
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    _write_session(ws, _container_session(task_dir=str(task_dir)), index_path)
+
+    def docker(*args, **kwargs):
+        failed = args[0] == "cp" and args[1].endswith(":/logs/agent/.")
+        return MagicMock(
+            returncode=1 if failed else 0, stdout="", stderr="permission denied"
+        )
+
+    with (
+        patch("pier.harbor_bridge._docker", docker),
+        patch("pier.cli._assemble_trial_output"),
+        patch("pier.harbor_bridge.stop_workspace_environment") as stop,
+        patch("pier.harbor_bridge.regrade", return_value={"reward": 1.0}) as regrade,
+    ):
+        result = runner.invoke(cli, ["verify"])
+    assert result.exit_code != 0
+    assert "could not copy agent logs" in result.output
+    stop.assert_not_called()
+    regrade.assert_not_called()
+
+
 @patch(
     "pier.harbor_bridge.get_binary_agent_map",
     return_value={"kimi": "kimi-code"},

@@ -231,10 +231,9 @@ def _make_environment(
 ):
     """Reconstruct a Harbor Docker environment from pier session data.
 
-    Called for every container operation (exec, verify, stop) since the
-    environment object is stateless — the running Docker container is the
-    actual state. So *extra_compose* must be the same list on every call: a
-    stop without an overlay's services leaves their containers running.
+    The environment object is stateless; operations reuse *extra_compose*
+    from the session. Stop falls back to project labels if Compose cleanup
+    cannot run.
 
     Fragility: EnvironmentFactory is not in Harbor's public __all__.
     If Harbor reorganizes its package, update the import below.
@@ -652,16 +651,48 @@ def stop_environment(
     # Harbor reconstructs the environment on stop, resolving task env vars.
     # Set placeholders for missing vars so stop doesn't fail.
     # TODO: Harbor should not require env vars for stop.
-    with _placeholder_task_env_vars(task_dir):
-        asyncio.run(
-            _async_stop_environment(
-                task_dir,
-                harbor_session_id,
-                trial_dir,
-                delete=delete,
-                extra_compose=extra_compose,
+    cleanup_error: Exception | None = None
+    try:
+        with _placeholder_task_env_vars(task_dir):
+            asyncio.run(
+                _async_stop_environment(
+                    task_dir,
+                    harbor_session_id,
+                    trial_dir,
+                    delete=delete,
+                    extra_compose=extra_compose,
+                )
             )
+    except Exception as exc:
+        cleanup_error = exc
+
+    # Harbor can also log a failed Compose down without raising. Query the
+    # actual project so missing or changed overlays cannot leave services live.
+    project_filter = (
+        f"label=com.docker.compose.project={get_compose_project(harbor_session_id)}"
+    )
+    running = _docker("ps", "-q", "--filter", project_filter)
+    if running.returncode:
+        raise RuntimeError(
+            "could not list workspace containers: " + running.stderr.strip()
         )
+    containers = running.stdout.split()
+    if containers:
+        stopped = _docker("stop", *containers)
+        if stopped.returncode:
+            raise RuntimeError(
+                "could not stop workspace containers: " + stopped.stderr.strip()
+            )
+        remaining = _docker("ps", "-q", "--filter", project_filter)
+        if remaining.returncode or remaining.stdout.strip():
+            raise RuntimeError("workspace containers are still running")
+    if cleanup_error is not None or containers:
+        message = "workspace stopped, but Compose cleanup was incomplete; resources were retained"
+        if cleanup_error is not None:
+            message += f": {cleanup_error}"
+        if delete:
+            raise RuntimeError(message)
+        logger.warning(message)
 
 
 @contextlib.contextmanager
@@ -902,7 +933,12 @@ def record_workspace(
     _check_record_target(record, agent_dir)
     agent_dir.mkdir(exist_ok=True)
     container = get_container_name(harbor_session_id)
-    _docker("cp", f"{container}:{AGENT_LOGS}/.", str(agent_dir))
+    copied = _docker("cp", f"{container}:{AGENT_LOGS}/.", str(agent_dir))
+    if copied.returncode:
+        raise RuntimeError(
+            "could not copy agent logs out of the workspace: "
+            + copied.stderr.strip()[-300:]
+        )
     _remove_record_symlinks(agent_dir, record)
 
     sidecar_hooks = [

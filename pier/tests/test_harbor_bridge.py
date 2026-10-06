@@ -3,7 +3,7 @@
 import json
 from datetime import datetime, timezone
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -705,6 +705,89 @@ class TestExtraCompose:
         names = [Path(p).name for p in environment._docker_compose_paths]
         assert "docker-compose-pier.json" in names
 
+    @pytest.mark.parametrize("move", [False, True])
+    def test_stop_after_the_overlay_is_deleted_or_moved(
+        self, tmp_path: Path, caplog, move
+    ):
+        from pier.harbor_bridge import stop_environment
+
+        task = self._task(tmp_path)
+        overlay = tmp_path / "gateway.yaml"
+        overlay.write_text("services: {}\n")
+        if move:
+            overlay.rename(tmp_path / "moved.yaml")
+        else:
+            overlay.unlink()
+        replies = [
+            MagicMock(returncode=0, stdout="main-id\ngateway-id\n"),
+            MagicMock(returncode=0),
+            MagicMock(returncode=0, stdout=""),
+        ]
+        with patch("pier.harbor_bridge._docker", side_effect=replies) as docker:
+            stop_environment(
+                task, "pier-ws", tmp_path / "trial", extra_compose=[str(overlay)]
+            )
+        assert docker.call_args_list[1].args == ("stop", "main-id", "gateway-id")
+        assert docker.call_args_list[0].args == (
+            "ps",
+            "-q",
+            "--filter",
+            "label=com.docker.compose.project=pier-ws",
+        )
+        assert docker.call_args_list[2] == docker.call_args_list[0]
+        assert "Compose cleanup was incomplete" in caplog.text
+
+
+def test_stop_checks_the_project_even_when_harbor_does_not_raise(
+    tmp_path: Path, caplog
+):
+    from pier.harbor_bridge import stop_environment
+
+    replies = [
+        MagicMock(returncode=0, stdout="gateway-id\n"),
+        MagicMock(returncode=0),
+        MagicMock(returncode=0, stdout=""),
+    ]
+    with (
+        patch("pier.harbor_bridge._async_stop_environment", new_callable=AsyncMock),
+        patch("pier.harbor_bridge._docker", side_effect=replies) as docker,
+    ):
+        stop_environment(tmp_path, "pier-ws", tmp_path / "trial")
+    assert docker.call_args_list[1].args == ("stop", "gateway-id")
+    assert "resources were retained" in caplog.text
+
+
+@pytest.mark.parametrize(
+    "failure", ["list", "stop", "still-running", "recheck", "delete"]
+)
+def test_incomplete_stop_is_reported(tmp_path: Path, failure):
+    from pier.harbor_bridge import stop_environment
+
+    replies = [
+        MagicMock(
+            returncode=1 if failure == "list" else 0,
+            stdout="main-id\n",
+            stderr="unavailable",
+        ),
+        MagicMock(returncode=1 if failure == "stop" else 0, stderr="stop failed"),
+        MagicMock(
+            returncode=1 if failure == "recheck" else 0,
+            stdout="main-id\n" if failure == "still-running" else "",
+        ),
+    ]
+    with (
+        patch(
+            "pier.harbor_bridge._async_stop_environment",
+            new_callable=AsyncMock,
+            side_effect=FileNotFoundError("overlay missing"),
+        ),
+        patch("pier.harbor_bridge._docker", side_effect=replies),
+        pytest.raises(RuntimeError),
+    ):
+        stop_environment(
+            tmp_path, "pier-ws", tmp_path / "trial", delete=failure == "delete"
+        )
+
 
 # ---------------------------------------------------------------------------
 # Scoring apart ([verifier] environment_mode = "separate")
@@ -1026,6 +1109,33 @@ def test_sidecar_evidence_is_collected_after_stopping_main(tmp_path: Path):
         next(e for e in manifest if e["source"] == "/sidecar-results")["service"]
         == "database"
     )
+
+
+def test_a_failed_agent_log_copy_aborts_before_stopping_main(tmp_path: Path):
+    task = _task(
+        tmp_path,
+        SEPARATE
+        + '[[verifier.collect]]\ncommand = "sidecar-collect"\nservice = "database"\n',
+    )
+    record = tmp_path / "record"
+    record.mkdir()
+    calls: list = []
+    fake = _fake_docker(calls, {})
+
+    def docker(*args, **kwargs):
+        result = fake(*args, **kwargs)
+        if args[0] == "cp" and args[1].endswith(":/logs/agent/."):
+            return MagicMock(returncode=1, stderr="permission denied")
+        return result
+
+    with (
+        patch("pier.harbor_bridge._docker", docker),
+        pytest.raises(RuntimeError, match="agent logs.*permission denied"),
+    ):
+        harbor_bridge.record_workspace("pier-ws", task, record, "pier")
+    assert not any(args[0] == "stop" for args in calls)
+    assert not any("sidecar-collect" in args for args in calls)
+    assert not (record / "result.json").exists()
 
 
 def test_an_explicit_convention_artifact_is_not_collected_twice(tmp_path: Path):
