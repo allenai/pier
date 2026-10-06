@@ -1095,6 +1095,10 @@ def test_copy_trajectory_does_not_hang_on_a_fifo(tmp_path: Path):
     assert copied == [False]
 
 
+@pytest.mark.skipif(
+    not harbor_bridge._can_open_without_links(),
+    reason="this platform leaves the trajectory beside the logs",
+)
 @pytest.mark.parametrize("link", ["symlink", "hard link"])
 def test_copy_trajectory_replaces_a_link_in_the_trial_rather_than_writing_through(
     tmp_path: Path, link
