@@ -33,6 +33,7 @@ import sys
 from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -781,6 +782,9 @@ def download_task(
 
     Uses TaskClient (not in Harbor's public __all__) — internal import.
     """
+    import asyncio
+    import inspect
+
     from harbor import GitTaskId
     from harbor.tasks.client import TaskClient  # internal import
 
@@ -790,8 +794,22 @@ def download_task(
         git_commit_id=git_commit_id,
     )
     client = TaskClient()
-    paths = client.download_tasks([task_id])
-    return paths[0]
+    result: Any = client.download_tasks([task_id])
+    if inspect.iscoroutine(result):
+        # Harbor >= 0.7 made download_tasks a coroutine; older versions return
+        # the list directly.
+        result = asyncio.run(result)
+    return _downloaded_paths(result)[0]
+
+
+def _downloaded_paths(result: Any) -> list[Path]:
+    """The paths in a TaskClient.download_tasks result, whichever shape it has.
+
+    Older Harbor returned ``list[Path]``; current Harbor returns a
+    ``BatchDownloadResult`` whose ``paths`` property lists them.
+    """
+    paths = getattr(result, "paths", result)
+    return [Path(p) for p in paths]
 
 
 # ---------------------------------------------------------------------------

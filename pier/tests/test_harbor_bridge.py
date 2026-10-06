@@ -629,3 +629,33 @@ class TestGetPostRunCommands:
     def test_unknown_agent_returns_empty(self):
         assert get_post_run_commands("claude-code", "/logs/agent/ts") == []
         assert get_post_run_commands("goose", "/logs/agent/ts") == []
+
+
+class TestDownloadTask:
+    """download_task follows Harbor's TaskClient across its two shapes: a
+    coroutine returning a BatchDownloadResult (>= 0.7) and, before that, a
+    plain list of paths."""
+
+    def _run(self, download_tasks):
+        client_cls = MagicMock()
+        client_cls.return_value.download_tasks = download_tasks
+        with patch("harbor.tasks.client.TaskClient", client_cls):
+            from pier.harbor_bridge import download_task
+
+            return download_task("https://github.com/org/repo", "tasks/t")
+
+    def test_awaits_a_coroutine_and_reads_batch_paths(self, tmp_path: Path):
+        batch = MagicMock()
+        batch.paths = [tmp_path / "t"]
+
+        async def download_tasks(task_ids):
+            assert len(task_ids) == 1
+            return batch
+
+        assert self._run(download_tasks) == tmp_path / "t"
+
+    def test_accepts_the_older_list_return(self, tmp_path: Path):
+        def download_tasks(task_ids):
+            return [tmp_path / "t"]
+
+        assert self._run(download_tasks) == tmp_path / "t"
