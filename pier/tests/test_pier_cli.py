@@ -1776,6 +1776,25 @@ def test_start_exec_fails_with_its_command(
     assert "--exec command exited with code 3." in result.output
 
 
+@patch("pier.harbor_bridge.exec_in_container", return_value=0)
+@patch("pier.harbor_bridge.is_environment_running", return_value=True)
+def test_start_exec_runs_in_the_current_workspace(
+    mock_running, mock_exec, runner, index_path, tmp_path, monkeypatch
+):
+    """With no task path, pier start works on the workspace it is run in;
+    --exec was dropped there without a word."""
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    _write_session(ws, _container_session(), index_path)
+    monkeypatch.chdir(ws)
+    monkeypatch.setenv("PWD", str(ws))
+    result = runner.invoke(
+        cli, ["start", "--exec", "claude --version"], catch_exceptions=False
+    )
+    assert result.exit_code == 0, result.output
+    assert mock_exec.call_args[0][2] == ["claude", "--version"]
+
+
 def test_start_exec_refuses_host_mode(runner, index_path, task_dir, tmp_path):
     result = runner.invoke(
         cli,
