@@ -2090,6 +2090,26 @@ def test_verify_refuses_a_trial_dir_the_agent_can_write(
 @patch("pier.cli._assemble_trial_output")
 @patch("pier.harbor_bridge.verify_environment", return_value={"reward": 1.0})
 @patch("pier.harbor_bridge.is_environment_running", return_value=True)
+def test_verify_refuses_a_trial_dir_reached_through_a_link_in_the_workspace(
+    mock_running, mock_verify, mock_assemble, runner, index_path, task_dir, tmp_path
+):
+    """A link the agent left in the workspace can point outside it: the path
+    as given is the agent's to redirect, wherever it resolves today."""
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (ws / "out").symlink_to(outside)
+    _write_session(ws, _container_session(task_dir=str(task_dir)), index_path)
+    result = runner.invoke(cli, ["verify", "--trial-dir", str(ws / "out" / "my-trial")])
+    assert result.exit_code != 0
+    assert "which the agent can write" in result.output
+    mock_verify.assert_not_called()
+
+
+@patch("pier.cli._assemble_trial_output")
+@patch("pier.harbor_bridge.verify_environment", return_value={"reward": 1.0})
+@patch("pier.harbor_bridge.is_environment_running", return_value=True)
 def test_verify_with_agent_flag(
     mock_running,
     mock_verify,

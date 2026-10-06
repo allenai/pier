@@ -1239,7 +1239,7 @@ def test_extract_session_declines_where_links_cannot_be_refused(
     not harbor_bridge._can_open_without_links(),
     reason="this platform does not extract the session",
 )
-@pytest.mark.parametrize("bound", ["bytes", "files", "depth"])
+@pytest.mark.parametrize("bound", ["bytes", "files", "directories", "depth"])
 def test_extract_session_declines_a_session_past_its_bounds(
     tmp_path: Path, monkeypatch, caplog, bound
 ):
@@ -1253,6 +1253,10 @@ def test_extract_session_declines_a_session_past_its_bounds(
         monkeypatch.setattr(harbor_bridge, "MAX_SESSION_FILES", 2)
         for i in range(3):
             (session / f"{i}.jsonl").write_text("{}")
+    elif bound == "directories":
+        monkeypatch.setattr(harbor_bridge, "MAX_SESSION_FILES", 2)
+        for i in range(3):
+            (session / f"empty-{i}").mkdir()
     else:
         monkeypatch.setattr(harbor_bridge, "MAX_SESSION_DEPTH", 2)
         (session / "a" / "b" / "c").mkdir(parents=True)
@@ -1263,6 +1267,21 @@ def test_extract_session_declines_a_session_past_its_bounds(
     assert harbor_bridge.extract_session("claude-code", session, root) == (None, None)
     assert read == []
     assert "did not extract the agent's session" in caplog.text
+
+
+@pytest.mark.skipif(
+    not harbor_bridge._can_open_without_links(),
+    reason="this platform does not extract the session",
+)
+def test_extract_session_caps_the_trajectory_harbor_writes(tmp_path: Path, monkeypatch):
+    root, session = _mounted_logs(tmp_path)
+    monkeypatch.setattr(harbor_bridge, "MAX_TRAJECTORY_BYTES", 10)
+    read: list[Path] = []
+    monkeypatch.setattr(
+        harbor_bridge, "extract_agent_context", _harbor_writes_a_trajectory(read)
+    )
+    context, trajectory = harbor_bridge.extract_session("claude-code", session, root)
+    assert context and trajectory is None
 
 
 def test_a_symlink_one_artifact_leaves_cannot_redirect_the_next(tmp_path: Path):

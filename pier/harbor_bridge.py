@@ -1810,6 +1810,11 @@ def _copy_tree_from(
         if entry.is_symlink():
             continue
         if entry.is_dir(follow_symlinks=False):
+            budget[1] += 1
+            if budget[1] > MAX_SESSION_FILES:
+                raise _SessionTooLarge(
+                    f"over {MAX_SESSION_FILES} files and directories"
+                )
             try:
                 inner = os.open(
                     entry.name,
@@ -1834,7 +1839,8 @@ def _copy_tree_from(
             budget[1] += 1
             if budget[0] > MAX_SESSION_BYTES or budget[1] > MAX_SESSION_FILES:
                 raise _SessionTooLarge(
-                    f"over {MAX_SESSION_BYTES} bytes or {MAX_SESSION_FILES} files"
+                    f"over {MAX_SESSION_BYTES} bytes or {MAX_SESSION_FILES} files "
+                    "and directories"
                 )
             (dest / entry.name).write_bytes(data)
 
@@ -1878,7 +1884,12 @@ def extract_session(
             os.close(directory)
         context = extract_agent_context(agent_name, copy)
         trajectory = copy / "trajectory.json"
-        data = trajectory.read_bytes() if trajectory.is_file() else None
+        data = None
+        if trajectory.is_file():
+            with trajectory.open("rb") as written:
+                data = written.read(MAX_TRAJECTORY_BYTES + 1)
+            if len(data) > MAX_TRAJECTORY_BYTES:
+                data = None
     return context, data
 
 

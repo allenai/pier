@@ -1611,16 +1611,22 @@ def _refuse_a_trial_dir_the_agent_can_write(
     (whose logs dirs are mounted into the container too) or a writable mount,
     the agent could swap a directory there for a link and redirect those
     writes onto this host. Mounts an ``--extra-docker-compose`` overlay adds
-    are not known here."""
-    target = trial_dir.expanduser().resolve()
-    writable = [workspace.resolve()]
+    are not known here. Both the path as given and where its links lead are
+    checked: a link the agent left in the workspace can point out of it."""
+
+    def as_given_and_resolved(path: Path) -> set[Path]:
+        path = path.expanduser()
+        return {Path(os.path.abspath(path)), path.resolve()}
+
+    targets = as_given_and_resolved(trial_dir)
+    writable = as_given_and_resolved(workspace)
     for raw in sess.get("extra_mounts") or []:
         # host:container[:ro], where a Windows host starts with its drive (C:\).
         mount = re.match(r"^((?:[A-Za-z]:[\\/])?[^:]*):([^:]*)(?::(.*))?$", raw)
         if mount and mount[1] and mount[3] != "ro":
-            writable.append(Path(mount[1]).expanduser().resolve())
-    for place in writable:
-        if target.is_relative_to(place):
+            writable |= as_given_and_resolved(Path(mount[1]))
+    for place in sorted(writable):
+        if any(target.is_relative_to(place) for target in targets):
             raise click.ClickException(
                 f"--trial-dir {trial_dir} is inside {place}, which the agent can "
                 "write: it could redirect what pier writes there. Choose a "
