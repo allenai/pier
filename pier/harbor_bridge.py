@@ -717,25 +717,24 @@ def _docker(*args: str, timeout: float | None = None) -> subprocess.CompletedPro
 
 
 def _declared_artifacts(task_dir: Path) -> list:
-    """The artifacts to collect: the convention's and the task's own, as
-    Harbor's ``ArtifactConfig``.
+    """The artifacts to collect, as Harbor lists them: the task's own, with the
+    convention's added unless the task declares it.
 
     An entry with excludes, or from a service other than main, is refused
     rather than collected differently from how Harbor collects it."""
-    from harbor.models.task.config import ArtifactConfig, TaskConfig
+    from harbor.models.task.artifacts import with_convention_entry
+    from harbor.models.task.config import TaskConfig
 
     config = TaskConfig.model_validate_toml((task_dir / "task.toml").read_text())
-    entries = [ArtifactConfig(source=ARTIFACTS_CONVENTION)]
-    for entry in config.artifacts:
-        if isinstance(entry, str):
-            entries.append(ArtifactConfig(source=entry))
-            continue
+    entries = with_convention_entry(
+        config.artifacts, convention_source=ARTIFACTS_CONVENTION
+    )
+    for entry in entries:
         if entry.exclude or (entry.service or "main") != "main":
             raise RuntimeError(
                 f"artifact {entry.source}: excludes and services other than "
                 "main are not collected by pier verify yet"
             )
-        entries.append(entry)
     return entries
 
 
@@ -808,7 +807,7 @@ def record_workspace(
 
     artifacts_dir = record / "artifacts"
     inside = record.resolve()
-    collected: list[tuple[str, str, Path, bool, bool]] = []
+    collected: list[tuple[str, str, Path, bool]] = []
     skipped: list[tuple[str, str]] = []
     dropped: list[Path] = []
     for artifact in _declared_artifacts(task_dir):
@@ -821,7 +820,7 @@ def record_workspace(
         )
         # As Harbor collects: an artifact overlapping one collected before it
         # is left out, so nothing one copy left can lie on another's path.
-        earlier = [t for _, _, t, _, _ in collected]
+        earlier = [t for _, _, t, _ in collected]
         if any(
             target == t or t in target.parents or target in t.parents for t in earlier
         ):
@@ -842,16 +841,13 @@ def record_workspace(
             target.parent.mkdir(parents=True, exist_ok=True)
             copied = _docker("cp", f"{container}:{source}", str(target))
         if copied.returncode:
-            # As Harbor collects: best effort, so an artifact the agent never
-            # wrote is a failed entry in the manifest, and the work is scored.
-            logger.warning(
-                "could not copy artifact %s out of the workspace (%s)",
-                source,
-                copied.stderr.strip()[-300:],
+            # Harbor's regrade refuses a record missing a declared artifact, so
+            # one the agent never wrote leaves nothing it could score.
+            raise RuntimeError(
+                f"could not copy {source} out of the workspace, and the task's "
+                "verifier reads it: " + copied.stderr.strip()[-300:]
             )
-        collected.append(
-            (source, destination, target, is_dir.returncode == 0, not copied.returncode)
-        )
+        collected.append((source, destination, target, is_dir.returncode == 0))
         dropped += _drop_symlinks(record)
     (record / "agent").mkdir(exist_ok=True)
     copied = _docker("cp", f"{container}:{AGENT_LOGS}/.", str(record / "agent"))
@@ -869,14 +865,11 @@ def record_workspace(
         )
 
     manifest = []
-    for source, destination, target, a_directory, ok in collected:
-        kind = "directory" if a_directory else "file"
-        if not ok:
-            status = "failed"
-        elif a_directory:
-            status = "ok" if any(target.iterdir()) else "empty"
+    for source, destination, target, a_directory in collected:
+        if a_directory:
+            kind, status = "directory", "ok" if any(target.iterdir()) else "empty"
         else:
-            status = "ok" if target.is_file() else "failed"
+            kind, status = "file", "ok" if target.is_file() else "failed"
         manifest.append(
             ArtifactManifestEntry(
                 source=source, destination=destination, type=kind, status=status

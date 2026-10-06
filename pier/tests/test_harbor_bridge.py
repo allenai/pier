@@ -997,32 +997,60 @@ def test_a_task_pier_cannot_record_is_refused_before_anything_runs(
     assert calls == []
 
 
-@pytest.mark.parametrize(
-    "source,kind", [("/workspace/out.txt", "file"), ("/workspace/out", "directory")]
-)
-def test_a_missing_artifact_is_recorded_as_failed_and_scored(
-    tmp_path: Path, caplog, source, kind
-):
-    """As Harbor collects artifacts: best effort. Output the agent never wrote
-    is a failed attempt to score, not a reason to skip scoring."""
-    toml = f'artifacts = ["{source}"]\n[verifier]\nenvironment_mode = "separate"\n'
+def test_an_artifact_the_agent_never_wrote_stops_the_scoring(tmp_path: Path):
+    """Harbor's regrade refuses a record missing a declared artifact, so the
+    error names the artifact rather than leaving regrade to refuse."""
+    toml = (
+        'artifacts = ["/workspace/out.txt"]\n'
+        '[verifier]\nenvironment_mode = "separate"\n'
+    )
     task = _task(tmp_path, toml)
     record = tmp_path / "record"
     record.mkdir()
     fake = _fake_docker([], {}, file_sources=("/workspace/out.txt",))
 
     def docker(*args, timeout=None):
-        if args[0] == "cp" and args[1].split(":", 1)[1].removesuffix("/.") == source:
+        if args[0] == "cp" and args[1].endswith(":/workspace/out.txt"):
             return MagicMock(returncode=1, stdout="", stderr="no such path")
         return fake(*args, timeout=timeout)
 
+    with (
+        patch("pier.harbor_bridge._docker", docker),
+        pytest.raises(RuntimeError, match="could not copy /workspace/out.txt"),
+    ):
+        harbor_bridge.record_workspace("pier-ws", task, record, "pier")
+    assert not (record / "result.json").exists()
+
+
+class _Accepted(Exception):
+    """Raised where Harbor's regrade first uses a record it has validated."""
+
+
+@pytest.mark.parametrize(
+    "artifacts",
+    ["", 'artifacts = ["/workspace"]\n', 'artifacts = ["/logs/artifacts"]\n'],
+)
+def test_harbor_regrade_accepts_the_record(tmp_path: Path, artifacts):
+    """Harbor's regrade checks a record before using it, and refuses one with
+    an artifact failed or skipped: the record pier writes passes."""
+    from harbor.trial.regrade import RegradeTrial
+
+    task = _task(tmp_path, artifacts + '[verifier]\nenvironment_mode = "separate"\n')
+    (task / "instruction.md").write_text("Do it.\n")
+    for part in ("environment", "tests"):
+        (task / part).mkdir()
+        (task / part / "Dockerfile").write_text("FROM alpine\n")
+    (task / "tests" / "test.sh").write_text("#!/bin/sh\n")
+    record = tmp_path / "record"
+    record.mkdir()
+    docker = _fake_docker([], {"/workspace": "out.json"})
     with patch("pier.harbor_bridge._docker", docker):
         harbor_bridge.record_workspace("pier-ws", task, record, "pier")
-    assert f"could not copy artifact {source}" in caplog.text
-    manifest = json.loads((record / "artifacts" / "manifest.json").read_text())
-    entry = next(e for e in manifest if e["source"] == source)
-    assert (entry["type"], entry["status"]) == (kind, "failed")
-    assert (record / "result.json").exists()
+    with (
+        patch.object(RegradeTrial, "_seed_from_source", side_effect=_Accepted()),
+        pytest.raises(RuntimeError, match="^_Accepted"),
+    ):
+        harbor_bridge.regrade(record, task, tmp_path / "trials", "scored")
 
 
 def test_scoring_stops_every_container_of_the_workspace():
