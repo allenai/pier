@@ -478,6 +478,9 @@ class TestVerifyIntegration:
             "command = \"sh -c 'sleep 2; echo late > /app/late.txt' & wait\"\n"
             "timeout_sec = 0.2\n"
         )
+        (task_dir / "tests" / "Dockerfile").write_text(
+            "FROM python:3.12-slim\nWORKDIR /app\n"
+        )
         try:
             _start_workspace(runner, task_dir, workspace)
             (workspace / "hello.txt").write_text("Hello, world!")
