@@ -1219,19 +1219,50 @@ def test_extract_session_leaves_links_inside_the_session_out(
     assert copied == [{"real.jsonl"}]
 
 
-def test_extract_session_where_links_cannot_be_refused_reads_in_place(
+def test_extract_session_declines_where_links_cannot_be_refused(
     tmp_path: Path, monkeypatch, caplog
 ):
+    """Without dir_fd and O_NOFOLLOW (Windows), reading the session where it
+    lies would follow any link the agent left in it."""
     root, session = _mounted_logs(tmp_path)
     read: list[Path] = []
     monkeypatch.setattr(harbor_bridge, "_can_open_without_links", lambda: False)
     monkeypatch.setattr(
         harbor_bridge, "extract_agent_context", _harbor_writes_a_trajectory(read)
     )
-    context, trajectory = harbor_bridge.extract_session("claude-code", session, root)
-    assert context and trajectory is None
-    assert read == [session]
-    assert "beside the session's logs" in caplog.text
+    assert harbor_bridge.extract_session("claude-code", session, root) == (None, None)
+    assert read == []
+    assert "did not extract the agent's session" in caplog.text
+
+
+@pytest.mark.skipif(
+    not harbor_bridge._can_open_without_links(),
+    reason="this platform does not extract the session",
+)
+@pytest.mark.parametrize("bound", ["bytes", "files", "depth"])
+def test_extract_session_declines_a_session_past_its_bounds(
+    tmp_path: Path, monkeypatch, caplog, bound
+):
+    """The agent arranges its session: a copy without bounds could fill the
+    disk or recurse until verify fails."""
+    root, session = _mounted_logs(tmp_path)
+    if bound == "bytes":
+        monkeypatch.setattr(harbor_bridge, "MAX_SESSION_BYTES", 10)
+        (session / "big.jsonl").write_text("x" * 11)
+    elif bound == "files":
+        monkeypatch.setattr(harbor_bridge, "MAX_SESSION_FILES", 2)
+        for i in range(3):
+            (session / f"{i}.jsonl").write_text("{}")
+    else:
+        monkeypatch.setattr(harbor_bridge, "MAX_SESSION_DEPTH", 2)
+        (session / "a" / "b" / "c").mkdir(parents=True)
+    read: list[Path] = []
+    monkeypatch.setattr(
+        harbor_bridge, "extract_agent_context", _harbor_writes_a_trajectory(read)
+    )
+    assert harbor_bridge.extract_session("claude-code", session, root) == (None, None)
+    assert read == []
+    assert "did not extract the agent's session" in caplog.text
 
 
 def test_a_symlink_one_artifact_leaves_cannot_redirect_the_next(tmp_path: Path):

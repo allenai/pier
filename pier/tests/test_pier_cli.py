@@ -2860,6 +2860,10 @@ def test_capture_outside_workspace_does_not_attach_to_unrelated_active_workspace
     assert not (active_ws / ".pier" / "trials").exists()
 
 
+@pytest.mark.skipif(
+    not harbor_bridge._can_open_without_links(),
+    reason="this platform does not extract a container's session",
+)
 @patch("pier.harbor_bridge.extract_agent_context", return_value={"cost_usd": 0.05})
 def test_capture_container_auto_discover(
     mock_extract,

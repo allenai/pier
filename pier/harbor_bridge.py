@@ -1785,10 +1785,26 @@ def write_trajectory(into: Path, data: bytes) -> bool:
     return _write_under(into, "trajectory.json", data)
 
 
-def _copy_tree_from(directory: int, dest: Path) -> None:
+#: Beyond any of these a session is not copied out, so not extracted.
+MAX_SESSION_BYTES = 1024 * 1024 * 1024
+MAX_SESSION_FILES = 100_000
+MAX_SESSION_DEPTH = 32
+
+
+class _SessionTooLarge(Exception):
+    """A session over one of the MAX_SESSION_* bounds."""
+
+
+def _copy_tree_from(
+    directory: int, dest: Path, budget: list[int], depth: int = 0
+) -> None:
     """Copy the directory open at *directory* into *dest*: directories and
     regular files only, each opened without following a link. Links, FIFOs,
-    devices and files over :data:`MAX_TRAJECTORY_BYTES` are left out."""
+    devices and files over :data:`MAX_TRAJECTORY_BYTES` are left out. *budget*
+    holds the bytes and files copied so far; past a bound, or deeper than
+    :data:`MAX_SESSION_DEPTH`, it raises :class:`_SessionTooLarge`."""
+    if depth > MAX_SESSION_DEPTH:
+        raise _SessionTooLarge(f"deeper than {MAX_SESSION_DEPTH} directories")
     dest.mkdir(parents=True, exist_ok=True)
     for entry in os.scandir(directory):
         if entry.is_symlink():
@@ -1803,7 +1819,7 @@ def _copy_tree_from(directory: int, dest: Path) -> None:
             except OSError:
                 continue
             try:
-                _copy_tree_from(inner, dest / entry.name)
+                _copy_tree_from(inner, dest / entry.name, budget, depth + 1)
             finally:
                 os.close(inner)
         elif entry.is_file(follow_symlinks=False):
@@ -1812,8 +1828,15 @@ def _copy_tree_from(directory: int, dest: Path) -> None:
                 continue
             with os.fdopen(fd, "rb") as source:
                 data = source.read(MAX_TRAJECTORY_BYTES + 1)
-            if len(data) <= MAX_TRAJECTORY_BYTES:
-                (dest / entry.name).write_bytes(data)
+            if len(data) > MAX_TRAJECTORY_BYTES:
+                continue
+            budget[0] += len(data)
+            budget[1] += 1
+            if budget[0] > MAX_SESSION_BYTES or budget[1] > MAX_SESSION_FILES:
+                raise _SessionTooLarge(
+                    f"over {MAX_SESSION_BYTES} bytes or {MAX_SESSION_FILES} files"
+                )
+            (dest / entry.name).write_bytes(data)
 
 
 def extract_session(
@@ -1827,15 +1850,15 @@ def extract_session(
     its trajectory there, following links, so a session dir the agent made a
     link to a host directory would have Harbor read and write on this host.
     So the session is first copied out from *root* without following a link,
-    and Harbor reads and writes the copy. Where the platform cannot open a
-    path that way (Windows), Harbor reads the session where it lies, and the
-    trajectory is left beside it."""
+    within the MAX_SESSION_* bounds, and Harbor reads and writes the copy.
+    Where the platform cannot open a path that way (Windows), or the session
+    is past a bound, nothing is extracted, with a warning."""
     if not _can_open_without_links():
         logger.warning(
-            "left the trajectory beside the session's logs: this platform "
-            "cannot copy them out without following links"
+            "did not extract the agent's session: this platform cannot read it "
+            "without following links, and the agent arranges it"
         )
-        return extract_agent_context(agent_name, logs_dir), None
+        return None, None
     session = _latest_session_dir(logs_dir, agent_name) or logs_dir
     try:
         relative = PurePosixPath(session.relative_to(root).as_posix())
@@ -1847,7 +1870,10 @@ def extract_session(
     with tempfile.TemporaryDirectory() as scratch:
         copy = Path(scratch) / "session"
         try:
-            _copy_tree_from(directory, copy)
+            _copy_tree_from(directory, copy, [0, 0])
+        except _SessionTooLarge as e:
+            logger.warning("did not extract the agent's session: it is %s", e)
+            return None, None
         finally:
             os.close(directory)
         context = extract_agent_context(agent_name, copy)
