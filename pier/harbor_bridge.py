@@ -28,11 +28,12 @@ import json
 import logging
 import os
 import re
+import shutil
 import subprocess
 import sys
 from collections.abc import Callable
 from datetime import datetime
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -227,12 +228,14 @@ def _make_environment(
     workspace_dir: Path | None = None,
     ports: list[int] | None = None,
     extra_mounts: list[str] | None = None,
+    extra_compose: list[str] | None = None,
 ):
     """Reconstruct a Harbor Docker environment from pier session data.
 
     Called for every container operation (exec, verify, stop) since the
     environment object is stateless — the running Docker container is the
-    actual state.
+    actual state. So *extra_compose* must be the same list on every call: a
+    stop without an overlay's services leaves their containers running.
 
     Fragility: EnvironmentFactory is not in Harbor's public __all__.
     If Harbor reorganizes its package, update the import below.
@@ -299,16 +302,6 @@ def _make_environment(
     if mounts:
         kwargs["mounts"] = mounts
 
-    environment = EnvironmentFactory.create_environment(
-        type="docker",
-        environment_dir=task.paths.environment_dir,
-        environment_name=task.name,
-        session_id=harbor_session_id,
-        trial_paths=trial_paths,
-        task_env_config=task.config.environment,
-        **kwargs,
-    )
-
     # Always write a compose override for the tmpfs mount that hides .pier/
     # from the container. On older Harbor (no mounts_json), this file also
     # carries the workspace bind mount.
@@ -340,38 +333,21 @@ def _make_environment(
         if mounts_path.exists():
             override_paths.append(mounts_path)
 
-    for p in override_paths:
-        _patch_compose_paths(environment, p)
+    # Harbor merges these after the task's own compose. pier's override is a
+    # separate file from Harbor's docker-compose-mounts.json, which Harbor
+    # rewrites.
+    environment = EnvironmentFactory.create_environment(
+        type="docker",
+        environment_dir=task.paths.environment_dir,
+        environment_name=task.name,
+        session_id=harbor_session_id,
+        trial_paths=trial_paths,
+        task_env_config=task.config.environment,
+        extra_docker_compose=[*(Path(p) for p in extra_compose or []), *override_paths],
+        **kwargs,
+    )
 
     return environment, task, trial_paths
-
-
-def _patch_compose_paths(environment: object, mounts_path: Path) -> None:
-    """Monkey-patch _docker_compose_paths to include pier's compose override.
-
-    TODO: Replace when Harbor supports a public API for compose overrides.
-
-    Pier writes a separate compose override (docker-compose-pier.json) for
-    the tmpfs that hides .pier/ from the container. This must be a different
-    file from Harbor's docker-compose-mounts.json to avoid being overwritten.
-    """
-    orig_property = type(environment)._docker_compose_paths  # type: ignore[attr-defined]
-
-    @property  # type: ignore[misc]
-    def _patched(self: object) -> list[Path]:
-        paths: list[Path] = orig_property.fget(self)  # type: ignore[union-attr]
-        if mounts_path not in paths:
-            paths.append(mounts_path)
-        return paths
-
-    # Patch on the instance's class would affect all instances, so use a
-    # one-off subclass instead.
-    patched_cls = type(
-        type(environment).__name__,
-        (type(environment),),
-        {"_docker_compose_paths": _patched},
-    )
-    environment.__class__ = patched_cls
 
 
 async def _async_start_environment(
@@ -381,6 +357,7 @@ async def _async_start_environment(
     workspace_dir: Path | None = None,
     ports: list[int] | None = None,
     extra_mounts: list[str] | None = None,
+    extra_compose: list[str] | None = None,
 ) -> None:
     environment, task, _ = _make_environment(
         task_dir,
@@ -389,17 +366,21 @@ async def _async_start_environment(
         workspace_dir=workspace_dir,
         ports=ports,
         extra_mounts=extra_mounts,
+        extra_compose=extra_compose,
     )
     await environment.start(force_build=False)
 
 
 async def _async_verify_environment(
-    task_dir: Path, harbor_session_id: str, trial_dir: Path
+    task_dir: Path,
+    harbor_session_id: str,
+    trial_dir: Path,
+    extra_compose: list[str] | None = None,
 ) -> dict:
     from harbor import Verifier
 
     environment, task, trial_paths = _make_environment(
-        task_dir, harbor_session_id, trial_dir
+        task_dir, harbor_session_id, trial_dir, extra_compose=extra_compose
     )
     verifier = Verifier(task=task, trial_paths=trial_paths, environment=environment)
     await verifier.verify()
@@ -423,8 +404,11 @@ async def _async_stop_environment(
     trial_dir: Path,
     *,
     delete: bool = False,
+    extra_compose: list[str] | None = None,
 ) -> None:
-    environment, _, _ = _make_environment(task_dir, harbor_session_id, trial_dir)
+    environment, _, _ = _make_environment(
+        task_dir, harbor_session_id, trial_dir, extra_compose=extra_compose
+    )
     await environment.stop(delete=delete)
 
 
@@ -435,12 +419,14 @@ def start_environment(
     workspace_dir: Path | None = None,
     ports: list[int] | None = None,
     extra_mounts: list[str] | None = None,
+    extra_compose: list[str] | None = None,
 ) -> None:
     """Build (if needed), start a Harbor Docker environment.
 
     If workspace_dir is provided, it is bind-mounted into the container.
     If ports is provided, those container ports are exposed to the host.
     If extra_mounts is provided, they are added as volume mounts.
+    If extra_compose is provided, those compose files are merged in.
     """
     with _placeholder_task_env_vars(task_dir):
         asyncio.run(
@@ -451,6 +437,7 @@ def start_environment(
                 workspace_dir=workspace_dir,
                 ports=ports,
                 extra_mounts=extra_mounts,
+                extra_compose=extra_compose,
             )
         )
 
@@ -502,14 +489,16 @@ def create_synthetic_task_dir(image: str, temp_root: Path) -> Path:
 
 def _claude_config_dir() -> str:
     """Return the CLAUDE_CONFIG_DIR path used inside Harbor containers."""
-    from harbor.agents.installed.claude_code import EnvironmentPaths
+    # Where harbor defines it: 0.24 stopped re-exporting it from the agents.
+    from harbor.models.trial.paths import EnvironmentPaths
 
     return (EnvironmentPaths.agent_dir / "sessions").as_posix()
 
 
 def _codex_home_dir() -> str:
     """Return the CODEX_HOME path used inside Harbor containers."""
-    from harbor.agents.installed.codex import EnvironmentPaths
+    # Where harbor defines it: 0.24 stopped re-exporting it from the agents.
+    from harbor.models.trial.paths import EnvironmentPaths
 
     return EnvironmentPaths.agent_dir.as_posix()
 
@@ -635,11 +624,18 @@ def setup_agent(
         )
 
 
-def verify_environment(task_dir: Path, harbor_session_id: str, trial_dir: Path) -> dict:
+def verify_environment(
+    task_dir: Path,
+    harbor_session_id: str,
+    trial_dir: Path,
+    extra_compose: list[str] | None = None,
+) -> dict:
     """Run Harbor's verifier on a running environment. Returns reward dict."""
     with _placeholder_task_env_vars(task_dir):
         return asyncio.run(
-            _async_verify_environment(task_dir, harbor_session_id, trial_dir)
+            _async_verify_environment(
+                task_dir, harbor_session_id, trial_dir, extra_compose=extra_compose
+            )
         )
 
 
@@ -649,6 +645,7 @@ def stop_environment(
     trial_dir: Path,
     *,
     delete: bool = False,
+    extra_compose: list[str] | None = None,
 ) -> None:
     """Stop the Harbor Docker environment.
 
@@ -661,7 +658,11 @@ def stop_environment(
     with _placeholder_task_env_vars(task_dir):
         asyncio.run(
             _async_stop_environment(
-                task_dir, harbor_session_id, trial_dir, delete=delete
+                task_dir,
+                harbor_session_id,
+                trial_dir,
+                delete=delete,
+                extra_compose=extra_compose,
             )
         )
 
@@ -683,6 +684,327 @@ def _placeholder_task_env_vars(task_dir: Path):
     finally:
         for var in added:
             os.environ.pop(var, None)
+
+
+# ---------------------------------------------------------------------------
+# Scoring apart: a task declaring [verifier] environment_mode = "separate"
+# ---------------------------------------------------------------------------
+#
+# Harbor scores such a task in an environment of its own, built from the
+# task's tests/, after collecting the agent's work: the tests never enter the
+# container the agent worked in. pier does the same through Harbor's own
+# re-scoring (`harbor trial regrade`): it records the workspace's work as a
+# trial, stops the workspace's container, and regrades that record.
+
+#: What every Harbor trial collects besides a task's own artifacts.
+ARTIFACTS_CONVENTION = "/logs/artifacts"
+AGENT_LOGS = "/logs/agent"
+
+
+def scores_apart(task_dir: Path) -> bool:
+    """Whether any of the task's verifiers runs in an environment of its own:
+    the task's, or for a task with steps, any step's."""
+    from harbor.models.task.config import TaskConfig
+    from harbor.models.task.verifier_mode import task_has_any_separate_verifier
+
+    config = TaskConfig.model_validate_toml((task_dir / "task.toml").read_text())
+    return task_has_any_separate_verifier(config)
+
+
+def _docker(*args: str, timeout: float | None = None) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        ["docker", *args], capture_output=True, text=True, check=False, timeout=timeout
+    )
+
+
+def _declared_artifacts(task_dir: Path) -> list:
+    """The artifacts to collect, as Harbor lists them: the task's own, with the
+    convention's added unless the task declares it.
+
+    An entry with excludes, or from a service other than main, is refused
+    rather than collected differently from how Harbor collects it."""
+    from harbor.models.task.artifacts import with_convention_entry
+    from harbor.models.task.config import TaskConfig
+
+    config = TaskConfig.model_validate_toml((task_dir / "task.toml").read_text())
+    entries = with_convention_entry(
+        config.artifacts, convention_source=ARTIFACTS_CONVENTION
+    )
+    for entry in entries:
+        if entry.exclude or (entry.service or "main") != "main":
+            raise RuntimeError(
+                f"artifact {entry.source}: excludes and services other than "
+                "main are not collected by pier verify yet"
+            )
+    return entries
+
+
+def _drop_symlinks(root: Path) -> list[Path]:
+    """Delete every symlink under *root*, and return them.
+
+    ``docker cp`` keeps a symlink the agent left, and Harbor's regrade copies
+    the record following symlinks, so one would resolve on this host rather
+    than in the container: a host file copied into the scored trial."""
+    dropped: list[Path] = []
+    for dirpath, dirnames, filenames in os.walk(root):
+        for name in [*dirnames, *filenames]:
+            path = Path(dirpath) / name
+            if path.is_symlink():
+                path.unlink()
+                dropped.append(path)
+    return dropped
+
+
+def record_workspace(
+    harbor_session_id: str, task_dir: Path, record: Path, agent_name: str
+) -> None:
+    """The workspace's work, as a trial record Harbor's regrade reads: the
+    task's collect hooks run in the container, then its artifacts and the
+    agent's logs copied out, with the manifest and result.json beside them."""
+    from harbor.models.task.config import TaskConfig, TaskOS
+    from harbor.models.trial.artifact_manifest import ArtifactManifestEntry
+    from harbor.trial.artifact_handler import artifact_host_path
+
+    container = get_container_name(harbor_session_id)
+    config = TaskConfig.model_validate_toml((task_dir / "task.toml").read_text())
+    if config.steps:
+        raise RuntimeError(
+            "a task with steps is not scored apart by pier verify yet: its record "
+            "would need each step's results"
+        )
+    if config.environment.os == TaskOS.WINDOWS:
+        raise RuntimeError(
+            "a Windows-container task is not scored apart by pier verify: it "
+            "collects with POSIX paths and bash"
+        )
+    for hook in config.verifier.collect:
+        if (hook.service or "main") != "main":
+            raise RuntimeError(
+                f"collect hook {hook.command!r} runs in {hook.service!r}; "
+                "pier verify runs hooks in main only"
+            )
+        # As Harbor runs them in main: in bash, as the hook's user, and best
+        # effort, so a hook that fails leaves its output out rather than
+        # stopping the scoring.
+        user = ["-u", str(hook.user)] if hook.user is not None else []
+        try:
+            ran = _docker(
+                "exec",
+                *user,
+                container,
+                "bash",
+                "-c",
+                hook.command,
+                timeout=hook.timeout_sec,
+            )
+            failed = (
+                f"exit {ran.returncode}: " + (ran.stderr or ran.stdout).strip()[-300:]
+                if ran.returncode
+                else ""
+            )
+        except subprocess.TimeoutExpired:
+            failed = f"timed out after {hook.timeout_sec:g}s"
+        if failed:
+            logger.warning("collect hook %r failed (%s)", hook.command, failed)
+
+    artifacts_dir = record / "artifacts"
+    inside = record.resolve()
+    # pier's session data lies under the workspace, hidden in the container by
+    # an empty tmpfs that `docker cp` reads through: the record holds what the
+    # container shows there, so no session, earlier trial or env of pier's.
+    hidden = PurePosixPath(get_container_workdir(task_dir), ".pier")
+    collected: list[tuple[str, str, Path, bool]] = []
+    skipped: list[tuple[str, str]] = []
+    dropped: list[Path] = []
+    for artifact in _declared_artifacts(task_dir):
+        source = artifact.source
+        target = artifact_host_path(artifacts_dir, artifact)
+        destination = (
+            "artifacts"
+            if target == artifacts_dir
+            else f"artifacts/{target.relative_to(artifacts_dir).as_posix()}"
+        )
+        # As Harbor collects: an artifact overlapping one collected before it
+        # is left out, so nothing one copy left can lie on another's path.
+        earlier = [t for _, _, t, _ in collected]
+        if any(
+            target == t or t in target.parents or target in t.parents for t in earlier
+        ):
+            logger.warning(
+                "artifact %s overlaps one collected before it; left out, as Harbor "
+                "leaves it",
+                source,
+            )
+            skipped.append((source, destination))
+            continue
+        if not target.resolve().is_relative_to(inside):
+            raise RuntimeError(f"artifact {source} would be written outside the record")
+        is_dir = _docker("exec", "-u", "root", container, "test", "-d", source)
+        if is_dir.returncode == 0:
+            target.mkdir(parents=True, exist_ok=True)
+            copied = _docker("cp", f"{container}:{source}/.", str(target))
+        else:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            copied = _docker("cp", f"{container}:{source}", str(target))
+        if copied.returncode:
+            # Harbor's regrade refuses a record missing a declared artifact, so
+            # one the agent never wrote leaves nothing it could score.
+            raise RuntimeError(
+                f"could not copy {source} out of the workspace, and the task's "
+                "verifier reads it: " + copied.stderr.strip()[-300:]
+            )
+        copied_from = PurePosixPath(source)
+        if is_dir.returncode == 0 and (
+            copied_from == hidden or copied_from in hidden.parents
+        ):
+            under = target / hidden.relative_to(copied_from)
+            if under.is_dir() and not under.is_symlink():
+                shutil.rmtree(under)
+                under.mkdir()
+        collected.append((source, destination, target, is_dir.returncode == 0))
+        dropped += _drop_symlinks(record)
+    (record / "agent").mkdir(exist_ok=True)
+    copied = _docker("cp", f"{container}:{AGENT_LOGS}/.", str(record / "agent"))
+    if copied.returncode:
+        raise RuntimeError(
+            "could not copy the agent's logs out of the workspace, so it was not "
+            "scored: " + copied.stderr.strip()[-300:]
+        )
+    dropped += _drop_symlinks(record)
+    for link in dropped:
+        logger.warning(
+            "left %s out of the scored record: it is a symlink, which would "
+            "resolve on this host",
+            link.relative_to(record).as_posix(),
+        )
+
+    manifest = []
+    for source, destination, target, a_directory in collected:
+        if a_directory:
+            kind, status = "directory", "ok" if any(target.iterdir()) else "empty"
+        else:
+            kind, status = "file", "ok" if target.is_file() else "failed"
+        manifest.append(
+            ArtifactManifestEntry(
+                source=source, destination=destination, type=kind, status=status
+            ).model_dump(mode="json")
+        )
+    for source, destination in skipped:
+        manifest.append(
+            ArtifactManifestEntry(
+                source=source,
+                destination=destination,
+                type="file" if Path(source).suffix else "directory",
+                status="skipped",
+            ).model_dump(mode="json")
+        )
+    (artifacts_dir / "manifest.json").write_text(json.dumps(manifest, indent=2))
+
+    name = config.task.name if config.task is not None else task_dir.name
+    trial_config = {
+        "task": {"path": str(task_dir)},
+        "trial_name": record.name,
+        "agent": {"name": agent_name},
+    }
+    result = {
+        "task_name": name,
+        "trial_name": record.name,
+        "trial_uri": record.resolve().as_uri(),
+        "task_id": {"path": str(task_dir)},
+        "task_checksum": "",
+        "config": trial_config,
+        "agent_info": {"name": agent_name, "version": "", "model_info": None},
+        "started_at": datetime.now().astimezone().isoformat(),
+    }
+    (record / "result.json").write_text(json.dumps(result, indent=2))
+    (record / "config.json").write_text(json.dumps(trial_config, indent=2))
+
+
+def remove_workspace_containers(harbor_session_id: str) -> list[str]:
+    """Remove every container of the workspace's compose project, found by its
+    label, and return their ids: what stopping does when the environment cannot
+    be rebuilt, say because an overlay it was started with has moved."""
+    project = get_compose_project(harbor_session_id)
+    listed = _docker(
+        "ps", "-aq", "--filter", f"label=com.docker.compose.project={project}"
+    )
+    if listed.returncode:
+        raise RuntimeError(
+            "could not list the workspace's containers: " + listed.stderr.strip()
+        )
+    ids = listed.stdout.split()
+    if ids:
+        removed = _docker("rm", "-f", *ids)
+        if removed.returncode:
+            raise RuntimeError(
+                "could not remove the workspace's containers: " + removed.stderr.strip()
+            )
+    return ids
+
+
+def stop_workspace_container(harbor_session_id: str) -> None:
+    """Stop the workspace's containers — main, and any service an overlay
+    added — keeping them for `pier start` to restart: nothing the agent left
+    running runs while it is scored. Main is named as well as listed, so a
+    project that lists nothing cannot leave it running."""
+    project = get_compose_project(harbor_session_id)
+    listed = _docker(
+        "ps", "-q", "--filter", f"label=com.docker.compose.project={project}"
+    )
+    if listed.returncode:
+        raise RuntimeError(
+            "could not list the workspace's containers, so it was not scored: "
+            + listed.stderr.strip()
+        )
+    stopped = _docker(
+        "stop", get_container_name(harbor_session_id), *listed.stdout.split()
+    )
+    if stopped.returncode:
+        raise RuntimeError(
+            "could not stop the workspace's container, so it was not scored: "
+            + stopped.stderr.strip()
+        )
+
+
+async def _async_regrade(
+    record: Path, task_dir: Path, trials_dir: Path, trial_name: str
+) -> dict:
+    from harbor.models.trial.config import SourceTrialConfig, TaskConfig, TrialConfig
+    from harbor.models.trial.result import TrialResult
+    from harbor.trial.trial import Trial
+
+    source = TrialResult.model_validate_json((record / "result.json").read_text())
+    # Harbor looks the agent's class up by name for its setup timeout unless
+    # one is given, and a pier session's agent is not one of Harbor's. A
+    # regrade sets no agent up, so the timeout is never used.
+    agent = source.config.agent.model_copy(update={"override_setup_timeout_sec": 0.0})
+    config = TrialConfig(
+        task=TaskConfig(path=task_dir),
+        trial_name=trial_name,
+        trials_dir=trials_dir,
+        agent=agent,
+        artifacts=source.config.artifacts,
+        source_trial=SourceTrialConfig(
+            action="regrade", type="local", trial_id=source.id, path=record.resolve()
+        ),
+    )
+    trial = await Trial.create(config)
+    result = await trial.run()
+    if result.exception_info:
+        raise RuntimeError(
+            f"{result.exception_info.exception_type}: "
+            f"{result.exception_info.exception_message}"
+        )
+    rewards = result.verifier_result.rewards if result.verifier_result else None
+    return dict(rewards) if rewards else {"reward": None}
+
+
+def regrade(record: Path, task_dir: Path, trials_dir: Path, trial_name: str) -> dict:
+    """Score a trial record with the task, in an environment built from its
+    tests/, through Harbor's regrade. Returns the rewards; the scored trial is
+    `trials_dir/trial_name`."""
+    with _placeholder_task_env_vars(task_dir):
+        return asyncio.run(_async_regrade(record, task_dir, trials_dir, trial_name))
 
 
 # ---------------------------------------------------------------------------
@@ -1038,10 +1360,17 @@ def get_binary_agent_map() -> dict[str, str]:
 
     from harbor.agents.factory import AgentFactory
 
+    # harbor's public list where it has one (0.23+), else the keys of its
+    # private map (0.21, 0.22). harbor dropped the private list pier read
+    # before, and every agent became undetectable.
+    if hasattr(AgentFactory, "registered_names"):
+        names = [str(n) for n in AgentFactory.registered_names()]
+    else:
+        names = [str(getattr(n, "value", n)) for n in AgentFactory._AGENT_MAP]
+
     result: dict[str, str] = {}
-    for agent_cls in AgentFactory._AGENTS:
+    for name in names:
         try:
-            name = agent_cls.name()
             binary = get_agent_binary(name)
             if binary:
                 result[binary] = name

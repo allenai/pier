@@ -564,6 +564,18 @@ def cli():
     help="JSON array of volume mounts (e.g. '[\"./skills:/opt/asta-plugins/skills:ro\"]').",
 )
 @click.option(
+    "--extra-docker-compose",
+    "extra_compose",
+    multiple=True,
+    type=click.Path(exists=True, dir_okay=False),
+    help=(
+        "Compose file merged into the task's, as ``harbor run "
+        "--extra-docker-compose`` merges it — a service the agent reaches by "
+        "name, say. Kept for restart, verify and stop. Container mode only. "
+        "Repeatable."
+    ),
+)
+@click.option(
     "-e",
     "extra_env_cli",
     multiple=True,
@@ -609,6 +621,7 @@ def start(
     image: str | None,
     ports: tuple[int, ...],
     mounts_json: str | None,
+    extra_compose: tuple[str, ...],
     extra_env_cli: tuple[str, ...],
     env_file: str | None,
     no_mount: bool,
@@ -635,11 +648,14 @@ def start(
         pier start --agent claude-code
     """
     extra_mounts = _parse_mounts_json(mounts_json)
+    extra_compose_list = [str(Path(c).resolve()) for c in extra_compose]
 
     if no_mount and host:
         raise click.ClickException("--no-mount and --host are mutually exclusive.")
     if host and extra_env_cli:
         raise click.ClickException("-e cannot be used with --host.")
+    if host and extra_compose:
+        raise click.ClickException("--extra-docker-compose cannot be used with --host.")
     if host and env_file:
         raise click.ClickException("--env-file cannot be used with --host.")
     if host and skill_paths:
@@ -684,6 +700,7 @@ def start(
             agents=[agent] if agent else None,
             ports=list(ports),
             extra_mounts=extra_mounts,
+            extra_compose=extra_compose_list,
             extra_env=extra_env_list,
             no_mount=no_mount,
             force=force,
@@ -747,6 +764,8 @@ def start(
                     agents=agents,
                     ports=resolved_ports,
                     extra_mounts=resolved_extra_mounts,
+                    extra_compose=extra_compose_list
+                    or existing_sess.get("extra_compose", []),
                     extra_env=extra_env_list or existing_sess.get("extra_env", []),
                     no_mount=existing_sess.get("no_mount", False),
                 )
@@ -787,6 +806,7 @@ def start(
             agents=[agent] if agent else None,
             ports=list(ports),
             extra_mounts=extra_mounts,
+            extra_compose=extra_compose_list,
             extra_env=extra_env_list,
             no_mount=no_mount,
             skills_dir_override=skills_dir_override,
@@ -838,6 +858,7 @@ def _start_existing(agent: str | None) -> None:
             agents=agents,
             ports=_resolve_restart_ports(None, sess),
             extra_mounts=_resolve_restart_mounts(None, sess),
+            extra_compose=sess.get("extra_compose", []),
             extra_env=sess.get("extra_env", []),
             no_mount=sess.get("no_mount", False),
         )
@@ -980,6 +1001,7 @@ def _start_container(
     extra_env: list[str] | None = None,
     no_mount: bool = False,
     skills_dir_override: str | None = None,
+    extra_compose: list[str] | None = None,
 ) -> None:
 
     hsid = _harbor_session_id(workspace)
@@ -995,6 +1017,7 @@ def _start_container(
             workspace_dir=None if no_mount else workspace,
             ports=ports,
             extra_mounts=extra_mounts,
+            extra_compose=extra_compose,
         )
     except Exception as e:
         raise click.ClickException(f"Failed to start container: {e}")
@@ -1046,6 +1069,7 @@ def _start_container(
             "agents": agents or [],
             "ports": ports or [],
             "extra_mounts": extra_mounts or [],
+            "extra_compose": extra_compose or [],
             "extra_env": extra_env or [],
             "no_mount": no_mount,
             "started_at": datetime.now(timezone.utc).isoformat(),
@@ -1076,6 +1100,7 @@ def _start_task_free(
     extra_env: list[str] | None = None,
     no_mount: bool = False,
     force: bool = False,
+    extra_compose: list[str] | None = None,
 ) -> None:
     """Start a task-free container from a base image.
 
@@ -1113,6 +1138,8 @@ def _start_task_free(
                     agents=existing_agents,
                     ports=resolved_ports,
                     extra_mounts=resolved_extra_mounts,
+                    extra_compose=extra_compose
+                    or existing_sess.get("extra_compose", []),
                     extra_env=extra_env or existing_sess.get("extra_env", []),
                     no_mount=existing_sess.get("no_mount", False),
                 )
@@ -1140,6 +1167,7 @@ def _start_task_free(
         agents=agents,
         ports=ports,
         extra_mounts=extra_mounts,
+        extra_compose=extra_compose,
         extra_env=extra_env,
         no_mount=no_mount,
     )
@@ -1202,18 +1230,32 @@ def _validate_session_flags(
         raise click.ClickException(f"Invalid session timestamp: {session!r}")
 
 
-def _detect_agent_from_command(command: list[str]) -> str | None:
+def _detect_agent_from_command(
+    command: list[str], registered: list[str] | None = None
+) -> str | None:
     """Match a command against all known Harbor agent binaries.
 
     Uses Harbor's agent registry to build a binary→agent map (cached
-    after first call).  Returns the agent name or None.
+    after first call).  Returns the agent name or None.  An agent the
+    session set up wins over another that runs the same binary (harbor's
+    kimi-cli and kimi-code both run ``kimi``).
     """
     if not command:
         return None
+    cmd_basename = Path(command[0]).name
     try:
-        cmd_basename = Path(command[0]).name
+        for name in registered or []:
+            if harbor_bridge.get_agent_binary(name) == cmd_basename:
+                return name
         return harbor_bridge.get_binary_agent_map().get(cmd_basename)
-    except Exception:
+    except Exception as e:
+        # Not silently: without detection an agent runs with no log capture
+        # and none of its env.
+        click.echo(
+            f"pier: cannot read harbor's agent registry ({type(e).__name__}: {e}); "
+            f"running {cmd_basename!r} without agent setup",
+            err=True,
+        )
         return None
 
 
@@ -1250,8 +1292,8 @@ def _exec_container(
 
     # Apply agent env vars and PATH prefixes for registered agents
     # and the auto-detected agent (if not already registered).
-    active_agent = _detect_agent_from_command(command)
     agent_names = list(sess.get("agents", []))
+    active_agent = _detect_agent_from_command(command, agent_names)
     if active_agent and active_agent not in agent_names:
         agent_names.append(active_agent)
 
@@ -1443,19 +1485,24 @@ def _verify_container(
     # writes to a path the container can reach. Then copy results to the
     # per-verify trial dir.
     harbor_td = _harbor_trial_dir(workspace)
+    task_dir = Path(sess["task_dir"])
     start_time = datetime.now(timezone.utc)
-    try:
-        reward = harbor_bridge.verify_environment(
-            Path(sess["task_dir"]),
-            hsid,
-            harbor_td,
-        )
-    except Exception as e:
-        raise click.ClickException(f"Verifier failed: {e}")
+    if harbor_bridge.scores_apart(task_dir):
+        reward, harbor_verifier = _verify_apart(sess, hsid, task_dir, verify_trial_dir)
+    else:
+        try:
+            reward = harbor_bridge.verify_environment(
+                task_dir,
+                hsid,
+                harbor_td,
+                extra_compose=sess.get("extra_compose", []),
+            )
+        except Exception as e:
+            raise click.ClickException(f"Verifier failed: {e}")
+        harbor_verifier = harbor_td / "verifier"
     end_time = datetime.now(timezone.utc)
 
     # Copy verifier output from Harbor's dir to the per-verify trial dir
-    harbor_verifier = harbor_td / "verifier"
     if harbor_verifier.is_dir():
         shutil.copytree(
             harbor_verifier, verify_trial_dir / "verifier", dirs_exist_ok=True
@@ -1515,6 +1562,30 @@ def _verify_container(
         session_dir,
         agent_context=container_agent_context,
     )
+
+
+def _verify_apart(
+    sess: dict, hsid: str, task_dir: Path, verify_trial_dir: Path
+) -> tuple[dict, Path]:
+    """Score a task that declares `[verifier] environment_mode = "separate"` as
+    Harbor does: the workspace's work recorded, its container stopped, and the
+    record scored in an environment built from the task's tests/, which never
+    enter the workspace. Returns the reward and the scored trial's verifier dir."""
+    agents = sess.get("agents") or []
+    agent_name = "pier:" + "+".join(agents) if agents else "pier"
+    record = verify_trial_dir / "record"
+    record.mkdir(parents=True, exist_ok=True)
+    try:
+        harbor_bridge.record_workspace(hsid, task_dir, record, agent_name)
+        harbor_bridge.stop_workspace_container(hsid)
+        click.echo(
+            "Scoring apart from the workspace, as the task declares: its "
+            "container is stopped ('pier start' restarts it)."
+        )
+        reward = harbor_bridge.regrade(record, task_dir, verify_trial_dir, "scored")
+    except Exception as e:
+        raise click.ClickException(f"Verifier failed: {e}")
+    return reward, verify_trial_dir / "scored" / "verifier"
 
 
 def _verify_host(
@@ -1642,14 +1713,41 @@ def _stop_container_env(sess: dict, workspace: Path) -> None:
     harbor_trial_dir = _harbor_trial_dir(workspace)
     task_dir = Path(sess["task_dir"])
 
+    error: Exception | None = None
     try:
         harbor_bridge.stop_environment(
             task_dir,
             hsid,
             harbor_trial_dir,
+            extra_compose=sess.get("extra_compose", []),
         )
     except Exception as e:
-        raise click.ClickException(f"Failed to stop container: {e}")
+        error = e
+    # Harbor logs a failed compose stop or down and carries on, and cannot
+    # rebuild an environment whose overlay has moved: whatever of the
+    # workspace's compose project is left is removed by its label.
+    try:
+        removed = harbor_bridge.remove_workspace_containers(hsid)
+    except Exception as fallback:
+        raise click.ClickException(
+            "Failed to stop container: "
+            + (f"{error}; " if error else "")
+            + f"removing what was left by its compose project failed too: {fallback}"
+        )
+    if removed:
+        click.echo(
+            "Stopping through Harbor "
+            + (f"failed ({error}) and " if error else "")
+            + f"left {len(removed)} container(s); removed them by their compose "
+            "project.",
+            err=True,
+        )
+    elif error:
+        click.echo(
+            f"Stopping through Harbor failed ({error}); no container of its "
+            "compose project was left.",
+            err=True,
+        )
 
 
 @cli.command("list")

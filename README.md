@@ -151,6 +151,7 @@ pier start                                  # restart a stopped container
 - `--mounts-json` adds volume mounts as a JSON array (e.g., `--mounts-json '["./skills:/opt/skills:ro"]'`).
 - `-e` passes container-mode environment variables in `KEY=VALUE` format (repeatable). Stored in the session and forwarded on every `pier exec`.
 - `--env-file` loads container-mode environment variables from a `.env` file. Same behavior as `-e` for each line.
+- `--extra-docker-compose` adds a compose overlay, as `harbor run --extra-docker-compose` does — a service beside the agent's container, or a change to that container (repeatable, container mode only). Kept in the session and reused by restart, `pier verify` and `pier stop`.
 - `--no-mount` keeps workspace files inside the container only (no bind-mount to host). `pier stop` copies files back. Note: Harbor's internal mounts (agent logs, verifier output) still write to the host under `.pier/`.
 - `-f` / `--force` allows starting in a non-empty directory.
 - `--host` skips the container (workspace only).
@@ -182,6 +183,7 @@ The agent is inferred from the session (set by `pier start --agent`). If no agen
 
 - **Container mode**: uses Harbor's `Verifier` (same verifier as `harbor run`). The trajectory is captured automatically when an agent is registered. For unregistered agents (e.g. baked into the image), pass `--session-dir` (container path) and `-a`.
 - **Host mode**: spins up a temporary container to run the verifier, then tears it down. Pass `--session-dir` and `-a` to capture the trajectory.
+- **A task scored apart** — one whose `task.toml` declares `[verifier] environment_mode = "separate"` — is scored as `harbor run` scores it: pier runs the task's `[[verifier.collect]]` hooks in the workspace's container, copies out its `artifacts` and the agent's logs, stops the container, and scores that record in an environment built from the task's `tests/` (Harbor's `trial regrade`). The tests never enter the workspace. `pier start` restarts the container; the scored trial is under the verify run's `scored/`.
 
 ### `pier stop`
 

@@ -659,3 +659,484 @@ class TestDownloadTask:
             return [tmp_path / "t"]
 
         assert self._run(download_tasks) == tmp_path / "t"
+
+
+class TestExtraCompose:
+    """Overlays and pier's own override reach Harbor through its public
+    ``extra_docker_compose``, in that order, after the task's compose."""
+
+    def _task(self, tmp_path: Path) -> Path:
+        td = tmp_path / "task"
+        (td / "environment").mkdir(parents=True)
+        (td / "environment" / "Dockerfile").write_text("FROM ubuntu:24.04\n")
+        (td / "task.toml").write_text("[environment]\n[verifier]\n[agent]\n")
+        (td / "instruction.md").write_text("do it\n")
+        (td / "tests").mkdir()
+        (td / "tests" / "test.sh").write_text("#!/bin/bash\n")
+        return td
+
+    def test_overlays_then_pier_override(self, tmp_path: Path):
+        from pier.harbor_bridge import _make_environment
+
+        overlay = tmp_path / "gateway.yaml"
+        overlay.write_text("services: {}\n")
+        ws = tmp_path / "ws"
+        ws.mkdir()
+        environment, _, _ = _make_environment(
+            self._task(tmp_path),
+            "hsid",
+            tmp_path / "trial",
+            workspace_dir=ws,
+            extra_compose=[str(overlay)],
+        )
+        extra = [Path(p).name for p in environment.extra_docker_compose_paths]
+        assert extra == ["gateway.yaml", "docker-compose-pier.json"]
+        names = [Path(p).name for p in environment._docker_compose_paths]
+        assert "gateway.yaml" in names and "docker-compose-pier.json" in names
+
+    def test_no_overlays_still_merges_pier_override(self, tmp_path: Path):
+        from pier.harbor_bridge import _make_environment
+
+        ws = tmp_path / "ws"
+        ws.mkdir()
+        environment, _, _ = _make_environment(
+            self._task(tmp_path), "hsid", tmp_path / "trial", workspace_dir=ws
+        )
+        names = [Path(p).name for p in environment._docker_compose_paths]
+        assert "docker-compose-pier.json" in names
+
+
+# ---------------------------------------------------------------------------
+# Scoring apart ([verifier] environment_mode = "separate")
+# ---------------------------------------------------------------------------
+
+from pier import harbor_bridge  # noqa: E402
+
+SEPARATE = (
+    'artifacts = ["/workspace"]\n[verifier]\nenvironment_mode = "separate"\n'
+    '[[verifier.collect]]\ncommand = "collect-it"\n'
+)
+
+
+def _task(tmp_path: Path, toml: str) -> Path:
+    task = tmp_path / "my-task"
+    task.mkdir()
+    (task / "task.toml").write_text(toml)
+    return task
+
+
+@pytest.mark.parametrize(
+    "toml,apart",
+    [
+        (SEPARATE, True),
+        ('[verifier]\nenvironment_mode = "shared"\n', False),
+        ("[verifier]\n", False),
+        (
+            '[verifier]\nenvironment_mode = "shared"\n[[steps]]\nname = "one"\n'
+            '[steps.verifier]\nenvironment_mode = "separate"\n',
+            True,
+        ),
+    ],
+)
+def test_scores_apart_reads_the_tasks_declaration(tmp_path: Path, toml, apart):
+    assert harbor_bridge.scores_apart(_task(tmp_path, toml)) is apart
+
+
+def _fake_docker(
+    calls: list,
+    files: dict[str, str],
+    exec_rc: int = 0,
+    file_sources: tuple[str, ...] = (),
+    links: dict[str, tuple[str, Path]] | None = None,
+):
+    """`docker exec` runs a hook (exit *exec_rc*) or answers `test -d`: every
+    source is a directory but *file_sources*. `docker cp` writes `files` for a
+    directory source, a file for a file source, and plants *links*: for a
+    source, a symlink of that name pointing at a host path."""
+
+    def docker(*args, timeout=None):
+        calls.append(args)
+        if args[0] == "exec" and "test" in args:
+            is_file = args[-1] in file_sources
+            return MagicMock(returncode=1 if is_file else 0, stdout="", stderr="")
+        if args[0] == "cp":
+            source = args[1].split(":", 1)[1]
+            dest = Path(args[2])
+            if source.endswith("/."):
+                source = source.removesuffix("/.")
+                if source in files:
+                    (dest / files[source]).write_text("x")
+                if source in (links or {}):
+                    name, host_path = (links or {})[source]
+                    (dest / name).symlink_to(host_path)
+            elif source in file_sources:
+                dest.write_text("x")
+        rc = exec_rc if args[0] == "exec" else 0
+        return MagicMock(returncode=rc, stdout="", stderr="it failed")
+
+    return docker
+
+
+def test_record_workspace_writes_what_regrade_reads(tmp_path: Path):
+    task = _task(tmp_path, SEPARATE)
+    record = tmp_path / "record"
+    record.mkdir()
+    calls: list = []
+    docker = _fake_docker(calls, {"/workspace": "submission.json"})
+    with patch("pier.harbor_bridge._docker", docker):
+        harbor_bridge.record_workspace("pier-ws", task, record, "pier:claude-code")
+    container = harbor_bridge.get_container_name("pier-ws")
+    assert calls[0] == ("exec", container, "bash", "-c", "collect-it"), "hook first"
+    manifest = json.loads((record / "artifacts" / "manifest.json").read_text())
+    assert [(e["source"], e["status"]) for e in manifest] == [
+        ("/logs/artifacts", "empty"),
+        ("/workspace", "ok"),
+    ]
+    assert (record / "artifacts" / "workspace" / "submission.json").exists()
+    result = json.loads((record / "result.json").read_text())
+    assert result["task_name"] == "my-task"
+    assert result["agent_info"]["name"] == "pier:claude-code"
+
+
+def test_a_failing_collect_hook_warns_and_the_scoring_goes_on(tmp_path: Path, caplog):
+    """As Harbor runs collect hooks: best effort."""
+    task = _task(tmp_path, SEPARATE)
+    record = tmp_path / "record"
+    record.mkdir()
+    with patch("pier.harbor_bridge._docker", _fake_docker([], {}, exec_rc=3)):
+        harbor_bridge.record_workspace("pier-ws", task, record, "pier")
+    assert "collect hook 'collect-it' failed (exit 3" in caplog.text
+    assert (record / "result.json").exists()
+
+
+def test_a_collect_hook_runs_as_its_user_in_bash(tmp_path: Path):
+    """As Harbor runs a hook in main."""
+    toml = (
+        '[verifier]\nenvironment_mode = "separate"\n'
+        '[[verifier.collect]]\ncommand = "collect-it"\nuser = "agent"\n'
+    )
+    task = _task(tmp_path, toml)
+    record = tmp_path / "record"
+    record.mkdir()
+    calls: list = []
+    with patch("pier.harbor_bridge._docker", _fake_docker(calls, {})):
+        harbor_bridge.record_workspace("pier-ws", task, record, "pier")
+    container = harbor_bridge.get_container_name("pier-ws")
+    assert calls[0] == ("exec", "-u", "agent", container, "bash", "-c", "collect-it")
+
+
+def test_a_file_artifact_is_copied_as_a_file(tmp_path: Path):
+    toml = (
+        'artifacts = ["/workspace/out.txt"]\n'
+        '[verifier]\nenvironment_mode = "separate"\n'
+    )
+    task = _task(tmp_path, toml)
+    record = tmp_path / "record"
+    record.mkdir()
+    docker = _fake_docker([], {}, file_sources=("/workspace/out.txt",))
+    with patch("pier.harbor_bridge._docker", docker):
+        harbor_bridge.record_workspace("pier-ws", task, record, "pier")
+    assert (record / "artifacts" / "workspace" / "out.txt").is_file()
+    manifest = json.loads((record / "artifacts" / "manifest.json").read_text())
+    entry = next(e for e in manifest if e["source"] == "/workspace/out.txt")
+    assert (entry["type"], entry["status"]) == ("file", "ok")
+
+
+def test_an_artifact_lands_at_its_declared_destination(tmp_path: Path):
+    toml = (
+        'artifacts = [{source = "/workspace/results", destination = "results"}]\n'
+        '[verifier]\nenvironment_mode = "separate"\n'
+    )
+    task = _task(tmp_path, toml)
+    record = tmp_path / "record"
+    record.mkdir()
+    docker = _fake_docker([], {"/workspace/results": "scores.json"})
+    with patch("pier.harbor_bridge._docker", docker):
+        harbor_bridge.record_workspace("pier-ws", task, record, "pier")
+    assert (record / "artifacts" / "results" / "scores.json").exists()
+    manifest = json.loads((record / "artifacts" / "manifest.json").read_text())
+    entry = next(e for e in manifest if e["source"] == "/workspace/results")
+    assert entry["destination"] == "artifacts/results"
+
+
+def test_a_symlink_the_agent_left_is_not_in_the_record(tmp_path: Path, caplog):
+    """Regrade copies the record following symlinks, so one left in it would
+    copy this host's file into the scored trial."""
+    secret = tmp_path / "host-secret"
+    secret.write_text("not the agent's")
+    task = _task(tmp_path, SEPARATE)
+    record = tmp_path / "record"
+    record.mkdir()
+    docker = _fake_docker([], {}, links={"/workspace": ("leak", secret)})
+    with patch("pier.harbor_bridge._docker", docker):
+        harbor_bridge.record_workspace("pier-ws", task, record, "pier")
+    leak = record / "artifacts" / "workspace" / "leak"
+    assert not leak.exists() and not leak.is_symlink()
+    assert "artifacts/workspace/leak" in caplog.text
+    manifest = json.loads((record / "artifacts" / "manifest.json").read_text())
+    entry = next(e for e in manifest if e["source"] == "/workspace")
+    assert entry["status"] == "empty", "what the symlink was is not counted"
+
+
+def test_pier_session_data_in_the_workspace_stays_out_of_the_record(tmp_path: Path):
+    """In the container the workspace's .pier/ is an empty tmpfs, and `docker
+    cp` reads through it to pier's session and earlier trials beneath."""
+    toml = 'artifacts = ["/app"]\n[verifier]\nenvironment_mode = "separate"\n'
+    task = _task(tmp_path, toml)
+    record = tmp_path / "record"
+    record.mkdir()
+    fake = _fake_docker([], {})
+
+    def docker(*args, timeout=None):
+        if args[0] == "cp" and args[1].endswith(":/app/."):
+            dest = Path(args[2])
+            (dest / ".pier" / "trials").mkdir(parents=True)
+            (dest / ".pier" / "session.json").write_text("{}")
+            (dest / "submission.json").write_text("{}")
+        return fake(*args, timeout=timeout)
+
+    with patch("pier.harbor_bridge._docker", docker):
+        harbor_bridge.record_workspace("pier-ws", task, record, "pier")
+    workspace = record / "artifacts" / "app"
+    assert (workspace / "submission.json").exists()
+    assert list((workspace / ".pier").iterdir()) == []
+
+
+def test_an_artifact_harbor_would_collect_differently_is_refused(tmp_path: Path):
+    toml = (
+        'artifacts = [{source = "/workspace", exclude = ["*.log"]}]\n'
+        '[verifier]\nenvironment_mode = "separate"\n'
+    )
+    task = _task(tmp_path, toml)
+    record = tmp_path / "record"
+    record.mkdir()
+    with (
+        patch("pier.harbor_bridge._docker", _fake_docker([], {})),
+        pytest.raises(RuntimeError, match="excludes"),
+    ):
+        harbor_bridge.record_workspace("pier-ws", task, record, "pier")
+
+
+def test_a_container_that_will_not_stop_is_not_scored():
+    failed = MagicMock(returncode=1, stdout="", stderr="no such container")
+    with (
+        patch("pier.harbor_bridge._docker", return_value=failed),
+        pytest.raises(RuntimeError, match="not scored"),
+    ):
+        harbor_bridge.stop_workspace_container("pier-ws")
+
+
+def test_binary_agent_map_reads_the_public_registry(monkeypatch):
+    """harbor 0.23+ lists its agents with registered_names()."""
+    from harbor.agents import factory
+
+    from pier import harbor_bridge as hb
+
+    class Factory:
+        @staticmethod
+        def registered_names():
+            return ["claude-code"]
+
+    monkeypatch.setattr(factory, "AgentFactory", Factory)
+    monkeypatch.setattr(hb, "_binary_agent_map", None)
+    monkeypatch.setattr(hb, "get_agent_binary", lambda name: "claude")
+    assert hb.get_binary_agent_map() == {"claude": "claude-code"}
+
+
+def test_binary_agent_map_reads_the_private_map_before_it(monkeypatch):
+    """harbor 0.21 and 0.22 have no registered_names(), only _AGENT_MAP."""
+    import enum
+
+    from harbor.agents import factory
+
+    from pier import harbor_bridge as hb
+
+    class Name(enum.Enum):
+        CLAUDE_CODE = "claude-code"
+
+    class Factory:
+        _AGENT_MAP = {Name.CLAUDE_CODE: object}
+
+    monkeypatch.setattr(factory, "AgentFactory", Factory)
+    monkeypatch.setattr(hb, "_binary_agent_map", None)
+    monkeypatch.setattr(hb, "get_agent_binary", lambda name: "claude")
+    assert hb.get_binary_agent_map() == {"claude": "claude-code"}
+
+
+def test_binary_agent_map_finds_claude_in_the_installed_harbor(monkeypatch):
+    """Against the harbor actually installed, not a stand-in."""
+    from pier import harbor_bridge as hb
+
+    monkeypatch.setattr(hb, "_binary_agent_map", None)
+    assert hb.get_binary_agent_map().get("claude") == "claude-code"
+
+
+def test_a_symlink_one_artifact_leaves_cannot_redirect_the_next(tmp_path: Path):
+    """The first artifact plants a symlink where the second would land: it
+    must not write through it, onto this host."""
+    host_dir = tmp_path / "host-dir"
+    host_dir.mkdir()
+    toml = (
+        'artifacts = ["/workspace", {source = "/data", destination = "workspace/sub"}]\n'
+        '[verifier]\nenvironment_mode = "separate"\n'
+    )
+    task = _task(tmp_path, toml)
+    record = tmp_path / "record"
+    record.mkdir()
+    docker = _fake_docker(
+        [], {"/data": "planted.txt"}, links={"/workspace": ("sub", host_dir)}
+    )
+    with patch("pier.harbor_bridge._docker", docker):
+        harbor_bridge.record_workspace("pier-ws", task, record, "pier")
+    assert list(host_dir.iterdir()) == []
+    manifest = json.loads((record / "artifacts" / "manifest.json").read_text())
+    entry = next(e for e in manifest if e["source"] == "/data")
+    assert entry["status"] == "skipped"
+
+
+@pytest.mark.parametrize(
+    "toml,refusal",
+    [
+        (
+            '[verifier]\nenvironment_mode = "separate"\n[[steps]]\nname = "one"\n',
+            "with steps",
+        ),
+        (
+            '[environment]\nos = "windows"\n[verifier]\nenvironment_mode = "separate"\n',
+            "Windows-container",
+        ),
+    ],
+)
+def test_a_task_pier_cannot_record_is_refused_before_anything_runs(
+    tmp_path: Path, toml, refusal
+):
+    task = _task(tmp_path, toml)
+    record = tmp_path / "record"
+    record.mkdir()
+    calls: list = []
+    with (
+        patch("pier.harbor_bridge._docker", _fake_docker(calls, {})),
+        pytest.raises(RuntimeError, match=refusal),
+    ):
+        harbor_bridge.record_workspace("pier-ws", task, record, "pier")
+    assert calls == []
+
+
+def test_an_artifact_the_agent_never_wrote_stops_the_scoring(tmp_path: Path):
+    """Harbor's regrade refuses a record missing a declared artifact, so the
+    error names the artifact rather than leaving regrade to refuse."""
+    toml = (
+        'artifacts = ["/workspace/out.txt"]\n'
+        '[verifier]\nenvironment_mode = "separate"\n'
+    )
+    task = _task(tmp_path, toml)
+    record = tmp_path / "record"
+    record.mkdir()
+    fake = _fake_docker([], {}, file_sources=("/workspace/out.txt",))
+
+    def docker(*args, timeout=None):
+        if args[0] == "cp" and args[1].endswith(":/workspace/out.txt"):
+            return MagicMock(returncode=1, stdout="", stderr="no such path")
+        return fake(*args, timeout=timeout)
+
+    with (
+        patch("pier.harbor_bridge._docker", docker),
+        pytest.raises(RuntimeError, match="could not copy /workspace/out.txt"),
+    ):
+        harbor_bridge.record_workspace("pier-ws", task, record, "pier")
+    assert not (record / "result.json").exists()
+
+
+class _Accepted(Exception):
+    """Raised where Harbor's regrade first uses a record it has validated."""
+
+
+@pytest.mark.parametrize(
+    "artifacts",
+    ["", 'artifacts = ["/workspace"]\n', 'artifacts = ["/logs/artifacts"]\n'],
+)
+def test_harbor_regrade_accepts_the_record(tmp_path: Path, artifacts):
+    """Harbor's regrade checks a record before using it, and refuses one with
+    an artifact failed or skipped: the record pier writes passes."""
+    from harbor.trial.regrade import RegradeTrial
+
+    task = _task(tmp_path, artifacts + '[verifier]\nenvironment_mode = "separate"\n')
+    (task / "instruction.md").write_text("Do it.\n")
+    for part in ("environment", "tests"):
+        (task / part).mkdir()
+        (task / part / "Dockerfile").write_text("FROM alpine\n")
+    (task / "tests" / "test.sh").write_text("#!/bin/sh\n")
+    record = tmp_path / "record"
+    record.mkdir()
+    docker = _fake_docker([], {"/workspace": "out.json"})
+    with patch("pier.harbor_bridge._docker", docker):
+        harbor_bridge.record_workspace("pier-ws", task, record, "pier")
+    with (
+        patch.object(RegradeTrial, "_seed_from_source", side_effect=_Accepted()),
+        pytest.raises(RuntimeError, match="^_Accepted"),
+    ):
+        harbor_bridge.regrade(record, task, tmp_path / "trials", "scored")
+
+
+def test_scoring_stops_every_container_of_the_workspace():
+    """An overlay's services stop with main: nothing keeps running while the
+    work is scored."""
+    calls = []
+
+    def docker(*args, timeout=None):
+        calls.append(args)
+        out = "abc123\ndef456\n" if args[0] == "ps" else ""
+        return MagicMock(returncode=0, stdout=out, stderr="")
+
+    with patch("pier.harbor_bridge._docker", docker):
+        harbor_bridge.stop_workspace_container("pier-ws")
+    project = harbor_bridge.get_compose_project("pier-ws")
+    assert calls[0] == (
+        "ps",
+        "-q",
+        "--filter",
+        f"label=com.docker.compose.project={project}",
+    )
+    assert calls[1] == (
+        "stop",
+        harbor_bridge.get_container_name("pier-ws"),
+        "abc123",
+        "def456",
+    )
+
+
+def test_a_failed_agent_log_copy_stops_the_scoring(tmp_path: Path):
+    """Regrade without the agent's trajectory would score it misleadingly."""
+    task = _task(tmp_path, SEPARATE)
+    record = tmp_path / "record"
+    record.mkdir()
+    fake = _fake_docker([], {})
+
+    def docker(*args, timeout=None):
+        if args[0] == "cp" and args[1].endswith(f":{harbor_bridge.AGENT_LOGS}/."):
+            return MagicMock(returncode=1, stdout="", stderr="no such path")
+        return fake(*args, timeout=timeout)
+
+    with (
+        patch("pier.harbor_bridge._docker", docker),
+        pytest.raises(RuntimeError, match="agent's logs"),
+    ):
+        harbor_bridge.record_workspace("pier-ws", task, record, "pier")
+    assert not (record / "result.json").exists()
+
+
+def test_removing_a_workspace_finds_its_containers_by_project():
+    calls = []
+
+    def docker(*args, timeout=None):
+        calls.append(args)
+        out = "abc123\n" if args[0] == "ps" else ""
+        return MagicMock(returncode=0, stdout=out, stderr="")
+
+    with patch("pier.harbor_bridge._docker", docker):
+        assert harbor_bridge.remove_workspace_containers("pier-ws") == ["abc123"]
+    project = harbor_bridge.get_compose_project("pier-ws")
+    assert calls == [
+        ("ps", "-aq", "--filter", f"label=com.docker.compose.project={project}"),
+        ("rm", "-f", "abc123"),
+    ]

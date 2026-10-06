@@ -19,6 +19,15 @@ def runner():
     return CliRunner()
 
 
+@pytest.fixture(autouse=True)
+def _nothing_left_after_stop(monkeypatch):
+    """pier stop asks Docker what is left of the workspace; no test here
+    reaches Docker, and one that needs leftovers patches this itself."""
+    monkeypatch.setattr(
+        "pier.harbor_bridge.remove_workspace_containers", lambda hsid: []
+    )
+
+
 @pytest.fixture
 def index_path(tmp_path, monkeypatch):
     """Redirect the global index to a temp file."""
@@ -1529,6 +1538,62 @@ def test_stop_container(mock_stop, runner, index_path, tmp_path):
     # Session and workspace preserved
     assert (ws / ".pier" / "session.json").exists()
     assert ws.exists()
+
+
+@patch(
+    "pier.harbor_bridge.stop_environment",
+    side_effect=FileNotFoundError("overlay.yaml"),
+)
+def test_stop_removes_the_containers_when_the_environment_cannot_be_rebuilt(
+    mock_stop, runner, index_path, tmp_path
+):
+    """An overlay moved since start: the containers are removed by their
+    compose project rather than left running."""
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    _write_session(ws, _container_session(), index_path)
+    with patch(
+        "pier.harbor_bridge.remove_workspace_containers", return_value=["a", "b"]
+    ) as mock_remove:
+        result = runner.invoke(cli, ["stop"], catch_exceptions=False)
+    assert result.exit_code == 0, result.output
+    mock_remove.assert_called_once()
+    assert "left 2 container(s)" in result.output
+
+
+@patch("pier.harbor_bridge.stop_environment")
+def test_stop_removes_what_a_silently_failed_stop_left(
+    mock_stop, runner, index_path, tmp_path
+):
+    """Harbor logs a failed compose down and carries on: what is left of the
+    workspace is removed by its compose project all the same."""
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    _write_session(ws, _container_session(), index_path)
+    with patch(
+        "pier.harbor_bridge.remove_workspace_containers", return_value=["a"]
+    ) as mock_remove:
+        result = runner.invoke(cli, ["stop"], catch_exceptions=False)
+    assert result.exit_code == 0, result.output
+    mock_remove.assert_called_once()
+    assert "left 1 container(s)" in result.output
+
+
+@patch(
+    "pier.harbor_bridge.stop_environment",
+    side_effect=FileNotFoundError("overlay.yaml"),
+)
+def test_a_failed_stop_that_left_nothing_claims_no_cleanup(
+    mock_stop, runner, index_path, tmp_path
+):
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    _write_session(ws, _container_session(), index_path)
+    with patch("pier.harbor_bridge.remove_workspace_containers", return_value=[]):
+        result = runner.invoke(cli, ["stop"], catch_exceptions=False)
+    assert result.exit_code == 0, result.output
+    assert "no container of its compose project was left" in result.output
+    assert "removed them" not in result.output
 
 
 def test_stop_rejects_delete_flag(runner, index_path, tmp_path):
@@ -3535,3 +3600,176 @@ class TestDetectClaudeCodeSessionDir:
         empty = home / ".claude" / "projects" / slug
         empty.mkdir(parents=True)
         assert _detect_claude_code_session_dir(ws) is None
+
+
+@patch("pier.harbor_bridge.start_environment")
+def test_start_passes_and_keeps_extra_compose(
+    mock_start, runner, index_path, task_dir, tmp_path
+):
+    """--extra-docker-compose reaches the environment and is kept in the session."""
+    overlay = tmp_path / "gateway.yaml"
+    overlay.write_text("services: {}\n")
+    ws = tmp_path / "ws"
+    result = runner.invoke(
+        cli,
+        ["start", str(task_dir), "-d", str(ws), "--extra-docker-compose", str(overlay)],
+        catch_exceptions=False,
+    )
+    assert result.exit_code == 0
+    assert mock_start.call_args[1]["extra_compose"] == [str(overlay.resolve())]
+    sess = json.loads((ws / ".pier" / "session.json").read_text())
+    assert sess["extra_compose"] == [str(overlay.resolve())]
+
+
+@patch("pier.harbor_bridge.is_environment_running", return_value=False)
+@patch("pier.harbor_bridge.start_environment")
+def test_restart_keeps_extra_compose(
+    mock_start, mock_running, runner, index_path, task_dir, tmp_path
+):
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    sess = _container_session(task_dir=str(task_dir))
+    sess["extra_compose"] = ["/overlays/gateway.yaml"]
+    _write_session(ws, sess, index_path)
+    result = runner.invoke(
+        cli, ["start", str(task_dir), "-d", str(ws)], catch_exceptions=False
+    )
+    assert result.exit_code == 0
+    assert mock_start.call_args[1]["extra_compose"] == ["/overlays/gateway.yaml"]
+
+
+@patch("pier.cli._assemble_trial_output")
+@patch("pier.harbor_bridge.verify_environment", return_value={"reward": 1.0})
+@patch("pier.harbor_bridge.is_environment_running", return_value=True)
+def test_verify_uses_the_session_extra_compose(
+    mock_running, mock_verify, mock_assemble, runner, index_path, task_dir, tmp_path
+):
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    sess = _container_session(task_dir=str(task_dir))
+    sess["extra_compose"] = ["/overlays/gateway.yaml"]
+    _write_session(ws, sess, index_path)
+    result = runner.invoke(cli, ["verify"], catch_exceptions=False)
+    assert result.exit_code == 0
+    assert mock_verify.call_args[1]["extra_compose"] == ["/overlays/gateway.yaml"]
+
+
+@patch("pier.harbor_bridge.stop_environment")
+def test_stop_brings_down_the_extra_compose_services(
+    mock_stop, runner, index_path, tmp_path
+):
+    """A stop without the overlay's services would leave their containers running."""
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    sess = _container_session()
+    sess["extra_compose"] = ["/overlays/gateway.yaml"]
+    _write_session(ws, sess, index_path)
+    result = runner.invoke(cli, ["stop"], catch_exceptions=False)
+    assert result.exit_code == 0
+    assert mock_stop.call_args[1]["extra_compose"] == ["/overlays/gateway.yaml"]
+
+
+def test_start_host_rejects_extra_compose(runner, index_path, task_dir, tmp_path):
+    overlay = tmp_path / "gateway.yaml"
+    overlay.write_text("services: {}\n")
+    result = runner.invoke(
+        cli,
+        [
+            "start",
+            str(task_dir),
+            "--host",
+            "-d",
+            str(tmp_path / "ws"),
+            "--extra-docker-compose",
+            str(overlay),
+        ],
+    )
+    assert result.exit_code != 0
+    assert "--extra-docker-compose" in result.output
+
+
+# ---------------------------------------------------------------------------
+# pier verify, a task scored apart ([verifier] environment_mode = "separate")
+# ---------------------------------------------------------------------------
+
+
+def _scored_apart(task_dir: Path) -> None:
+    (task_dir / "task.toml").write_text(
+        'artifacts = ["/workspace"]\n[metadata]\nauthor_name = "test"\n'
+        '[environment]\n[verifier]\nenvironment_mode = "separate"\n[agent]\n'
+    )
+
+
+@patch("pier.cli._assemble_trial_output")
+@patch("pier.harbor_bridge.verify_environment")
+@patch("pier.harbor_bridge.is_environment_running", return_value=True)
+def test_verify_scores_apart_when_the_task_declares_it(
+    mock_running, mock_verify, mock_assemble, runner, index_path, task_dir, tmp_path
+):
+    """The work is recorded, the workspace's container stopped, then the record
+    regraded; the workspace's own verifier never runs."""
+    _scored_apart(task_dir)
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    _write_session(
+        ws,
+        _container_session(task_dir=str(task_dir), agents=["claude-code"]),
+        index_path,
+    )
+    calls = MagicMock()
+    calls.regrade.return_value = {"reward": 1.0}
+    with (
+        patch("pier.harbor_bridge.record_workspace", calls.record_workspace),
+        patch("pier.harbor_bridge.stop_workspace_container", calls.stop),
+        patch("pier.harbor_bridge.regrade", calls.regrade),
+    ):
+        result = runner.invoke(cli, ["verify"], catch_exceptions=False)
+    assert result.exit_code == 0, result.output
+    assert "Scoring apart" in result.output
+    mock_verify.assert_not_called()
+    assert [c[0] for c in calls.mock_calls] == ["record_workspace", "stop", "regrade"]
+    record_args = calls.record_workspace.call_args[0]
+    assert record_args[3] == "pier:claude-code"
+    record, task, trials_dir, name = calls.regrade.call_args[0]
+    assert task == task_dir and name == "scored"
+    assert record == trials_dir / "record"
+
+
+@patch("pier.cli._assemble_trial_output")
+@patch("pier.harbor_bridge.verify_environment", return_value={"reward": 1.0})
+@patch("pier.harbor_bridge.is_environment_running", return_value=True)
+def test_verify_scores_in_the_workspace_when_the_task_does_not_say_otherwise(
+    mock_running, mock_verify, mock_assemble, runner, index_path, task_dir, tmp_path
+):
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    _write_session(ws, _container_session(task_dir=str(task_dir)), index_path)
+    with (
+        patch("pier.harbor_bridge.regrade") as mock_regrade,
+        patch("pier.harbor_bridge.stop_workspace_container") as mock_stop,
+    ):
+        result = runner.invoke(cli, ["verify"], catch_exceptions=False)
+    assert result.exit_code == 0
+    mock_verify.assert_called_once()
+    mock_regrade.assert_not_called()
+    mock_stop.assert_not_called()
+
+
+@patch(
+    "pier.harbor_bridge.get_binary_agent_map",
+    return_value={"kimi": "kimi-code"},
+)
+@patch("pier.harbor_bridge.get_agent_binary", return_value="kimi")
+@patch("pier.harbor_bridge.is_environment_running", return_value=True)
+def test_exec_detects_the_session_s_agent_when_two_share_a_binary(
+    mock_running, mock_binary, mock_map, runner, index_path, tmp_path
+):
+    """harbor's kimi-cli and kimi-code both run `kimi`; the one set up wins."""
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    _write_session(ws, _container_session(agents=["kimi-cli"]), index_path)
+    with patch("subprocess.run", return_value=MagicMock(returncode=0)) as mock_run:
+        runner.invoke(cli, ["exec", "kimi", "--version"])
+    args = mock_run.call_args[0][0]
+    cmd_str = args[args.index("-c") + 1]
+    assert "kimi-cli.txt" in cmd_str
