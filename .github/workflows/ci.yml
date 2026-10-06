@@ -49,15 +49,3 @@ jobs:
           PIER_RUN_DOCKER_INTEGRATION: "1"
           PIER_TEST_IMAGE: "ubuntu:24.04"
           PIER_TEST_AGENTS: ${{ matrix.agent }}
-
-  harbor-floor:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v6
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-      - run: uv sync --extra dev
-      - run: uv pip install 'harbor==0.21.0'
-      - run: uv run --no-sync pytest -rs

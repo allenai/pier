@@ -26,7 +26,6 @@ import asyncio
 import contextlib
 import json
 import logging
-import math
 import os
 import re
 import subprocess
@@ -232,9 +231,10 @@ def _make_environment(
 ):
     """Reconstruct a Harbor Docker environment from pier session data.
 
-    The environment object is stateless; operations reuse *extra_compose*
-    from the session. Stop falls back to project labels if Compose cleanup
-    cannot run.
+    Called for every container operation (exec, verify, stop) since the
+    environment object is stateless — the running Docker container is the
+    actual state. So *extra_compose* must be the same list on every call: a
+    stop without an overlay's services leaves their containers running.
 
     Fragility: EnvironmentFactory is not in Harbor's public __all__.
     If Harbor reorganizes its package, update the import below.
@@ -488,14 +488,16 @@ def create_synthetic_task_dir(image: str, temp_root: Path) -> Path:
 
 def _claude_config_dir() -> str:
     """Return the CLAUDE_CONFIG_DIR path used inside Harbor containers."""
-    from harbor.agents.installed.claude_code import EnvironmentPaths
+    # Where harbor defines it: 0.24 stopped re-exporting it from the agents.
+    from harbor.models.trial.paths import EnvironmentPaths
 
     return (EnvironmentPaths.agent_dir / "sessions").as_posix()
 
 
 def _codex_home_dir() -> str:
     """Return the CODEX_HOME path used inside Harbor containers."""
-    from harbor.agents.installed.codex import EnvironmentPaths
+    # Where harbor defines it: 0.24 stopped re-exporting it from the agents.
+    from harbor.models.trial.paths import EnvironmentPaths
 
     return EnvironmentPaths.agent_dir.as_posix()
 
@@ -652,48 +654,16 @@ def stop_environment(
     # Harbor reconstructs the environment on stop, resolving task env vars.
     # Set placeholders for missing vars so stop doesn't fail.
     # TODO: Harbor should not require env vars for stop.
-    cleanup_error: Exception | None = None
-    try:
-        with _placeholder_task_env_vars(task_dir):
-            asyncio.run(
-                _async_stop_environment(
-                    task_dir,
-                    harbor_session_id,
-                    trial_dir,
-                    delete=delete,
-                    extra_compose=extra_compose,
-                )
+    with _placeholder_task_env_vars(task_dir):
+        asyncio.run(
+            _async_stop_environment(
+                task_dir,
+                harbor_session_id,
+                trial_dir,
+                delete=delete,
+                extra_compose=extra_compose,
             )
-    except Exception as exc:
-        cleanup_error = exc
-
-    # Harbor can also log a failed Compose down without raising. Query the
-    # actual project so missing or changed overlays cannot leave services live.
-    project_filter = (
-        f"label=com.docker.compose.project={get_compose_project(harbor_session_id)}"
-    )
-    running = _docker("ps", "-q", "--filter", project_filter)
-    if running.returncode:
-        raise RuntimeError(
-            "could not list workspace containers: " + running.stderr.strip()
         )
-    containers = running.stdout.split()
-    if containers:
-        stopped = _docker("stop", *containers)
-        if stopped.returncode:
-            raise RuntimeError(
-                "could not stop workspace containers: " + stopped.stderr.strip()
-            )
-        remaining = _docker("ps", "-q", "--filter", project_filter)
-        if remaining.returncode or remaining.stdout.strip():
-            raise RuntimeError("workspace containers are still running")
-    if cleanup_error is not None or containers:
-        message = "workspace stopped, but Compose cleanup was incomplete; resources were retained"
-        if cleanup_error is not None:
-            message += f": {cleanup_error}"
-        if delete:
-            raise RuntimeError(message)
-        logger.warning(message)
 
 
 @contextlib.contextmanager
@@ -749,27 +719,22 @@ def _declared_artifacts(task_dir: Path) -> list:
     """The artifacts to collect: the convention's and the task's own, as
     Harbor's ``ArtifactConfig``.
 
-    Entries with excludes are refused rather than collected differently
-    from how Harbor collects them."""
+    An entry with excludes, or from a service other than main, is refused
+    rather than collected differently from how Harbor collects it."""
     from harbor.models.task.config import ArtifactConfig, TaskConfig
 
     config = TaskConfig.model_validate_toml((task_dir / "task.toml").read_text())
-    entries = []
+    entries = [ArtifactConfig(source=ARTIFACTS_CONVENTION)]
     for entry in config.artifacts:
         if isinstance(entry, str):
             entries.append(ArtifactConfig(source=entry))
             continue
-        if entry.exclude:
+        if entry.exclude or (entry.service or "main") != "main":
             raise RuntimeError(
-                f"artifact {entry.source}: excludes are not collected by pier verify yet"
+                f"artifact {entry.source}: excludes and services other than "
+                "main are not collected by pier verify yet"
             )
         entries.append(entry)
-    if not any(
-        entry.source.rstrip("/") == ARTIFACTS_CONVENTION
-        and (entry.service or "main") == "main"
-        for entry in entries
-    ):
-        entries.insert(0, ArtifactConfig(source=ARTIFACTS_CONVENTION))
     return entries
 
 
@@ -780,9 +745,6 @@ def _drop_symlinks(root: Path) -> list[Path]:
     the record following symlinks, so one would resolve on this host rather
     than in the container: a host file copied into the scored trial."""
     dropped: list[Path] = []
-    if root.is_symlink():
-        root.unlink()
-        return [root]
     for dirpath, dirnames, filenames in os.walk(root):
         for name in [*dirnames, *filenames]:
             path = Path(dirpath) / name
@@ -792,134 +754,80 @@ def _drop_symlinks(root: Path) -> list[Path]:
     return dropped
 
 
-def _check_record_target(record: Path, target: Path) -> None:
-    if not target.resolve().is_relative_to(record.resolve()):
-        raise RuntimeError(f"record destination {target} resolves outside the record")
-    for path in [target, *target.parents]:
-        if path == record:
-            break
-        if path.is_symlink():
-            raise RuntimeError(f"record destination {target} contains a symlink")
-
-
-def _remove_record_symlinks(root: Path, record: Path) -> None:
-    for link in _drop_symlinks(root):
-        logger.warning(
-            "left %s out of the scored record: it is a symlink, which would "
-            "resolve on this host",
-            link.relative_to(record).as_posix(),
-        )
-
-
-def _service_container(harbor_session_id: str, service: str) -> str:
-    if service == "main":
-        return get_container_name(harbor_session_id)
-    found = _docker(
-        "ps",
-        "-aq",
-        "--filter",
-        f"label=com.docker.compose.project={get_compose_project(harbor_session_id)}",
-        "--filter",
-        f"label=com.docker.compose.service={service}",
-    )
-    containers = found.stdout.split()
-    if found.returncode or len(containers) != 1:
-        raise RuntimeError(f"expected one workspace container for service {service!r}")
-    return containers[0]
-
-
 def record_workspace(
     harbor_session_id: str, task_dir: Path, record: Path, agent_name: str
 ) -> None:
     """The workspace's work, as a trial record Harbor's regrade reads: the
     task's collect hooks run in the container, then its artifacts and the
     agent's logs copied out, with the manifest and result.json beside them."""
-    from harbor.models.task.config import (
-        ArtifactConfig,
-        TaskConfig,
-        VerifierCollectConfig,
-    )
+    from harbor.models.task.config import TaskConfig
     from harbor.models.trial.artifact_manifest import ArtifactManifestEntry
     from harbor.trial.artifact_handler import artifact_host_path
 
+    container = get_container_name(harbor_session_id)
     config = TaskConfig.model_validate_toml((task_dir / "task.toml").read_text())
     if config.steps:
         raise RuntimeError(
             "a task with steps is not scored apart by pier verify yet: its record "
-            "would need each step's results; use harbor run to record each step"
+            "would need each step's results"
         )
-    artifacts_dir = record / "artifacts"
-    if any(
-        not math.isfinite(h.timeout_sec) or h.timeout_sec <= 0
-        for h in config.verifier.collect
-    ):
-        raise RuntimeError("collect hook timeout must be finite and greater than zero")
-    artifacts = _declared_artifacts(task_dir)
-    for artifact in artifacts:
-        target = artifact_host_path(artifacts_dir, artifact)
-        _check_record_target(record, target)
-        manifest_path = artifacts_dir / "manifest.json"
-        if target == manifest_path or target in manifest_path.parents:
+    for hook in config.verifier.collect:
+        if (hook.service or "main") != "main":
             raise RuntimeError(
-                f"artifact {artifact.source}: overlapping the record manifest is not supported"
+                f"collect hook {hook.command!r} runs in {hook.service!r}; "
+                "pier verify runs hooks in main only"
             )
-
-    def run_hook(hook: VerifierCollectConfig) -> None:
         # As Harbor runs them: as the hook's user, and best effort, so a hook
         # that fails leaves its output out rather than stopping the scoring.
         user = ["-u", str(hook.user)] if hook.user is not None else []
         try:
-            container = _service_container(harbor_session_id, hook.service or "main")
             ran = _docker(
                 "exec",
                 *user,
                 container,
-                "timeout",
-                "-s",
-                "KILL",
-                f"{hook.timeout_sec:g}",
                 "sh",
                 "-c",
                 hook.command,
-                timeout=hook.timeout_sec + 10,
+                timeout=hook.timeout_sec,
             )
             failed = (
                 f"exit {ran.returncode}: " + (ran.stderr or ran.stdout).strip()[-300:]
                 if ran.returncode
                 else ""
             )
-        except subprocess.TimeoutExpired as exc:
-            raise RuntimeError(
-                "collect hook client timed out; cannot confirm the hook stopped"
-            ) from exc
-        except (RuntimeError, OSError) as exc:
-            failed = str(exc)
+        except subprocess.TimeoutExpired:
+            failed = f"timed out after {hook.timeout_sec:g}s"
         if failed:
             logger.warning("collect hook %r failed (%s)", hook.command, failed)
 
-    collected: list[tuple[ArtifactConfig, str, Path, bool]] = []
-    skipped: list[tuple[ArtifactConfig, str]] = []
-
-    def collect(artifact: ArtifactConfig) -> None:
+    artifacts_dir = record / "artifacts"
+    inside = record.resolve()
+    collected: list[tuple[str, str, Path, bool]] = []
+    skipped: list[tuple[str, str]] = []
+    dropped: list[Path] = []
+    for artifact in _declared_artifacts(task_dir):
         source = artifact.source
         target = artifact_host_path(artifacts_dir, artifact)
-        _check_record_target(record, target)
         destination = (
             "artifacts"
             if target == artifacts_dir
             else f"artifacts/{target.relative_to(artifacts_dir).as_posix()}"
         )
+        # As Harbor collects: an artifact overlapping one collected before it
+        # is left out, so nothing one copy left can lie on another's path.
         earlier = [t for _, _, t, _ in collected]
         if any(
             target == t or t in target.parents or target in t.parents for t in earlier
         ):
             logger.warning(
-                "artifact %s overlaps one collected before it; left out, as Harbor leaves it",
+                "artifact %s overlaps one collected before it; left out, as Harbor "
+                "leaves it",
                 source,
             )
-            skipped.append((artifact, destination))
-            return
-        container = _service_container(harbor_session_id, artifact.service or "main")
+            skipped.append((source, destination))
+            continue
+        if not target.resolve().is_relative_to(inside):
+            raise RuntimeError(f"artifact {source} would be written outside the record")
         is_dir = _docker("exec", "-u", "root", container, "test", "-d", source)
         if is_dir.returncode == 0:
             target.mkdir(parents=True, exist_ok=True)
@@ -932,64 +840,43 @@ def record_workspace(
                 f"could not copy {source} out of the workspace: "
                 + copied.stderr.strip()[-300:]
             )
-        _remove_record_symlinks(target, record)
-        collected.append((artifact, destination, target, is_dir.returncode == 0))
-
-    for hook in config.verifier.collect:
-        if (hook.service or "main") == "main":
-            run_hook(hook)
-    for artifact in artifacts:
-        if (artifact.service or "main") == "main":
-            collect(artifact)
-    agent_dir = record / "agent"
-    _check_record_target(record, agent_dir)
-    agent_dir.mkdir(exist_ok=True)
-    container = get_container_name(harbor_session_id)
-    copied = _docker("cp", f"{container}:{AGENT_LOGS}/.", str(agent_dir))
+        collected.append((source, destination, target, is_dir.returncode == 0))
+        dropped += _drop_symlinks(record)
+    (record / "agent").mkdir(exist_ok=True)
+    copied = _docker("cp", f"{container}:{AGENT_LOGS}/.", str(record / "agent"))
     if copied.returncode:
         raise RuntimeError(
-            "could not copy agent logs out of the workspace: "
-            + copied.stderr.strip()[-300:]
+            "could not copy the agent's logs out of the workspace, so it was not "
+            "scored: " + copied.stderr.strip()[-300:]
         )
-    _remove_record_symlinks(agent_dir, record)
-
-    sidecar_hooks = [
-        h for h in config.verifier.collect if (h.service or "main") != "main"
-    ]
-    sidecar_artifacts = [a for a in artifacts if (a.service or "main") != "main"]
-    if sidecar_hooks or sidecar_artifacts:
-        _stop_workspace_main_container(harbor_session_id)
-        for hook in sidecar_hooks:
-            run_hook(hook)
-        for artifact in sidecar_artifacts:
-            collect(artifact)
+    dropped += _drop_symlinks(record)
+    for link in dropped:
+        logger.warning(
+            "left %s out of the scored record: it is a symlink, which would "
+            "resolve on this host",
+            link.relative_to(record).as_posix(),
+        )
 
     manifest = []
-    for artifact, destination, target, a_directory in collected:
+    for source, destination, target, a_directory in collected:
         if a_directory:
             kind, status = "directory", "ok" if any(target.iterdir()) else "empty"
         else:
             kind, status = "file", "ok" if target.is_file() else "failed"
         manifest.append(
             ArtifactManifestEntry(
-                source=artifact.source,
-                destination=destination,
-                type=kind,
-                status=status,
-                service=artifact.service,
+                source=source, destination=destination, type=kind, status=status
             ).model_dump(mode="json")
         )
-    for artifact, destination in skipped:
+    for source, destination in skipped:
         manifest.append(
             ArtifactManifestEntry(
-                source=artifact.source,
+                source=source,
                 destination=destination,
-                type="file" if Path(artifact.source).suffix else "directory",
+                type="file" if Path(source).suffix else "directory",
                 status="skipped",
-                service=artifact.service,
             ).model_dump(mode="json")
         )
-    _check_record_target(record, artifacts_dir / "manifest.json")
     (artifacts_dir / "manifest.json").write_text(json.dumps(manifest, indent=2))
 
     name = config.task.name if config.task is not None else task_dir.name
@@ -1008,10 +895,30 @@ def record_workspace(
         "agent_info": {"name": agent_name, "version": "", "model_info": None},
         "started_at": datetime.now().astimezone().isoformat(),
     }
-    _check_record_target(record, record / "result.json")
-    _check_record_target(record, record / "config.json")
     (record / "result.json").write_text(json.dumps(result, indent=2))
     (record / "config.json").write_text(json.dumps(trial_config, indent=2))
+
+
+def remove_workspace_containers(harbor_session_id: str) -> list[str]:
+    """Remove every container of the workspace's compose project, found by its
+    label, and return their ids: what stopping does when the environment cannot
+    be rebuilt, say because an overlay it was started with has moved."""
+    project = get_compose_project(harbor_session_id)
+    listed = _docker(
+        "ps", "-aq", "--filter", f"label=com.docker.compose.project={project}"
+    )
+    if listed.returncode:
+        raise RuntimeError(
+            "could not list the workspace's containers: " + listed.stderr.strip()
+        )
+    ids = listed.stdout.split()
+    if ids:
+        removed = _docker("rm", "-f", *ids)
+        if removed.returncode:
+            raise RuntimeError(
+                "could not remove the workspace's containers: " + removed.stderr.strip()
+            )
+    return ids
 
 
 def stop_workspace_container(harbor_session_id: str) -> None:
@@ -1035,32 +942,6 @@ def stop_workspace_container(harbor_session_id: str) -> None:
         raise RuntimeError(
             "could not stop the workspace's container, so it was not scored: "
             + stopped.stderr.strip()
-        )
-
-
-def _stop_workspace_main_container(harbor_session_id: str) -> None:
-    """Stop the workspace's container, keeping it for `pier start` to restart:
-    nothing the agent left running there runs while it is scored."""
-    stopped = _docker("stop", get_container_name(harbor_session_id))
-    if stopped.returncode:
-        raise RuntimeError(
-            "could not stop the workspace's container, so it was not scored: "
-            + stopped.stderr.strip()
-        )
-
-
-def stop_workspace_environment(harbor_session_id: str) -> None:
-    """Stop the workspace and verify that every Compose service is stopped."""
-    stop_workspace_container(harbor_session_id)
-    remaining = _docker(
-        "ps",
-        "-q",
-        "--filter",
-        f"label=com.docker.compose.project={get_compose_project(harbor_session_id)}",
-    )
-    if remaining.returncode or remaining.stdout.strip():
-        raise RuntimeError(
-            "workspace containers are still running, so it was not scored"
         )
 
 

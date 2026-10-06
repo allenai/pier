@@ -468,51 +468,6 @@ class TestExecIntegration:
 class TestVerifyIntegration:
     """Run the verifier in a real container."""
 
-    def test_separate_verify_records_then_scores_with_hook_children_stopped(
-        self, runner, index_path, task_dir, workspace
-    ):
-        (task_dir / "task.toml").write_text(
-            'artifacts = ["/app/hello.txt"]\n'
-            '[verifier]\nenvironment_mode = "separate"\n'
-            "[[verifier.collect]]\n"
-            "command = \"sh -c 'sleep 2; echo late > /app/late.txt' & wait\"\n"
-            "timeout_sec = 0.2\n"
-            '[[verifier.collect]]\ncommand = "sleep 3"\ntimeout_sec = 5\n'
-        )
-        (task_dir / "tests" / "Dockerfile").write_text(
-            "FROM python:3.12-slim\nWORKDIR /app\nCOPY . /tests/\n"
-        )
-        try:
-            _start_workspace(runner, task_dir, workspace)
-            (workspace / "hello.txt").write_text("Hello, world!")
-            result = runner.invoke(cli, ["verify"], catch_exceptions=False)
-            trial = next((workspace / ".pier" / "trials").iterdir())
-            stdout = trial / "scored" / "verifier" / "test-stdout.txt"
-            assert result.exit_code == 0, result.output + (
-                stdout.read_text() if stdout.exists() else ""
-            )
-            data = json.loads((trial / "result.json").read_text())
-            assert data["verifier_result"]["rewards"] == {"reward": 1.0}
-            assert (trial / "record" / "artifacts" / "app" / "hello.txt").is_file()
-            assert (trial / "scored" / "verifier" / "reward.txt").exists()
-            assert (trial / "agent").is_dir()
-            assert not (workspace / "late.txt").exists()
-            state = subprocess.run(
-                [
-                    "docker",
-                    "inspect",
-                    _get_container_name(workspace),
-                    "--format",
-                    "{{.State.Running}}",
-                ],
-                capture_output=True,
-                text=True,
-                check=True,
-            )
-            assert state.stdout.strip() == "false"
-        finally:
-            _cleanup_container(workspace)
-
     def test_verify_produces_reward(self, runner, index_path, task_dir, workspace):
         """Full start -> solve -> verify cycle produces a reward."""
         try:

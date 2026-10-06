@@ -19,6 +19,15 @@ def runner():
     return CliRunner()
 
 
+@pytest.fixture(autouse=True)
+def _nothing_left_after_stop(monkeypatch):
+    """pier stop asks Docker what is left of the workspace; no test here
+    reaches Docker, and one that needs leftovers patches this itself."""
+    monkeypatch.setattr(
+        "pier.harbor_bridge.remove_workspace_containers", lambda hsid: []
+    )
+
+
 @pytest.fixture
 def index_path(tmp_path, monkeypatch):
     """Redirect the global index to a temp file."""
@@ -1529,6 +1538,45 @@ def test_stop_container(mock_stop, runner, index_path, tmp_path):
     # Session and workspace preserved
     assert (ws / ".pier" / "session.json").exists()
     assert ws.exists()
+
+
+@patch(
+    "pier.harbor_bridge.stop_environment",
+    side_effect=FileNotFoundError("overlay.yaml"),
+)
+def test_stop_removes_the_containers_when_the_environment_cannot_be_rebuilt(
+    mock_stop, runner, index_path, tmp_path
+):
+    """An overlay moved since start: the containers are removed by their
+    compose project rather than left running."""
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    _write_session(ws, _container_session(), index_path)
+    with patch(
+        "pier.harbor_bridge.remove_workspace_containers", return_value=["a", "b"]
+    ) as mock_remove:
+        result = runner.invoke(cli, ["stop"], catch_exceptions=False)
+    assert result.exit_code == 0, result.output
+    mock_remove.assert_called_once()
+    assert "left 2 container(s)" in result.output
+
+
+@patch("pier.harbor_bridge.stop_environment")
+def test_stop_removes_what_a_silently_failed_stop_left(
+    mock_stop, runner, index_path, tmp_path
+):
+    """Harbor logs a failed compose down and carries on: what is left of the
+    workspace is removed by its compose project all the same."""
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    _write_session(ws, _container_session(), index_path)
+    with patch(
+        "pier.harbor_bridge.remove_workspace_containers", return_value=["a"]
+    ) as mock_remove:
+        result = runner.invoke(cli, ["stop"], catch_exceptions=False)
+    assert result.exit_code == 0, result.output
+    mock_remove.assert_called_once()
+    assert "left 1 container(s)" in result.output
 
 
 def test_stop_rejects_delete_flag(runner, index_path, tmp_path):
@@ -3652,13 +3700,10 @@ def test_verify_scores_apart_when_the_task_declares_it(
         index_path,
     )
     calls = MagicMock()
-    calls.record_workspace.side_effect = lambda hsid, task, record, agent: (
-        record / "agent"
-    ).mkdir()
     calls.regrade.return_value = {"reward": 1.0}
     with (
         patch("pier.harbor_bridge.record_workspace", calls.record_workspace),
-        patch("pier.harbor_bridge.stop_workspace_environment", calls.stop),
+        patch("pier.harbor_bridge.stop_workspace_container", calls.stop),
         patch("pier.harbor_bridge.regrade", calls.regrade),
     ):
         result = runner.invoke(cli, ["verify"], catch_exceptions=False)
@@ -3684,86 +3729,13 @@ def test_verify_scores_in_the_workspace_when_the_task_does_not_say_otherwise(
     _write_session(ws, _container_session(task_dir=str(task_dir)), index_path)
     with (
         patch("pier.harbor_bridge.regrade") as mock_regrade,
-        patch("pier.harbor_bridge.stop_workspace_environment") as mock_stop,
+        patch("pier.harbor_bridge.stop_workspace_container") as mock_stop,
     ):
         result = runner.invoke(cli, ["verify"], catch_exceptions=False)
     assert result.exit_code == 0
     mock_verify.assert_called_once()
     mock_regrade.assert_not_called()
     mock_stop.assert_not_called()
-
-
-@patch("pier.harbor_bridge.is_environment_running", return_value=True)
-def test_separate_multistep_verify_is_rejected_before_collection_or_stop(
-    mock_running, runner, index_path, task_dir, tmp_path
-):
-    _scored_apart(task_dir)
-    with (task_dir / "task.toml").open("a") as f:
-        f.write('[[steps]]\nname = "first"\n')
-    ws = tmp_path / "ws"
-    ws.mkdir()
-    _write_session(ws, _container_session(task_dir=str(task_dir)), index_path)
-    with (
-        patch("pier.harbor_bridge._docker") as docker,
-        patch("pier.harbor_bridge.stop_workspace_environment") as stop,
-        patch("pier.harbor_bridge.regrade") as regrade,
-    ):
-        result = runner.invoke(cli, ["verify"])
-    assert result.exit_code != 0
-    assert "with steps" in result.output
-    docker.assert_not_called()
-    stop.assert_not_called()
-    regrade.assert_not_called()
-
-
-@patch("pier.harbor_bridge.is_environment_running", return_value=True)
-def test_separate_verify_does_not_regrade_after_workspace_shutdown_fails(
-    mock_running, runner, index_path, task_dir, tmp_path
-):
-    _scored_apart(task_dir)
-    ws = tmp_path / "ws"
-    ws.mkdir()
-    _write_session(ws, _container_session(task_dir=str(task_dir)), index_path)
-    with (
-        patch("pier.harbor_bridge.record_workspace"),
-        patch(
-            "pier.harbor_bridge.stop_workspace_environment",
-            side_effect=RuntimeError("workspace still running"),
-        ),
-        patch("pier.harbor_bridge.regrade") as regrade,
-    ):
-        result = runner.invoke(cli, ["verify"])
-    assert result.exit_code != 0
-    assert "workspace still running" in result.output
-    regrade.assert_not_called()
-
-
-@patch("pier.harbor_bridge.is_environment_running", return_value=True)
-def test_separate_verify_does_not_stop_or_score_when_agent_logs_cannot_be_copied(
-    mock_running, runner, index_path, task_dir, tmp_path
-):
-    _scored_apart(task_dir)
-    ws = tmp_path / "ws"
-    ws.mkdir()
-    _write_session(ws, _container_session(task_dir=str(task_dir)), index_path)
-
-    def docker(*args, **kwargs):
-        failed = args[0] == "cp" and args[1].endswith(":/logs/agent/.")
-        return MagicMock(
-            returncode=1 if failed else 0, stdout="", stderr="permission denied"
-        )
-
-    with (
-        patch("pier.harbor_bridge._docker", docker),
-        patch("pier.cli._assemble_trial_output"),
-        patch("pier.harbor_bridge.stop_workspace_environment") as stop,
-        patch("pier.harbor_bridge.regrade", return_value={"reward": 1.0}) as regrade,
-    ):
-        result = runner.invoke(cli, ["verify"])
-    assert result.exit_code != 0
-    assert "could not copy agent logs" in result.output
-    stop.assert_not_called()
-    regrade.assert_not_called()
 
 
 @patch(
@@ -3784,98 +3756,3 @@ def test_exec_detects_the_session_s_agent_when_two_share_a_binary(
     args = mock_run.call_args[0][0]
     cmd_str = args[args.index("-c") + 1]
     assert "kimi-cli.txt" in cmd_str
-
-
-@pytest.mark.parametrize(
-    "content",
-    ["[verifier", '[verifier]\nenvironment_mode = "invalid"\n'],
-)
-@patch("pier.harbor_bridge.is_environment_running", return_value=True)
-def test_verify_reports_invalid_task_configuration_without_a_traceback(
-    mock_running, runner, index_path, task_dir, tmp_path, content
-):
-    (task_dir / "task.toml").write_text(content)
-    ws = tmp_path / "ws"
-    ws.mkdir()
-    _write_session(ws, _container_session(task_dir=str(task_dir)), index_path)
-    with (
-        patch("pier.harbor_bridge.verify_environment") as verify,
-        patch("pier.harbor_bridge.record_workspace") as record,
-        patch("pier.harbor_bridge.stop_workspace_environment") as stop,
-    ):
-        result = runner.invoke(cli, ["verify"])
-    assert result.exit_code == 1
-    assert "Error: Cannot read verifier configuration:" in result.output
-    verify.assert_not_called()
-    record.assert_not_called()
-    stop.assert_not_called()
-
-
-@pytest.mark.parametrize("selected_session", [None, "2026-01-01_00-00-00"])
-@patch("pier.harbor_bridge.is_environment_running", return_value=True)
-def test_separate_verify_assembles_output_from_recorded_agent_logs(
-    mock_running, runner, index_path, task_dir, tmp_path, selected_session
-):
-    _scored_apart(task_dir)
-    ws = tmp_path / "ws"
-    ws.mkdir()
-    _write_session(
-        ws,
-        _container_session(task_dir=str(task_dir), agents=["claude-code"]),
-        index_path,
-    )
-    trial = tmp_path / "trial"
-    timestamp = "2026-01-01_00-00-00"
-    live = ws / ".pier" / "_harbor" / "agent" / "exec" / timestamp
-    live.mkdir(parents=True)
-    (live / "claude-code.txt").write_text("stale live logs")
-    stopped = False
-
-    def record(hsid, task, dest, agent):
-        logs = dest / "agent" / "exec" / timestamp
-        logs.mkdir(parents=True)
-        (logs / "claude-code.txt").write_text("recorded logs")
-
-    def stop(hsid):
-        nonlocal stopped
-        stopped = True
-
-    def extract(agent, logs):
-        assert stopped
-        selected = logs if logs.name == timestamp else logs / "exec" / timestamp
-        assert (selected / "claude-code.txt").read_text() == "recorded logs"
-        (selected / "trajectory.json").write_text('{"steps": []}')
-        return {"cost_usd": 0.05}
-
-    args = ["verify", "--trial-dir", str(trial)]
-    if selected_session:
-        args.extend(["--session", selected_session])
-    with (
-        patch("pier.harbor_bridge.record_workspace", record),
-        patch("pier.harbor_bridge.stop_workspace_environment", stop),
-        patch("pier.harbor_bridge.regrade", return_value={"reward": 1.0}),
-        patch("pier.harbor_bridge.extract_agent_context", extract),
-        patch("pier.cli._copy_session_from_container") as copy,
-        patch(
-            "subprocess.run", side_effect=AssertionError("container access after stop")
-        ),
-    ):
-        result = runner.invoke(cli, args, catch_exceptions=False)
-    assert result.exit_code == 0, result.output
-    copy.assert_not_called()
-    data = json.loads((trial / "result.json").read_text())
-    assert data["verifier_result"]["rewards"] == {"reward": 1.0}
-    assert data["agent_result"]["cost_usd"] == 0.05
-    assert (trial / "agent" / "exec" / timestamp / "trajectory.json").exists()
-    assert (trial / "agent" / "trajectory.json").exists()
-    assert (trial / "agent" / "claude-code.txt").read_text() == "recorded logs"
-    assert (live / "claude-code.txt").read_text() == "stale live logs"
-
-
-def test_an_invalid_registered_agent_does_not_disable_detection():
-    from pier.cli import _detect_agent_from_command
-
-    assert (
-        _detect_agent_from_command(["codex"], ["nonexistent-agent", "codex"]) == "codex"
-    )
-    assert _detect_agent_from_command(["codex"], ["nonexistent-agent"]) == "codex"

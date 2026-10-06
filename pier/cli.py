@@ -1487,11 +1487,7 @@ def _verify_container(
     harbor_td = _harbor_trial_dir(workspace)
     task_dir = Path(sess["task_dir"])
     start_time = datetime.now(timezone.utc)
-    try:
-        apart = harbor_bridge.scores_apart(task_dir)
-    except Exception as e:
-        raise click.ClickException(f"Cannot read verifier configuration: {e}") from e
-    if apart:
+    if harbor_bridge.scores_apart(task_dir):
         reward, harbor_verifier = _verify_apart(sess, hsid, task_dir, verify_trial_dir)
     else:
         try:
@@ -1506,13 +1502,6 @@ def _verify_container(
         harbor_verifier = harbor_td / "verifier"
     end_time = datetime.now(timezone.utc)
 
-    if apart:
-        shutil.copytree(
-            verify_trial_dir / "record" / "agent",
-            verify_trial_dir / "agent",
-            dirs_exist_ok=True,
-        )
-
     # Copy verifier output from Harbor's dir to the per-verify trial dir
     if harbor_verifier.is_dir():
         shutil.copytree(
@@ -1521,11 +1510,12 @@ def _verify_container(
 
     _print_reward(reward)
 
-    # Separate scoring reads the recorded snapshot; shared scoring reads the
-    # live mount. Both retain Harbor's session layout.
+    # In container mode, agent logs are already in Harbor's expected layout
+    # under harbor_td/agent/ — let Harbor find sessions directly rather than
+    # reimplementing its detection logic in pier.
     container_agent_context = None
     if agent and not session_dir:
-        agent_dir = verify_trial_dir / "agent" if apart else harbor_td / "agent"
+        agent_dir = harbor_td / "agent"
         if session:
             # Explicit --session: use that specific timestamp dir.
             session_path = agent_dir / "exec" / session
@@ -1537,7 +1527,6 @@ def _verify_container(
             container_agent_context = harbor_bridge.extract_agent_context(
                 agent, session_path
             )
-            selected_logs = session_path
         else:
             sessions = harbor_bridge.get_agent_session_dirs(agent_dir, agent)
             ts = f" ({sessions[0].name})" if sessions else ""
@@ -1550,9 +1539,6 @@ def _verify_container(
             container_agent_context = harbor_bridge.extract_agent_context(
                 agent, agent_dir
             )
-            selected_logs = sessions[0] if sessions else agent_dir
-        if apart and selected_logs != agent_dir:
-            shutil.copytree(selected_logs, agent_dir, dirs_exist_ok=True)
         if not container_agent_context:
             click.echo(
                 "Warning: trajectory extraction returned no data. "
@@ -1582,7 +1568,7 @@ def _verify_apart(
     sess: dict, hsid: str, task_dir: Path, verify_trial_dir: Path
 ) -> tuple[dict, Path]:
     """Score a task that declares `[verifier] environment_mode = "separate"` as
-    Harbor does: the workspace's work recorded, its services stopped, and the
+    Harbor does: the workspace's work recorded, its container stopped, and the
     record scored in an environment built from the task's tests/, which never
     enter the workspace. Returns the reward and the scored trial's verifier dir."""
     agents = sess.get("agents") or []
@@ -1591,10 +1577,10 @@ def _verify_apart(
     record.mkdir(parents=True, exist_ok=True)
     try:
         harbor_bridge.record_workspace(hsid, task_dir, record, agent_name)
-        harbor_bridge.stop_workspace_environment(hsid)
+        harbor_bridge.stop_workspace_container(hsid)
         click.echo(
             "Scoring apart from the workspace, as the task declares: its "
-            "environment is stopped ('pier start' restarts it)."
+            "container is stopped ('pier start' restarts it)."
         )
         reward = harbor_bridge.regrade(record, task_dir, verify_trial_dir, "scored")
     except Exception as e:
@@ -1727,6 +1713,7 @@ def _stop_container_env(sess: dict, workspace: Path) -> None:
     harbor_trial_dir = _harbor_trial_dir(workspace)
     task_dir = Path(sess["task_dir"])
 
+    error: Exception | None = None
     try:
         harbor_bridge.stop_environment(
             task_dir,
@@ -1735,7 +1722,26 @@ def _stop_container_env(sess: dict, workspace: Path) -> None:
             extra_compose=sess.get("extra_compose", []),
         )
     except Exception as e:
-        raise click.ClickException(f"Failed to stop container: {e}")
+        error = e
+    # Harbor logs a failed compose stop or down and carries on, and cannot
+    # rebuild an environment whose overlay has moved: whatever of the
+    # workspace's compose project is left is removed by its label.
+    try:
+        removed = harbor_bridge.remove_workspace_containers(hsid)
+    except Exception as fallback:
+        raise click.ClickException(
+            "Failed to stop container: "
+            + (f"{error}; " if error else "")
+            + f"removing what was left by its compose project failed too: {fallback}"
+        )
+    if error or removed:
+        click.echo(
+            "Stopping through Harbor "
+            + (f"failed ({error}) and " if error else "")
+            + f"left {len(removed)} container(s); removed them by their compose "
+            "project.",
+            err=True,
+        )
 
 
 @cli.command("list")
